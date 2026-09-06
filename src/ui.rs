@@ -369,7 +369,8 @@ pub struct SearchState {
     pub total: usize,
 }
 
-/// Approval modal options, opencode labels. First field is the typed hotkey (`y`/`a`/`n`).
+/// Approval modal options. First field is the submitted value; its first character is also the
+/// direct hotkey (`y` approves `approve`, while `n` rejects).
 pub const PERM_OPTIONS: [(&str, &str); 3] = [
     ("y", "Allow once"),
     ("a", "Always allow this session"),
@@ -967,6 +968,7 @@ enum HitTarget {
     Ask(usize),
     Sidebar(SidebarAction),
     Footer(FooterAction),
+    Thinking,
     Overlay,
 }
 
@@ -984,7 +986,6 @@ enum FooterAction {
     Sessions,
     Interrupt,
     Live,
-    Thinking,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2045,7 +2046,7 @@ fn render_permission(frame: &mut Frame<'_>, perm: &PermissionState, area: Rect) 
     let width = 64.min(area.width.max(1));
     let all_rows: Vec<String> = wrap_display(&perm.body, width.saturating_sub(6) as usize);
     // Everything the box spends on chrome: blank row, options, the scroll note, the key hint.
-    let chrome = PERM_OPTIONS.len() + 5;
+    let chrome = perm.options.len() + 5;
     let ceiling = area.height.max(1) as usize;
     let capacity = ceiling.saturating_sub(chrome).max(1);
     let scroll = perm.scroll.min(all_rows.len().saturating_sub(capacity));
@@ -2096,14 +2097,14 @@ fn render_permission(frame: &mut Frame<'_>, perm: &PermissionState, area: Rect) 
     lines.push(Line::from(""));
     for (idx, (hotkey, label)) in perm.options.iter().enumerate() {
         let is_on = idx == perm.selected;
-        let prefix = if is_on { "\u{276f} " } else { "  " };
+        let prefix = if is_on { "[x] " } else { "[ ] " };
         lines.push(Line::from(vec![
             Span::styled(
                 prefix.to_string(),
                 Style::default().fg(if is_on { BLUE() } else { BORDER() }),
             ),
             Span::styled(
-                format!("{hotkey}  "),
+                format!("{}  ", hotkey.chars().next().unwrap_or('?')),
                 Style::default()
                     .fg(if is_on { BLUE() } else { MUTED() })
                     .add_modifier(Modifier::BOLD),
@@ -2125,10 +2126,13 @@ fn render_permission(frame: &mut Frame<'_>, perm: &PermissionState, area: Rect) 
             ),
         ]));
     }
-    lines.push(Line::from(Span::styled(
-        "y / a / n  \u{b7}  Enter confirm  \u{b7}  Esc rejects".to_string(),
-        Style::default().fg(MUTED()),
-    )));
+    let is_plan = perm.options.as_slice() == PLAN_OPTIONS.as_slice();
+    let hint = if is_plan {
+        "\u{2191}/\u{2193} choose  \u{b7}  Enter confirm  \u{b7}  y approve  \u{b7}  n/Esc reject"
+    } else {
+        "\u{2191}/\u{2193} choose  \u{b7}  Enter confirm  \u{b7}  y/a/n shortcut  \u{b7}  Esc rejects"
+    };
+    lines.push(Line::from(Span::styled(hint, Style::default().fg(MUTED()))));
     frame.render_widget(
         Paragraph::new(Text::from(lines))
             .style(Style::default().bg(POPUP_BG()))
@@ -2666,7 +2670,7 @@ fn input_thread(
                                     interrupt.notify_one();
                                 }
                             }
-                            Some(HitTarget::Footer(FooterAction::Thinking)) => {
+                            Some(HitTarget::Thinking) => {
                                 let _ = lock_screen(&screen.0).toggle_thinking_card();
                             }
                             Some(HitTarget::Footer(FooterAction::Live)) => {
@@ -3705,7 +3709,7 @@ fn render(frame: &mut Frame<'_>, model: &Model) -> RenderInfo {
             };
         hit_regions.push(HitRegion {
             area: Rect::new(editor_area.x, wall_row, editor_area.width, 1),
-            target: HitTarget::Footer(FooterAction::Thinking),
+            target: HitTarget::Thinking,
         });
     }
 
@@ -3856,7 +3860,6 @@ fn footer_hit_regions(model: &Model, area: Rect) -> Vec<HitRegion> {
     add("? help", FooterAction::Help);
     if model.thinking.is_some() {
         add("  ·  Esc interrupts", FooterAction::Interrupt);
-        add("  ·  click thinking", FooterAction::Thinking);
     }
     if model.scroll_from_bottom > 0 {
         add("  ·  Ctrl+End live", FooterAction::Live);
@@ -4027,7 +4030,7 @@ fn editor_widget(model: &Model, area: Rect) -> Paragraph<'static> {
             .any(|card| matches!(card.kind, CardKind::Thinking) && !card.body.trim().is_empty())
         {
             wall_line.push(Span::styled(
-                "  click to toggle".to_string(),
+                "  Ctrl+T / click to show reasoning".to_string(),
                 Style::default().fg(BORDER()),
             ));
         }
@@ -4167,29 +4170,22 @@ fn sidebar_rows(model: &Model, area: Rect) -> Vec<SidebarRow> {
             Style::default().fg(MUTED()).add_modifier(Modifier::BOLD),
         )));
         actions.push(None);
-        let compact_plan = area.width < 28 || area.height < 12;
-        let steps = if compact_plan {
-            plan.steps
-                .iter()
-                .filter(|(_, status)| *status == crate::tools::PlanStepStatus::InProgress)
-                .take(1)
-                .collect::<Vec<_>>()
-        } else {
-            plan.steps.iter().collect::<Vec<_>>()
-        };
         let completed = plan
             .steps
             .iter()
             .filter(|(_, status)| *status == crate::tools::PlanStepStatus::Completed)
             .count();
-        if compact_plan {
-            lines.push(Line::styled(
-                format!("Progress {completed}/{}", plan.steps.len()),
-                Style::default().fg(MUTED()),
-            ));
-            actions.push(None);
-        }
-        for (step, status) in steps {
+        lines.push(Line::styled(
+            format!("Progress {completed}/{}", plan.steps.len()),
+            Style::default().fg(MUTED()),
+        ));
+        actions.push(None);
+        for (step, status) in plan
+            .steps
+            .iter()
+            .filter(|(_, status)| *status == crate::tools::PlanStepStatus::InProgress)
+            .take(1)
+        {
             let mark = match status {
                 crate::tools::PlanStepStatus::Completed => "x",
                 crate::tools::PlanStepStatus::InProgress => "~",
@@ -4206,6 +4202,18 @@ fn sidebar_rows(model: &Model, area: Rect) -> Vec<SidebarRow> {
                     }),
                 ),
             ]));
+            actions.push(None);
+        }
+        let queued = plan
+            .steps
+            .iter()
+            .filter(|(_, status)| *status == crate::tools::PlanStepStatus::Pending)
+            .count();
+        if queued > 0 {
+            lines.push(Line::styled(
+                format!("{queued} queued"),
+                Style::default().fg(MUTED()),
+            ));
             actions.push(None);
         }
     }
@@ -4288,7 +4296,7 @@ fn sidebar_paragraph(
 fn is_sidebar_section(key: &str) -> bool {
     matches!(
         key,
-        "Session" | "Runtime" | "Context" | "Activity" | "Last turn"
+        "Session" | "Runtime" | "MCP" | "Context" | "Activity" | "Last turn"
     )
 }
 
@@ -5186,7 +5194,7 @@ mod tests {
     }
 
     #[test]
-    fn thinking_wall_and_footer_are_click_targets() {
+    fn thinking_wall_is_a_click_target() {
         let model = Model {
             intro: false,
             thinking: Some((0, "Thinking...")),
@@ -5201,11 +5209,10 @@ mod tests {
             .expect("draw");
         assert!(
             info.hits.iter().any(|hit| {
-                hit.target == HitTarget::Footer(FooterAction::Thinking)
-                    && hit_at(&info.hits, hit.area.x, hit.area.y)
-                        == Some(HitTarget::Footer(FooterAction::Thinking))
+                hit.target == HitTarget::Thinking
+                    && hit_at(&info.hits, hit.area.x, hit.area.y) == Some(HitTarget::Thinking)
             }),
-            "thinking wall/footer maps to a click target"
+            "thinking wall maps to a click target"
         );
         assert!(
             info.hits.iter().any(|hit| hit.target == HitTarget::Card(1)),

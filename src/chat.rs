@@ -3478,22 +3478,47 @@ fn tools_disabled_note(active: &Profile) -> Option<String> {
 }
 
 fn mcp_sidebar_value(statuses: &[ConnectionStatus]) -> String {
-    statuses
+    if statuses.is_empty() {
+        return String::new();
+    }
+    let connected = statuses
         .iter()
-        .map(|server| match &server.error {
-            Some(_) => format!("{} · unavailable", server.name),
-            None => format!(
-                "{} · {} tool(s){}",
-                server.name,
-                server.tool_count,
-                if server.trusted { " · trusted" } else { "" }
-            ),
-        })
-        .collect::<Vec<_>>()
-        .join(
-            "
-",
-        )
+        .filter(|server| server.error.is_none())
+        .count();
+    let tools: usize = statuses.iter().map(|server| server.tool_count).sum();
+    let mut lines = vec![
+        format!("status\t{connected}/{} connected", statuses.len()),
+        format!("tools\t{} available", compact_count(tools as u64)),
+    ];
+    lines.extend(statuses.iter().map(|server| match &server.error {
+        Some(_) => format!("{}\tunavailable", server.name),
+        None => format!(
+            "{}\t{} tools{}",
+            server.name,
+            server.tool_count,
+            if server.trusted { " · trusted" } else { "" }
+        ),
+    }));
+    lines.join("\n")
+}
+
+fn compact_count(value: u64) -> String {
+    let (divisor, suffix) = if value >= 1_000_000_000 {
+        (1_000_000_000.0, "B")
+    } else if value >= 1_000_000 {
+        (1_000_000.0, "M")
+    } else if value >= 1_000 {
+        (1_000.0, "K")
+    } else {
+        return value.to_string();
+    };
+    let scaled = value as f64 / divisor;
+    if scaled >= 100.0 {
+        format!("{scaled:.0}{suffix}")
+    } else {
+        let rounded = (scaled * 10.0 + f64::EPSILON).round() / 10.0;
+        format!("{rounded:.1}{suffix}")
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3540,18 +3565,20 @@ fn update_sidebar(
         runtime.push_str(&format!("\ngit\t{}{dirty}", git.branch));
     }
     runtime.push_str(&format!("\nproject\t{}", display_path(project.root())));
-    if !mcp.is_empty() {
-        runtime.push_str(&format!("\nmcp\t{mcp}"));
-    }
     entries_push(&mut entries, "Runtime", runtime);
+    if !mcp.is_empty() {
+        entries_push(&mut entries, "MCP", mcp.to_string());
+    }
     let mut context_line = match (last_input_tokens, context_window) {
         (Some(tokens), Some(window)) => {
             format!(
-                "{tokens} tokens ({:.1}% of {window})",
-                tokens as f64 / window as f64 * 100.0
+                "{} tokens ({:.1}% of {})",
+                compact_count(tokens),
+                tokens as f64 / window as f64 * 100.0,
+                compact_count(window)
             )
         }
-        (Some(tokens), None) => format!("{tokens} tokens"),
+        (Some(tokens), None) => format!("{} tokens", compact_count(tokens)),
         (None, _) => "\u{2014}".to_string(),
     };
     if let (Some(tokens), Some(window)) = (last_input_tokens, context_window)
@@ -3563,7 +3590,7 @@ fn update_sidebar(
     match (last_input_tokens, last_cached_tokens) {
         (Some(tokens), Some(cached)) if cached > 0 && tokens > 0 => {
             let hit = (cached as f64 / tokens as f64 * 100.0).min(100.0);
-            context_line.push_str(&format!("\ncache\t{cached} ({hit:.0}%)"));
+            context_line.push_str(&format!("\ncache\t{} · {hit:.0}%", compact_count(cached)));
         }
         (Some(_), Some(0)) if cache_pinned => {
             context_line.push_str("\ncache\t0 (warm-up)");
@@ -5476,15 +5503,28 @@ mod tests {
             status("filesystem", 11, true, None),
         ]);
         let rows: Vec<&str> = value.split('\n').collect();
-        assert_eq!(rows.len(), 2, "one row per server: {rows:?}");
+        assert_eq!(rows.len(), 4, "summary plus one row per server: {rows:?}");
         assert!(
-            rows[0].contains("mcptools") && rows[0].contains("79 tool(s)"),
+            rows[0].contains("2/2 connected") && rows[1].contains("90 available"),
             "{rows:?}"
         );
         assert!(
-            rows[1].contains("trusted"),
+            rows[2].contains("mcptools") && rows[2].contains("79 tools"),
+            "{rows:?}"
+        );
+        assert!(
+            rows[3].contains("trusted"),
             "trusted servers say so: {rows:?}"
         );
+    }
+
+    #[test]
+    fn sidebar_counts_are_compact_and_human_readable() {
+        assert_eq!(compact_count(999), "999");
+        assert_eq!(compact_count(1_000), "1.0K");
+        assert_eq!(compact_count(151_159), "151K");
+        assert_eq!(compact_count(1_250_000), "1.3M");
+        assert_eq!(compact_count(2_000_000_000), "2.0B");
     }
 
     #[test]
