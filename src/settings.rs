@@ -15,6 +15,12 @@ use crate::skills::{Skill, SkillSource};
 
 const KEY: &str = "disabledSkills";
 
+#[derive(Debug, Default)]
+pub struct DisabledSkillsReport {
+    pub disabled: HashSet<String>,
+    pub warnings: Vec<String>,
+}
+
 pub fn user_settings_path() -> Result<PathBuf> {
     Ok(crate::config::global_config_dir()?.join("settings.json"))
 }
@@ -23,14 +29,32 @@ pub fn project_settings_path(project_root: &Path) -> PathBuf {
     project_root.join(".kamui/settings.json")
 }
 
-/// Union of user + project disabled skills. Missing or unreadable files are treated as empty.
+/// Union of user + project disabled skills. Use `load_disabled_skills_report` when diagnostics
+/// can be shown to the user.
+#[allow(dead_code)]
 pub fn load_disabled_skills(project_root: &Path) -> HashSet<String> {
-    let mut out = HashSet::new();
-    if let Ok(path) = user_settings_path() {
-        out.extend(read_disabled_from_file(&path).unwrap_or_default());
+    load_disabled_skills_report(project_root).disabled
+}
+
+pub fn load_disabled_skills_report(project_root: &Path) -> DisabledSkillsReport {
+    let mut report = DisabledSkillsReport::default();
+    let mut paths = Vec::new();
+    match user_settings_path() {
+        Ok(path) => paths.push(path),
+        Err(error) => report
+            .warnings
+            .push(format!("settings: user settings path: {error:#}")),
     }
-    out.extend(read_disabled_from_file(&project_settings_path(project_root)).unwrap_or_default());
-    out
+    paths.push(project_settings_path(project_root));
+    for path in paths {
+        match read_disabled_from_file(&path) {
+            Ok(set) => report.disabled.extend(set),
+            Err(error) => report
+                .warnings
+                .push(format!("settings: {}: {error:#}", path.display())),
+        }
+    }
+    report
 }
 
 fn read_disabled_from_file(path: &Path) -> Result<HashSet<String>> {
@@ -39,21 +63,24 @@ fn read_disabled_from_file(path: &Path) -> Result<HashSet<String>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(HashSet::new()),
         Err(e) => return Err(e.into()),
     };
-    if content.trim().is_empty() {
-        return Ok(HashSet::new());
-    }
-    let value: serde_json::Value = match serde_json::from_str(&content) {
-        Ok(v) => v,
-        Err(_) => return Ok(HashSet::new()),
-    };
+    let value: serde_json::Value =
+        serde_json::from_str(&content).map_err(|e| anyhow::anyhow!("invalid JSON: {e}"))?;
+    let obj = value
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("root must be a JSON object"))?;
     let mut set = HashSet::new();
-    if let Some(arr) = value.get(KEY).and_then(|v| v.as_array()) {
-        for item in arr {
-            if let Some(s) = item.as_str() {
-                let s = s.trim().to_ascii_lowercase();
-                if !s.is_empty() {
-                    set.insert(s);
-                }
+    if let Some(value) = obj.get(KEY) {
+        let arr = value
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("{KEY} must be an array of strings"))?;
+        for (index, item) in arr.iter().enumerate() {
+            let s = item
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("{KEY}[{index}] must be a string"))?
+                .trim()
+                .to_ascii_lowercase();
+            if !s.is_empty() {
+                set.insert(s);
             }
         }
     }
@@ -65,9 +92,13 @@ fn write_disabled_to_file(path: &Path, set: &HashSet<String>) -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     let mut value = match std::fs::read_to_string(path) {
-        Ok(c) if !c.trim().is_empty() => serde_json::from_str::<serde_json::Value>(&c)
-            .unwrap_or(serde_json::Value::Object(Default::default())),
-        _ => serde_json::Value::Object(Default::default()),
+        Ok(c) => serde_json::from_str::<serde_json::Value>(&c).map_err(|e| {
+            anyhow::anyhow!("refusing to overwrite malformed {}: {e}", path.display())
+        })?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            serde_json::Value::Object(Default::default())
+        }
+        Err(e) => return Err(e.into()),
     };
     let obj = value
         .as_object_mut()
@@ -90,7 +121,14 @@ fn write_disabled_to_file(path: &Path, set: &HashSet<String>) -> Result<()> {
     }
 
     let pretty = serde_json::to_string_pretty(&value)?;
-    std::fs::write(path, pretty + "\n")?;
+    let temporary = path.with_extension("json.tmp");
+    std::fs::write(&temporary, pretty + "\n")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))?;
+    }
+    std::fs::rename(temporary, path)?;
     Ok(())
 }
 
@@ -113,13 +151,13 @@ pub fn set_skill_disabled(project_root: &Path, skill: &Skill, disabled: bool) ->
         } else {
             &user_path
         };
-        let mut set = read_disabled_from_file(target).unwrap_or_default();
+        let mut set = read_disabled_from_file(target)?;
         set.insert(skill.name.clone());
         write_disabled_to_file(target, &set)?;
     } else {
         // Remove from both scopes — union means either file can keep it disabled.
         for path in [&project_path, &user_path] {
-            let mut set = read_disabled_from_file(path).unwrap_or_default();
+            let mut set = read_disabled_from_file(path)?;
             if set.remove(&skill.name) {
                 write_disabled_to_file(path, &set)?;
             }
@@ -175,6 +213,48 @@ mod tests {
         assert!(path.exists());
         write_disabled_to_file(&path, &HashSet::new()).unwrap();
         assert!(!path.exists());
+        fs::remove_dir_all(p).unwrap();
+    }
+
+    #[test]
+    fn malformed_root_and_disabled_skills_types_are_errors() {
+        let p = tmp_project();
+        let path = p.join("settings.json");
+        for (data, expected) in [
+            ("{", "invalid JSON"),
+            ("[]", "root must be a JSON object"),
+            (r#"{"disabledSkills":true}"#, "must be an array"),
+            (r#"{"disabledSkills":["ok",3]}"#, "disabledSkills[1]"),
+        ] {
+            fs::write(&path, data).unwrap();
+            let error = read_disabled_from_file(&path).unwrap_err().to_string();
+            assert!(error.contains(expected), "{error}");
+        }
+        fs::remove_dir_all(p).unwrap();
+    }
+
+    #[test]
+    fn write_refuses_and_preserves_malformed_file() {
+        let p = tmp_project();
+        let path = p.join("settings.json");
+        fs::write(&path, "{broken").unwrap();
+        let error = write_disabled_to_file(&path, &HashSet::from(["x".into()])).unwrap_err();
+        assert!(error.to_string().contains("refusing to overwrite"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "{broken");
+        fs::remove_dir_all(p).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_file_reports_an_error() {
+        use std::os::unix::fs::PermissionsExt;
+        let p = tmp_project();
+        let path = p.join("settings.json");
+        fs::write(&path, "{}").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+        let result = read_disabled_from_file(&path);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(result.is_err() || result.unwrap().is_empty());
         fs::remove_dir_all(p).unwrap();
     }
 }

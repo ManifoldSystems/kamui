@@ -528,8 +528,20 @@ struct StreamChoice {
 #[derive(Debug, Deserialize)]
 struct StreamDelta {
     content: Option<String>,
+    #[serde(default)]
+    reasoning: Option<String>,
+    #[serde(default)]
+    reasoning_content: Option<String>,
+    #[serde(default)]
+    thinking: Option<String>,
     #[serde(default, deserialize_with = "null_as_empty_vec")]
     tool_calls: Vec<StreamToolCallDelta>,
+}
+
+fn reasoning_delta(delta: &StreamDelta) -> Option<String> {
+    [&delta.reasoning, &delta.reasoning_content, &delta.thinking]
+        .into_iter()
+        .find_map(|value| value.as_ref().filter(|text| !text.is_empty()).cloned())
 }
 
 #[derive(Debug, Deserialize)]
@@ -800,9 +812,20 @@ fn parse_event(
             if let Some(reason) = choice.finish_reason {
                 state.finish_reason = reason;
             }
-            if let Some(content) = choice.delta.content.filter(|content| !content.is_empty()) {
+            if let Some(content) = choice
+                .delta
+                .content
+                .as_ref()
+                .filter(|content| !content.is_empty())
+                .cloned()
+            {
                 sender
                     .send(Ok(StreamEvent::Delta(content)))
+                    .map_err(|_| anyhow::anyhow!("stream consumer disconnected"))?;
+            }
+            if let Some(reasoning) = reasoning_delta(&choice.delta) {
+                sender
+                    .send(Ok(StreamEvent::Reasoning(reasoning)))
                     .map_err(|_| anyhow::anyhow!("stream consumer disconnected"))?;
             }
             for delta in choice.delta.tool_calls {
@@ -864,10 +887,40 @@ mod tests {
 
         match receiver.try_recv().unwrap().unwrap() {
             StreamEvent::Delta(content) => assert_eq!(content, "Hello"),
-            StreamEvent::Done { .. } => panic!("expected a delta"),
+            other => panic!("expected a delta, got {other:?}"),
         }
         assert_eq!(state.usage.total_tokens, 5);
         assert_eq!(state.finish_reason, "stop");
+    }
+
+    #[test]
+    fn parses_reasoning_deltas_from_common_compat_fields() {
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let mut state = StreamState::default();
+        assert!(
+            !parse_event(
+                br#"data: {"choices":[{"delta":{"reasoning":"step one"}}]}"#,
+                &sender,
+                &mut state,
+            )
+            .unwrap()
+        );
+        assert!(
+            !parse_event(
+                br#"data: {"choices":[{"delta":{"reasoning_content":" step two"}}]}"#,
+                &sender,
+                &mut state,
+            )
+            .unwrap()
+        );
+        match receiver.try_recv().unwrap().unwrap() {
+            StreamEvent::Reasoning(text) => assert_eq!(text, "step one"),
+            other => panic!("expected reasoning, got {other:?}"),
+        }
+        match receiver.try_recv().unwrap().unwrap() {
+            StreamEvent::Reasoning(text) => assert_eq!(text, " step two"),
+            other => panic!("expected reasoning, got {other:?}"),
+        }
     }
 
     #[test]

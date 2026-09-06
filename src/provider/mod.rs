@@ -158,6 +158,8 @@ pub struct ChatResponse {
 #[derive(Debug)]
 pub enum StreamEvent {
     Delta(String),
+    /// Provider reasoning/thinking text. Display-only; never replayed to the model.
+    Reasoning(String),
     Done {
         usage: Usage,
         finish_reason: String,

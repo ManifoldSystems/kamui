@@ -21,7 +21,7 @@ impl FromStr for Theme {
             "ayuppuccin" | "ayu-catppuccin" | "ayuppuccin-dark" => Ok(Self::Ayuppuccin),
             other => {
                 // allow custom theme names (a-z,0-9,-,_)
-                if custom_exists(other) {
+                if custom_exists(other) && load_custom_palette(other).is_ok() {
                     Ok(Self::Custom(other.to_string()))
                 } else {
                     Err(format!(
@@ -99,7 +99,7 @@ impl Theme {
                 teal: "#94e2d5".into(),
                 cyan: "#95e6cb".into(),
             }),
-            Self::Custom(name) => load_custom_palette(name),
+            Self::Custom(name) => load_custom_palette(name).ok(),
         }
     }
     pub fn all() -> Vec<Theme> {
@@ -110,7 +110,9 @@ impl Theme {
             Self::Ayuppuccin,
         ];
         for n in list_custom_names() {
-            v.push(Self::Custom(n));
+            if load_custom_palette(&n).is_ok() {
+                v.push(Self::Custom(n));
+            }
         }
         v
     }
@@ -141,105 +143,187 @@ fn list_custom_names() -> Vec<String> {
     out.sort();
     out
 }
-fn load_custom_palette(name: &str) -> Option<Palette> {
+fn load_custom_palette(name: &str) -> Result<Palette, String> {
     let path = themes_dir().join(format!("{name}.json"));
-    let data = std::fs::read_to_string(path).ok()?;
-    let v: serde_json::Value = serde_json::from_str(&data).ok()?;
+    load_custom_palette_path(&path)
+}
+
+fn load_custom_palette_path(path: &std::path::Path) -> Result<Palette, String> {
+    let fail = |cause: String| format!("theme: {}: {cause}", path.display());
+    let data = std::fs::read_to_string(path).map_err(|e| fail(format!("cannot read: {e}")))?;
+    let v: serde_json::Value =
+        serde_json::from_str(&data).map_err(|e| fail(format!("invalid JSON: {e}")))?;
+    if !v.is_object() {
+        return Err(fail("root must be a JSON object".into()));
+    }
+    let color = |field: &str, value: Option<&str>| -> Result<String, String> {
+        let value = value.ok_or_else(|| fail(format!("missing string field '{field}'")))?;
+        hex_to_rgb(value).map_err(|_| fail(format!("field '{field}' must be exact #RRGGBB")))?;
+        Ok(value.to_string())
+    };
     // support either flat {bg,fg,...} or {defs:{}, theme:{}} like ayuppuccin.json
-    let get = |k: &str| v.get(k).and_then(|x| x.as_str()).map(|s| s.to_string());
+    let get = |k: &str| v.get(k).and_then(|x| x.as_str());
     // if has defs, resolve refs
     if let Some(defs) = v.get("defs") {
-        let resolve = |key: &str| {
+        let resolve = |key: &str| -> Result<String, String> {
             // theme.<key> may be {dark:"mauve"} -> resolve via defs
-            let theme = v.get("theme")?.get(key)?;
+            let theme = v
+                .get("theme")
+                .and_then(|x| x.get(key))
+                .ok_or_else(|| fail(format!("missing theme field '{key}'")))?;
             let ref_name = theme
                 .get("dark")
                 .and_then(|x| x.as_str())
-                .or_else(|| theme.as_str())?;
-            defs.get(ref_name)
+                .or_else(|| theme.as_str())
+                .ok_or_else(|| fail(format!("theme field '{key}' must be a string or dark ref")))?;
+            let resolved = defs
+                .get(ref_name)
                 .and_then(|x| x.as_str())
-                .map(|s| s.to_string())
-                .or_else(|| Some(ref_name.to_string()))
+                .unwrap_or(ref_name);
+            color(&format!("theme.{key} -> {ref_name}"), Some(resolved))
         };
-        return Some(Palette {
+        return Ok(Palette {
             bg: resolve("background")?,
             fg: resolve("text")?,
-            muted: resolve("textMuted").or_else(|| get("fg_muted"))?,
-            mauve: defs
-                .get("mauve")
-                .and_then(|x| x.as_str())
-                .unwrap_or("#cba6f7")
-                .to_string(),
-            blue: defs
-                .get("ayu_blue")
-                .and_then(|x| x.as_str())
-                .or_else(|| defs.get("blue").and_then(|x| x.as_str()))
-                .unwrap_or("#89b4fa")
-                .to_string(),
-            green: defs
-                .get("ayu_green")
-                .and_then(|x| x.as_str())
-                .or_else(|| defs.get("green").and_then(|x| x.as_str()))
-                .unwrap_or("#a6e3a1")
-                .to_string(),
-            red: defs
-                .get("ayu_red")
-                .and_then(|x| x.as_str())
-                .or_else(|| defs.get("red").and_then(|x| x.as_str()))
-                .unwrap_or("#f38ba8")
-                .to_string(),
-            amber: defs
-                .get("ayu_amber")
-                .and_then(|x| x.as_str())
-                .or_else(|| defs.get("amber").and_then(|x| x.as_str()))
-                .unwrap_or("#fab387")
-                .to_string(),
-            teal: defs
-                .get("teal")
-                .and_then(|x| x.as_str())
-                .unwrap_or("#94e2d5")
-                .to_string(),
-            cyan: defs
-                .get("teal")
-                .and_then(|x| x.as_str())
-                .unwrap_or("#89dceb")
-                .to_string(),
+            muted: if v.get("theme").and_then(|x| x.get("textMuted")).is_some() {
+                resolve("textMuted")?
+            } else {
+                color("fg_muted", get("fg_muted"))?
+            },
+            mauve: color(
+                "defs.mauve",
+                defs.get("mauve")
+                    .and_then(|x| x.as_str())
+                    .or(Some("#cba6f7")),
+            )?,
+            blue: color(
+                "defs.blue",
+                defs.get("ayu_blue")
+                    .or_else(|| defs.get("blue"))
+                    .and_then(|x| x.as_str())
+                    .or(Some("#89b4fa")),
+            )?,
+            green: color(
+                "defs.green",
+                defs.get("ayu_green")
+                    .or_else(|| defs.get("green"))
+                    .and_then(|x| x.as_str())
+                    .or(Some("#a6e3a1")),
+            )?,
+            red: color(
+                "defs.red",
+                defs.get("ayu_red")
+                    .or_else(|| defs.get("red"))
+                    .and_then(|x| x.as_str())
+                    .or(Some("#f38ba8")),
+            )?,
+            amber: color(
+                "defs.amber",
+                defs.get("ayu_amber")
+                    .or_else(|| defs.get("amber"))
+                    .and_then(|x| x.as_str())
+                    .or(Some("#fab387")),
+            )?,
+            teal: color(
+                "defs.teal",
+                defs.get("teal")
+                    .and_then(|x| x.as_str())
+                    .or(Some("#94e2d5")),
+            )?,
+            cyan: color(
+                "defs.cyan",
+                defs.get("cyan")
+                    .or_else(|| defs.get("teal"))
+                    .and_then(|x| x.as_str())
+                    .or(Some("#89dceb")),
+            )?,
         });
     }
-    Some(Palette {
-        bg: get("bg")?,
-        fg: get("fg")?,
-        muted: get("muted").or_else(|| get("fg_muted"))?,
-        mauve: get("mauve").unwrap_or("#cba6f7".into()),
-        blue: get("blue").unwrap_or("#89b4fa".into()),
-        green: get("green").unwrap_or("#a6e3a1".into()),
-        red: get("red").unwrap_or("#f38ba8".into()),
-        amber: get("amber").unwrap_or("#fab387".into()),
-        teal: get("teal").unwrap_or("#94e2d5".into()),
-        cyan: get("cyan").unwrap_or("#89dceb".into()),
+    Ok(Palette {
+        bg: color("bg", get("bg"))?,
+        fg: color("fg", get("fg"))?,
+        muted: color("muted", get("muted").or_else(|| get("fg_muted")))?,
+        mauve: color("mauve", get("mauve").or(Some("#cba6f7")))?,
+        blue: color("blue", get("blue").or(Some("#89b4fa")))?,
+        green: color("green", get("green").or(Some("#a6e3a1")))?,
+        red: color("red", get("red").or(Some("#f38ba8")))?,
+        amber: color("amber", get("amber").or(Some("#fab387")))?,
+        teal: color("teal", get("teal").or(Some("#94e2d5")))?,
+        cyan: color("cyan", get("cyan").or(Some("#89dceb")))?,
     })
 }
 
 #[allow(dead_code)]
-pub fn hex_to_rgb(hex: &str) -> (u8, u8, u8) {
-    let h = hex.trim_start_matches('#');
-    let r = u8::from_str_radix(&h[0..2], 16).unwrap_or(0);
-    let g = u8::from_str_radix(&h[2..4], 16).unwrap_or(0);
-    let b = u8::from_str_radix(&h[4..6], 16).unwrap_or(0);
-    (r, g, b)
+pub fn hex_to_rgb(hex: &str) -> Result<(u8, u8, u8), String> {
+    let bytes = hex.as_bytes();
+    if bytes.len() != 7 || bytes[0] != b'#' || !bytes[1..].iter().all(u8::is_ascii_hexdigit) {
+        return Err("expected exact #RRGGBB".into());
+    }
+    let parse = |range| u8::from_str_radix(&hex[range], 16).map_err(|e| e.to_string());
+    Ok((parse(1..3)?, parse(3..5)?, parse(5..7)?))
 }
 #[allow(dead_code)]
 pub fn fg_true(hex: &str) -> String {
-    let (r, g, b) = hex_to_rgb(hex);
+    let (r, g, b) = hex_to_rgb(hex).unwrap_or_default();
     format!("\x1b[38;2;{r};{g};{b}m")
 }
 #[allow(dead_code)]
 pub fn bg_true(hex: &str) -> String {
-    let (r, g, b) = hex_to_rgb(hex);
+    let (r, g, b) = hex_to_rgb(hex).unwrap_or_default();
     format!("\x1b[48;2;{r};{g};{b}m")
 }
 #[allow(dead_code)]
 pub fn ratatui_fg(hex: &str) -> ratatui::style::Color {
-    let (r, g, b) = hex_to_rgb(hex);
+    let (r, g, b) = hex_to_rgb(hex).unwrap_or_default();
     ratatui::style::Color::Rgb(r, g, b)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use uuid::Uuid;
+
+    fn theme_file(data: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("kamui-theme-{}.json", Uuid::new_v4()));
+        fs::write(&path, data).unwrap();
+        path
+    }
+
+    #[test]
+    fn hex_parser_rejects_short_and_invalid_values() {
+        assert!(hex_to_rgb("#fff").is_err());
+        assert!(hex_to_rgb("112233").is_err());
+        assert!(hex_to_rgb("#gg2233").is_err());
+        assert_eq!(hex_to_rgb("#Aa10ff").unwrap(), (0xaa, 0x10, 0xff));
+    }
+
+    #[test]
+    fn loads_valid_flat_theme_and_rejects_invalid_field() {
+        let valid = theme_file(r##"{"bg":"#112233","fg":"#abcdef","muted":"#010203"}"##);
+        assert_eq!(load_custom_palette_path(&valid).unwrap().bg, "#112233");
+        fs::remove_file(valid).unwrap();
+
+        let invalid = theme_file(r##"{"bg":"#123","fg":"#abcdef","muted":"#010203"}"##);
+        let error = load_custom_palette_path(&invalid).unwrap_err();
+        assert!(error.contains("field 'bg'"));
+        assert!(error.contains(&invalid.display().to_string()));
+        fs::remove_file(invalid).unwrap();
+    }
+
+    #[test]
+    fn loads_defs_theme_and_rejects_bad_reference() {
+        let valid = theme_file(
+            r##"{"defs":{"base":"#112233","text":"#abcdef","dim":"#010203"},"theme":{"background":{"dark":"base"},"text":{"dark":"text"},"textMuted":{"dark":"dim"}}}"##,
+        );
+        assert_eq!(load_custom_palette_path(&valid).unwrap().fg, "#abcdef");
+        fs::remove_file(valid).unwrap();
+
+        let invalid = theme_file(
+            r##"{"defs":{"base":"#112233","text":"#abcdef"},"theme":{"background":{"dark":"base"},"text":{"dark":"text"},"textMuted":{"dark":"missing"}}}"##,
+        );
+        let error = load_custom_palette_path(&invalid).unwrap_err();
+        assert!(error.contains("theme.textMuted -> missing"));
+        fs::remove_file(invalid).unwrap();
+    }
 }

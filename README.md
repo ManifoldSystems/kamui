@@ -574,6 +574,20 @@ TTY, `NO_COLOR` keeps the fullscreen TUI but removes its semantic foreground/bac
 | `/help` | List available commands |
 | `/exit` | Save and quit |
 
+Malformed or unreadable user/project `settings.json` files are reported in the startup warning rail
+and by `/warnings details`; Kamui does not silently overwrite them. Custom theme JSON files are also
+validated before selection, and every resolved color must use exact `#RRGGBB` form. Invalid themes
+are omitted from the picker and the last valid/default theme remains active.
+
+The model picker shows the profile, model, an active marker, and short capability notes (`tools off`,
+`Coding/sticky`, context window). Empty model or session pickers say so instead of opening a blank
+dialog. While a turn is running, `/model` and `/resume` are rejected rather than queued; typed input
+is queued for the next agent step and only folded into the current turn between tool rounds.
+
+If the provider streams reasoning (`reasoning`, `reasoning_content`, or `thinking`), Kamui shows a
+collapsed Thinking card. Click the card, the bouncing wall, or the footer hint — or press `Ctrl+T` —
+to expand or hide it. Reasoning is display-only and is not sent back to the model.
+
 `Ctrl+C` or `Esc` while a turn is running — waiting on the model, streaming, at an approval
 prompt, or running a command — cancels that turn and returns you to the prompt, killing any
 running command. The cancelled turn is not saved. At the idle prompt, `Ctrl+C` must be pressed

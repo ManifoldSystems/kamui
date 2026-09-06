@@ -83,6 +83,7 @@ fn wrapped_fingerprint(model: &Model) -> u64 {
             CardKind::Output => 3,
             CardKind::Error => 4,
             CardKind::Note => 5,
+            CardKind::Thinking => 6,
         });
         if let Some((status, ok)) = &card.status {
             fp = fp.wrapping_mul(31).wrapping_add(status.len() as u64);
@@ -173,7 +174,8 @@ fn BG_ELEMENT() -> Color {
     if std::env::var_os("NO_COLOR").is_some() {
         return Color::Reset;
     }
-    let (r, g, b) = crate::theme::hex_to_rgb(&palette().map(|p| p.bg).unwrap_or("#24283b".into()));
+    let (r, g, b) = crate::theme::hex_to_rgb(&palette().map(|p| p.bg).unwrap_or("#24283b".into()))
+        .unwrap_or((0x24, 0x28, 0x3b));
     Color::Rgb(
         r.saturating_sub(12),
         g.saturating_sub(12),
@@ -185,7 +187,8 @@ fn BG_PANEL() -> Color {
     if std::env::var_os("NO_COLOR").is_some() {
         return Color::Reset;
     }
-    let (r, g, b) = crate::theme::hex_to_rgb(&palette().map(|p| p.bg).unwrap_or("#1f2335".into()));
+    let (r, g, b) = crate::theme::hex_to_rgb(&palette().map(|p| p.bg).unwrap_or("#1f2335".into()))
+        .unwrap_or((0x1f, 0x23, 0x35));
     Color::Rgb(
         r.saturating_sub(6),
         g.saturating_sub(6),
@@ -246,6 +249,8 @@ pub enum CardKind {
     /// rendered below every card, so they lost their place in the conversation and older ones
     /// silently fell off the end.
     Note,
+    /// Provider reasoning, collapsed by default and never replayed to the model.
+    Thinking,
 }
 
 #[derive(Debug, Clone)]
@@ -595,7 +600,7 @@ impl FullScreen {
         // cannot collide with the editor. Ctrl+O, a click, or `/expand` / `/collapse` toggle
         // it; answers always show in full.
         let collapsed = match kind {
-            CardKind::Tool => true,
+            CardKind::Tool | CardKind::Thinking => true,
             CardKind::Output => title != "Assistant" && body.lines().count() > 2,
             CardKind::Error => error_should_fold(&body),
             _ => false,
@@ -611,6 +616,50 @@ impl FullScreen {
         });
         self.trim_history();
         self.draw()
+    }
+
+    fn update_thinking(&mut self, body: String) -> Result<()> {
+        if body.trim().is_empty() {
+            return Ok(());
+        }
+        self.model.intro = false;
+        match self
+            .model
+            .cards
+            .iter_mut()
+            .rev()
+            .find(|card| matches!(card.kind, CardKind::Thinking) && card.title == "Thinking")
+        {
+            Some(card) => card.body = body,
+            None => {
+                let id = self.take_card_id();
+                self.model.cards.push(Card {
+                    id,
+                    kind: CardKind::Thinking,
+                    title: "Thinking".to_string(),
+                    body,
+                    status: None,
+                    collapsed: true,
+                });
+            }
+        }
+        self.trim_history();
+        self.draw()
+    }
+
+    fn toggle_thinking_card(&mut self) -> Result<bool> {
+        let Some(card) = self
+            .model
+            .cards
+            .iter_mut()
+            .rev()
+            .find(|card| matches!(card.kind, CardKind::Thinking) && card.foldable_rows() > 0)
+        else {
+            return Ok(false);
+        };
+        card.collapsed = !card.collapsed;
+        self.draw()?;
+        Ok(true)
     }
 
     fn update_assistant(&mut self, body: String) -> Result<()> {
@@ -886,18 +935,23 @@ impl FullScreen {
     }
 
     fn trim_history(&mut self) {
-        let mut line_count = 0usize;
-        for card in self.model.cards.iter().rev() {
-            line_count += card.body.lines().count() + 3;
-            if line_count > MAX_HISTORY_LINES {
-                break;
-            }
-        }
-        if self.model.cards.len() > MAX_HISTORY_LINES {
-            let keep_from = self.model.cards.len().saturating_sub(MAX_HISTORY_LINES);
-            self.model.cards.drain(..keep_from);
-        }
+        trim_cards(&mut self.model.cards);
     }
+}
+
+fn trim_cards(cards: &mut Vec<Card>) {
+    let mut line_count = 0usize;
+    let mut keep_from = cards.len();
+    for (index, card) in cards.iter().enumerate().rev() {
+        let card_lines = card.body.lines().count() + 3;
+        // Always preserve the newest complete card, even when it alone exceeds the budget.
+        if keep_from < cards.len() && line_count.saturating_add(card_lines) > MAX_HISTORY_LINES {
+            break;
+        }
+        line_count = line_count.saturating_add(card_lines);
+        keep_from = index;
+    }
+    cards.drain(..keep_from);
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -926,6 +980,7 @@ enum FooterAction {
     Sessions,
     Interrupt,
     Live,
+    Thinking,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1209,6 +1264,13 @@ impl ChatUi {
         }
     }
 
+    pub fn thinking_update(&mut self, text: &str) -> Result<()> {
+        match self.fullscreen.as_ref() {
+            Some(screen) => lock_screen(screen).update_thinking(text.to_string()),
+            None => Ok(()),
+        }
+    }
+
     pub fn assistant_update(&mut self, raw_markdown: &str) -> Result<()> {
         match self.fullscreen.as_ref() {
             Some(screen) => lock_screen(screen).update_assistant(raw_markdown.to_string()),
@@ -1378,6 +1440,7 @@ impl ChatUi {
                     ),
                     CardKind::Output => crate::render::render_tool_output(&body, self.plain),
                     CardKind::Error => crate::render::render_error(&body, self.plain),
+                    CardKind::Thinking => format!("Thinking:\n{body}\n"),
                     // Plain mode has no cells; a note is just a line of output.
                     CardKind::Note => format!(
                         "{body}
@@ -2188,7 +2251,7 @@ fn render_ask(frame: &mut Frame<'_>, ask: &AskState, area: Rect) {
 /// `?` overlay: the keybinding sheet.
 fn render_help(frame: &mut Frame<'_>, area: Rect, scroll: usize) {
     let width = 64.min(area.width.saturating_sub(4));
-    let rows: [(&str, &str); 22] = [
+    let rows: [(&str, &str); 23] = [
         ("Enter", "send exact editor text"),
         ("Shift/Ctrl+Enter", "newline without sending"),
         ("\u{2190}/\u{2192}", "move the caret"),
@@ -2197,6 +2260,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, scroll: usize) {
         ("Ctrl+K", "switch model"),
         ("Ctrl+S", "resume a session"),
         ("Ctrl+O / click", "expand or fold tool output"),
+        ("Ctrl+T / click thinking", "expand or fold reasoning"),
         ("Ctrl+F", "search the transcript"),
         ("Ctrl+B", "show or hide the sidebar"),
         ("Ctrl+Y", "copy the latest answer"),
@@ -2528,30 +2592,28 @@ fn input_thread(
                                 }
                             }
                             Some(HitTarget::Sidebar(SidebarAction::Model)) => {
-                                let items = models_src
-                                    .read()
-                                    .unwrap_or_else(PoisonError::into_inner)
-                                    .clone();
-                                if !items.is_empty() {
-                                    let mut s = lock_screen(&screen.0);
-                                    s.model.dialog =
-                                        Some(DialogState::new("Select Model", "/model ", items));
-                                    drop(s);
-                                    let _ = screen.draw_now();
-                                }
+                                open_picker_or_notice(
+                                    &screen,
+                                    models_src
+                                        .read()
+                                        .unwrap_or_else(PoisonError::into_inner)
+                                        .clone(),
+                                    "Select Model",
+                                    "/model ",
+                                    EMPTY_MODELS_NOTICE,
+                                );
                             }
                             Some(HitTarget::Sidebar(SidebarAction::Session)) => {
-                                let items = sessions_src
-                                    .read()
-                                    .unwrap_or_else(PoisonError::into_inner)
-                                    .clone();
-                                if !items.is_empty() {
-                                    let mut s = lock_screen(&screen.0);
-                                    s.model.dialog =
-                                        Some(DialogState::new("Resume Session", "/resume ", items));
-                                    drop(s);
-                                    let _ = screen.draw_now();
-                                }
+                                open_picker_or_notice(
+                                    &screen,
+                                    sessions_src
+                                        .read()
+                                        .unwrap_or_else(PoisonError::into_inner)
+                                        .clone(),
+                                    "Resume Session",
+                                    "/resume ",
+                                    EMPTY_SESSIONS_NOTICE,
+                                );
                             }
                             Some(HitTarget::Sidebar(SidebarAction::Mode)) => submit_line(
                                 &screen,
@@ -2570,35 +2632,36 @@ fn input_thread(
                                 let _ = screen.draw_now();
                             }
                             Some(HitTarget::Footer(FooterAction::Models)) => {
-                                let items = models_src
-                                    .read()
-                                    .unwrap_or_else(PoisonError::into_inner)
-                                    .clone();
-                                if !items.is_empty() {
-                                    let mut s = lock_screen(&screen.0);
-                                    s.model.dialog =
-                                        Some(DialogState::new("Select Model", "/model ", items));
-                                    drop(s);
-                                    let _ = screen.draw_now();
-                                }
+                                open_picker_or_notice(
+                                    &screen,
+                                    models_src
+                                        .read()
+                                        .unwrap_or_else(PoisonError::into_inner)
+                                        .clone(),
+                                    "Select Model",
+                                    "/model ",
+                                    EMPTY_MODELS_NOTICE,
+                                );
                             }
                             Some(HitTarget::Footer(FooterAction::Sessions)) => {
-                                let items = sessions_src
-                                    .read()
-                                    .unwrap_or_else(PoisonError::into_inner)
-                                    .clone();
-                                if !items.is_empty() {
-                                    let mut s = lock_screen(&screen.0);
-                                    s.model.dialog =
-                                        Some(DialogState::new("Resume Session", "/resume ", items));
-                                    drop(s);
-                                    let _ = screen.draw_now();
-                                }
+                                open_picker_or_notice(
+                                    &screen,
+                                    sessions_src
+                                        .read()
+                                        .unwrap_or_else(PoisonError::into_inner)
+                                        .clone(),
+                                    "Resume Session",
+                                    "/resume ",
+                                    EMPTY_SESSIONS_NOTICE,
+                                );
                             }
                             Some(HitTarget::Footer(FooterAction::Interrupt)) => {
                                 if busy.load(std::sync::atomic::Ordering::SeqCst) {
                                     interrupt.notify_one();
                                 }
+                            }
+                            Some(HitTarget::Footer(FooterAction::Thinking)) => {
+                                let _ = lock_screen(&screen.0).toggle_thinking_card();
                             }
                             Some(HitTarget::Footer(FooterAction::Live)) => {
                                 let mut s = lock_screen(&screen.0);
@@ -2944,33 +3007,37 @@ fn input_thread(
 
         // Openers.
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('k') {
-            let items = models_src
-                .read()
-                .unwrap_or_else(PoisonError::into_inner)
-                .clone();
-            if !items.is_empty() {
-                let mut sc = lock_screen(&screen.0);
-                sc.model.dialog = Some(DialogState::new("Select Model", "/model ", items));
-                drop(sc);
-                let _ = screen.draw_now();
-            }
+            open_picker_or_notice(
+                &screen,
+                models_src
+                    .read()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone(),
+                "Select Model",
+                "/model ",
+                EMPTY_MODELS_NOTICE,
+            );
             continue;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
-            let items = sessions_src
-                .read()
-                .unwrap_or_else(PoisonError::into_inner)
-                .clone();
-            if !items.is_empty() {
-                let mut sc = lock_screen(&screen.0);
-                sc.model.dialog = Some(DialogState::new("Resume Session", "/resume ", items));
-                drop(sc);
-                let _ = screen.draw_now();
-            }
+            open_picker_or_notice(
+                &screen,
+                sessions_src
+                    .read()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone(),
+                "Resume Session",
+                "/resume ",
+                EMPTY_SESSIONS_NOTICE,
+            );
             continue;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('o') {
             let _ = lock_screen(&screen.0).toggle_last_card();
+            continue;
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('t') {
+            let _ = lock_screen(&screen.0).toggle_thinking_card();
             continue;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('y') {
@@ -3326,6 +3393,11 @@ fn submit_line(
             let _ = s.draw();
             return;
         }
+        if is_busy_navigation(&control) {
+            let mut s = lock_screen(&screen.0);
+            let _ = s.add_notice(BUSY_NAV_NOTICE);
+            return;
+        }
     }
     let answer_tx = requester
         .lock()
@@ -3345,6 +3417,35 @@ fn submit_line(
     } else {
         let _ = tx.send(HubEvent::Line(line));
     }
+}
+
+const EMPTY_MODELS_NOTICE: &str = "no provider profiles configured; use /model __add__";
+const EMPTY_SESSIONS_NOTICE: &str = "no saved sessions yet; send a message to create one";
+const BUSY_NAV_NOTICE: &str =
+    "model/session switch rejected while a turn is running; interrupt the current turn first";
+
+fn is_busy_navigation(control: &str) -> bool {
+    control == "/model"
+        || control.starts_with("/model ")
+        || control == "/resume"
+        || control.starts_with("/resume ")
+}
+
+fn open_picker_or_notice(
+    screen: &ScreenHandle,
+    items: Vec<(String, String)>,
+    title: &str,
+    prefix: &str,
+    empty_notice: &str,
+) {
+    let mut s = lock_screen(&screen.0);
+    if items.is_empty() {
+        let _ = s.add_notice(empty_notice);
+        return;
+    }
+    s.model.dialog = Some(DialogState::new(title, prefix, items));
+    drop(s);
+    let _ = screen.draw_now();
 }
 
 fn needle_of(buf: &str) -> String {
@@ -3541,23 +3642,17 @@ fn render(frame: &mut Frame<'_>, model: &Model) -> RenderInfo {
         );
     }
     if let Some(area) = sidebar_area {
-        frame.render_widget(sidebar_paragraph(model, area), area);
-        // Sidebar actions use whole semantic rows, not individual glyph coordinates. The compact
-        // rail keeps these rows stable enough to remain useful at narrow supported widths.
-        if let Some(entries) = &model.sidebar {
-            for (row, (key, _)) in entries.iter().enumerate() {
-                let target = match key.as_str() {
-                    "Session" => Some(SidebarAction::Session),
-                    "Model" => Some(SidebarAction::Model),
-                    "mode" | "Mode" => Some(SidebarAction::Mode),
-                    _ => None,
-                };
-                if let Some(target) = target {
-                    hit_regions.push(HitRegion {
-                        area: Rect::new(area.x, area.y + row as u16, area.width, 1),
-                        target: HitTarget::Sidebar(target),
-                    });
-                }
+        let sidebar_rows = sidebar_rows(model, area);
+        frame.render_widget(
+            sidebar_paragraph(sidebar_rows.iter().map(|row| row.line.clone()), area),
+            area,
+        );
+        for (row, rendered) in sidebar_rows.iter().enumerate() {
+            if let Some(target) = rendered.action {
+                hit_regions.push(HitRegion {
+                    area: Rect::new(area.x, area.y + 1 + row as u16, area.width, 1),
+                    target: HitTarget::Sidebar(target),
+                });
             }
         }
     }
@@ -3587,6 +3682,25 @@ fn render(frame: &mut Frame<'_>, model: &Model) -> RenderInfo {
         }
     }
     frame.render_widget(editor_widget(model, editor_area), editor_area);
+    if model.thinking.is_some() {
+        let wall_row = editor_area.y
+            + if model.input.is_empty() {
+                0
+            } else {
+                editor_view(
+                    &model.input,
+                    model.input_caret,
+                    editor_area.width.saturating_sub(4).max(1) as usize,
+                )
+                .rows
+                .len()
+                .min(EDITOR_VISIBLE_LINES) as u16
+            };
+        hit_regions.push(HitRegion {
+            area: Rect::new(editor_area.x, wall_row, editor_area.width, 1),
+            target: HitTarget::Footer(FooterAction::Thinking),
+        });
+    }
 
     // Terminal cursor sits at the end of the typed text whenever the editor owns input. This
     // includes the home screen: ratatui hides the cursor on any frame that sets no position,
@@ -3736,6 +3850,7 @@ fn footer_hit_regions(model: &Model, area: Rect) -> Vec<HitRegion> {
     add("? help", FooterAction::Help);
     if model.thinking.is_some() {
         add("  ·  Esc interrupts", FooterAction::Interrupt);
+        add("  ·  click thinking", FooterAction::Thinking);
     }
     if model.scroll_from_bottom > 0 {
         add("  ·  Ctrl+End live", FooterAction::Live);
@@ -3898,6 +4013,16 @@ fn editor_widget(model: &Model, area: Rect) -> Paragraph<'static> {
             format!("{label}{dots}"),
             Style::default().fg(MUTED()).add_modifier(Modifier::DIM),
         ));
+        if model
+            .cards
+            .iter()
+            .any(|card| matches!(card.kind, CardKind::Thinking) && !card.body.trim().is_empty())
+        {
+            wall_line.push(Span::styled(
+                "  click to toggle".to_string(),
+                Style::default().fg(BORDER()),
+            ));
+        }
         rows.push(Line::from(wall_line));
     }
     let block = Block::default()
@@ -4017,8 +4142,15 @@ fn popup_widget(model: &Model, area: Rect) -> Paragraph<'static> {
         )
 }
 
-fn sidebar_paragraph(model: &Model, area: Rect) -> Paragraph<'static> {
+#[derive(Clone)]
+struct SidebarRow {
+    line: Line<'static>,
+    action: Option<SidebarAction>,
+}
+
+fn sidebar_rows(model: &Model, area: Rect) -> Vec<SidebarRow> {
     let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut actions: Vec<Option<SidebarAction>> = Vec::new();
     // Left border eats one column; keep a little padding so values never kiss the rail.
     let max = area.width.saturating_sub(3).max(1) as usize;
     if let Some(plan) = &model.plan {
@@ -4026,6 +4158,7 @@ fn sidebar_paragraph(model: &Model, area: Rect) -> Paragraph<'static> {
             "Plan",
             Style::default().fg(MUTED()).add_modifier(Modifier::BOLD),
         )));
+        actions.push(None);
         let compact_plan = area.width < 28 || area.height < 12;
         let steps = if compact_plan {
             plan.steps
@@ -4046,6 +4179,7 @@ fn sidebar_paragraph(model: &Model, area: Rect) -> Paragraph<'static> {
                 format!("Progress {completed}/{}", plan.steps.len()),
                 Style::default().fg(MUTED()),
             ));
+            actions.push(None);
         }
         for (step, status) in steps {
             let mark = match status {
@@ -4064,6 +4198,7 @@ fn sidebar_paragraph(model: &Model, area: Rect) -> Paragraph<'static> {
                     }),
                 ),
             ]));
+            actions.push(None);
         }
     }
     if let Some(entries) = &model.sidebar {
@@ -4077,13 +4212,22 @@ fn sidebar_paragraph(model: &Model, area: Rect) -> Paragraph<'static> {
                         "─".repeat(max.min(key.len() + 4)),
                         Style::default().fg(BORDER()),
                     )));
+                    actions.push(None);
                 }
                 lines.push(Line::from(Span::styled(
                     key.to_string(),
                     Style::default().fg(MUTED()).add_modifier(Modifier::BOLD),
                 )));
+                actions.push((key == "Session").then_some(SidebarAction::Session));
                 for value_line in value.split('\n') {
+                    let before = lines.len();
                     push_sidebar_value(&mut lines, key, value_line, max);
+                    let action = match value_line.split_once('\t').map(|(label, _)| label) {
+                        Some("model") => Some(SidebarAction::Model),
+                        Some("mode") => Some(SidebarAction::Mode),
+                        _ => None,
+                    };
+                    actions.extend(std::iter::repeat_n(action, lines.len() - before));
                 }
                 continue;
             }
@@ -4091,18 +4235,37 @@ fn sidebar_paragraph(model: &Model, area: Rect) -> Paragraph<'static> {
                 format!("{key} "),
                 Style::default().fg(TEXT()).add_modifier(Modifier::BOLD),
             )));
+            actions.push(match key.as_str() {
+                "Model" => Some(SidebarAction::Model),
+                "Mode" | "mode" => Some(SidebarAction::Mode),
+                _ => None,
+            });
             // Values may carry newlines (Last turn metrics); ratatui strips them inside
             // spans, so split before styling. Tab-separated metric rows keep label/value
             // contrast; project paths truncate from the left so the leaf stays readable.
             for value_line in value.split('\n') {
+                let before = lines.len();
                 push_sidebar_value(&mut lines, key, value_line, max);
+                actions.extend(std::iter::repeat_n(None, lines.len() - before));
             }
             if !compact && i + 1 < entries.len() {
                 lines.push(Line::from(""));
+                actions.push(None);
             }
         }
     }
-    Paragraph::new(Text::from(lines))
+    lines
+        .into_iter()
+        .zip(actions)
+        .map(|(line, action)| SidebarRow { line, action })
+        .collect()
+}
+
+fn sidebar_paragraph(
+    lines: impl IntoIterator<Item = Line<'static>>,
+    _area: Rect,
+) -> Paragraph<'static> {
+    Paragraph::new(Text::from(lines.into_iter().collect::<Vec<_>>()))
         .style(Style::default().bg(BG_PANEL()))
         .block(
             Block::default()
@@ -4275,7 +4438,9 @@ fn footer_widget(model: &Model, area: Rect) -> Paragraph<'static> {
     // Keep action/status hints ahead of discoverability hints: truncation should not hide control
     // of an in-flight turn or the fact that input was queued.
     if model.thinking.is_some() {
-        left.push_str("  \u{b7}  Esc interrupts  \u{b7}  Enter steers");
+        left.push_str(
+            "  \u{b7}  Esc interrupts  \u{b7}  click thinking  \u{b7}  Enter queues for next step",
+        );
     }
     if model.scroll_from_bottom > 0 {
         left.push_str(&format!(
@@ -4286,7 +4451,7 @@ fn footer_widget(model: &Model, area: Rect) -> Paragraph<'static> {
     if model.queued_count > 0 {
         let plural = if model.queued_count == 1 { "" } else { "s" };
         left.push_str(&format!(
-            "  \u{b7}  {} message{} queued",
+            "  \u{b7}  {} input{} queued for next agent step",
             model.queued_count, plural
         ));
     }
@@ -4583,6 +4748,7 @@ fn card_lines(card: &Card, width: usize) -> Vec<Line<'static>> {
             },
             CardKind::Error => (RED(), Style::default().fg(TEXT())),
             CardKind::Note => (MUTED(), Style::default().fg(NOTICE_FG())),
+            CardKind::Thinking => (MUTED(), Style::default().fg(MUTED())),
         }
     };
 
@@ -4663,7 +4829,11 @@ fn card_lines(card: &Card, width: usize) -> Vec<Line<'static>> {
 
     // Tool cards lead with their own header row. Without it a finished call reduced to a
     // bare outcome ("completed - 0ms - 332 chars") that never said which tool produced it.
-    if matches!(card.kind, CardKind::Tool | CardKind::Note) && !card.title.is_empty() {
+    if matches!(
+        card.kind,
+        CardKind::Tool | CardKind::Note | CardKind::Thinking
+    ) && !card.title.is_empty()
+    {
         push_bordered(
             &mut out,
             vec![Span::styled(
@@ -4688,7 +4858,7 @@ fn card_lines(card: &Card, width: usize) -> Vec<Line<'static>> {
     if card.collapsed {
         // A card that already shows an outcome needs no peek: it folds to two tidy rows and
         // opens on demand. Cards without one keep the old head window.
-        let peek = if card.status.is_some() {
+        let peek = if card.status.is_some() || matches!(card.kind, CardKind::Thinking) {
             0
         } else {
             COLLAPSED_PEEK
@@ -4920,6 +5090,166 @@ fn wrap_display(text: &str, width: usize) -> Vec<String> {
 mod tests {
     use super::*;
 
+    fn test_card(id: u64, lines: usize) -> Card {
+        Card {
+            id,
+            kind: CardKind::Output,
+            title: "Assistant".into(),
+            body: std::iter::repeat_n("line", lines)
+                .collect::<Vec<_>>()
+                .join("\n"),
+            status: None,
+            collapsed: false,
+        }
+    }
+
+    #[test]
+    fn trim_history_enforces_cumulative_budget_without_splitting_newest_card() {
+        let mut cards = vec![
+            test_card(1, 2_500),
+            test_card(2, 2_500),
+            test_card(3, 5_000),
+        ];
+        trim_cards(&mut cards);
+        assert_eq!(
+            cards.iter().map(|card| card.id).collect::<Vec<_>>(),
+            vec![3]
+        );
+        assert_eq!(cards[0].body.lines().count(), 5_000);
+
+        let mut cards = vec![
+            test_card(1, 2_500),
+            test_card(2, 1_000),
+            test_card(3, 1_000),
+        ];
+        trim_cards(&mut cards);
+        assert_eq!(
+            cards.iter().map(|card| card.id).collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+    }
+
+    fn thinking_card(id: u64, body: &str, collapsed: bool) -> Card {
+        Card {
+            id,
+            kind: CardKind::Thinking,
+            title: "Thinking".into(),
+            body: body.into(),
+            status: None,
+            collapsed,
+        }
+    }
+
+    #[test]
+    fn thinking_card_stays_collapsed_until_toggled() {
+        let collapsed = thinking_card(1, "consider the cache prefix", true);
+        let rows = rendered(&collapsed, 60);
+        assert!(
+            rows.iter().any(|row| row.contains("Thinking")),
+            "header stays visible: {rows:?}"
+        );
+        assert!(
+            rows.iter().all(|row| !row.contains("cache prefix")),
+            "body stays folded: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.contains("ctrl+o or click")),
+            "expand hint is present: {rows:?}"
+        );
+
+        let open = thinking_card(1, "consider the cache prefix", false);
+        let rows = rendered(&open, 60);
+        assert!(
+            rows.iter().any(|row| row.contains("cache prefix")),
+            "expanded body is visible: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn thinking_wall_and_footer_are_click_targets() {
+        let model = Model {
+            intro: false,
+            thinking: Some((0, "Thinking...")),
+            cards: vec![thinking_card(1, "hidden reasoning", true)],
+            ..Default::default()
+        };
+        let backend = ratatui::backend::TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let mut info = RenderInfo::default();
+        terminal
+            .draw(|frame| info = render(frame, &model))
+            .expect("draw");
+        assert!(
+            info.hits.iter().any(|hit| {
+                hit.target == HitTarget::Footer(FooterAction::Thinking)
+                    && hit_at(&info.hits, hit.area.x, hit.area.y)
+                        == Some(HitTarget::Footer(FooterAction::Thinking))
+            }),
+            "thinking wall/footer maps to a click target"
+        );
+        assert!(
+            info.hits.iter().any(|hit| hit.target == HitTarget::Card(1)),
+            "thinking card itself remains clickable"
+        );
+    }
+
+    #[test]
+    fn busy_navigation_is_rejected_instead_of_queued() {
+        assert!(is_busy_navigation("/model fast"));
+        assert!(is_busy_navigation("/resume abc123"));
+        assert!(!is_busy_navigation("please continue"));
+        assert!(!is_busy_navigation("/mode next"));
+        assert!(BUSY_NAV_NOTICE.contains("interrupt the current turn first"));
+    }
+
+    #[test]
+    fn empty_picker_notice_is_actionable() {
+        assert!(EMPTY_MODELS_NOTICE.contains("/model __add__"));
+        assert!(EMPTY_SESSIONS_NOTICE.contains("send a message"));
+        let dialog = DialogState::new("Select Model", "/model ", Vec::new());
+        assert!(dialog.filtered().is_empty());
+    }
+
+    #[test]
+    fn sidebar_clicks_follow_rendered_semantic_rows_with_plan_and_sections() {
+        let model = Model {
+            plan: Some(crate::tools::PlanView {
+                steps: vec![("inspect".into(), crate::tools::PlanStepStatus::InProgress)],
+                active: Some("inspect".into()),
+            }),
+            sidebar: Some(vec![
+                ("Session".into(), "Current\nid\tabc".into()),
+                (
+                    "Runtime".into(),
+                    "model\tfast\nmode\tbuild\nproject\tkamui".into(),
+                ),
+                ("Context".into(), "100 tokens".into()),
+            ]),
+            ..Default::default()
+        };
+        let backend = ratatui::backend::TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let mut info = RenderInfo::default();
+        terminal
+            .draw(|frame| info = render(frame, &model))
+            .expect("draw");
+        for action in [
+            SidebarAction::Session,
+            SidebarAction::Model,
+            SidebarAction::Mode,
+        ] {
+            let hit = info
+                .hits
+                .iter()
+                .find(|hit| hit.target == HitTarget::Sidebar(action))
+                .expect("semantic sidebar row");
+            assert_eq!(
+                hit_at(&info.hits, hit.area.x, hit.area.y),
+                Some(HitTarget::Sidebar(action))
+            );
+        }
+    }
+
     #[test]
     fn tiny_ask_geometry_stays_inside_frame() {
         let ask = AskState {
@@ -5106,7 +5436,14 @@ mod tests {
         let mut terminal = Terminal::new(backend).expect("test terminal");
         terminal
             .draw(|frame| {
-                frame.render_widget(sidebar_paragraph(&model, frame.area()), frame.area())
+                let area = frame.area();
+                frame.render_widget(
+                    sidebar_paragraph(
+                        sidebar_rows(&model, area).into_iter().map(|row| row.line),
+                        area,
+                    ),
+                    area,
+                )
             })
             .expect("draw");
         let buffer = terminal.backend().buffer().clone();

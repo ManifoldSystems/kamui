@@ -63,17 +63,21 @@ where
         .find(&active_name)
         .cloned()
         .unwrap_or_else(|| config.default().clone());
-    if let Some(th) = database
-        .get_setting("active_theme")?
-        .and_then(|s| s.parse::<crate::theme::Theme>().ok())
-    {
-        config.theme = th;
+    let saved_theme = database.get_setting("active_theme")?;
+    let mut startup_warnings = Vec::new();
+    if let Some(name) = saved_theme {
+        match name.parse::<crate::theme::Theme>() {
+            Ok(th) => config.theme = th,
+            Err(error) => startup_warnings.push(format!("theme: saved theme '{name}': {error}")),
+        }
     }
     let mut provider = build_provider(&active);
     let mut context_window = active.context_window;
     let job_registry = tools.jobs();
     let command_library = commands::CommandLibrary::load(project.root());
     let mut skill_library = crate::skills::SkillLibrary::load(project.root());
+    let settings_report = crate::settings::load_disabled_skills_report(project.root());
+    startup_warnings.extend(settings_report.warnings.iter().cloned());
     // Warnings captured when `/warnings fix` was invoked, so the turn that repairs them can
     // be compared against a fresh load and reported instead of ending silently.
     let mut pending_skill_fix: Option<Vec<String>> = None;
@@ -93,7 +97,7 @@ where
     let mut hub = chat_ui.screen_handle().map(InputHub::spawn);
     let interrupt = hub.as_ref().map(|h| h.interrupt.clone());
     if let Some(hub) = hub.as_ref() {
-        refresh_model_source(&config, hub);
+        refresh_model_source(&config, &active.name, hub);
         refresh_session_source(database, hub);
         if let Ok(candidates) = project.at_path_candidates() {
             hub.set_path_candidates(candidates);
@@ -115,20 +119,22 @@ where
     // One tidy startup line instead of a wall of per-skill warnings; /skills still lists every
     // individual reason.
     let skill_warning_count = skill_library.warnings().len();
-    if skill_warning_count > 0 {
+    let mut warning_details = startup_warnings.clone();
+    warning_details.extend(skill_library.warnings().iter().cloned());
+    if !warning_details.is_empty() {
         if use_tui {
             chat_ui.warning(&format!(
-                "{skill_warning_count} skill folder(s) skipped (invalid name or frontmatter) — /warnings details, /warnings fix"
+                "{} startup warning(s) — /warnings details{}",
+                warning_details.len(),
+                if skill_warning_count > 0 {
+                    ", /warnings fix"
+                } else {
+                    ""
+                }
             ))?;
-            chat_ui.set_warning_details(
-                skill_library
-                    .warnings()
-                    .iter()
-                    .map(|w| w.to_string())
-                    .collect(),
-            )?;
+            chat_ui.set_warning_details(warning_details.clone())?;
         } else {
-            for warning in skill_library.warnings() {
+            for warning in &warning_details {
                 eprintln!("warning: {warning}");
             }
         }
@@ -253,7 +259,7 @@ where
         chat_ui.notice(&format!("Plan Mode — pending plan\n{rendered}"))?;
     }
     let mut input_rx = if use_tui { None } else { Some(input_channel()) };
-    let mut disabled_skills = crate::settings::load_disabled_skills(project.root());
+    let mut disabled_skills = settings_report.disabled;
 
     // Prompt-cache prefix watch. Only cache-pinned profiles (Orvix Coding Plan, `send_session_id`)
     // pay attention: everywhere else a changed prefix costs nothing worth a notice.
@@ -536,7 +542,7 @@ where
                     head_messages = None;
                     memory_dirty = true;
                     prefix_guard = cache::PrefixGuard::new(active.send_session_id);
-                    refresh_model_source(&config, hub_ref);
+                    refresh_model_source(&config, &active.name, hub_ref);
                     update_sidebar(
                         &mut chat_ui,
                         session.as_ref(),
@@ -635,13 +641,9 @@ where
                     }
                     "details" | "expand" => {
                         show_warnings = true;
-                        chat_ui.set_warning_details(
-                            skill_library
-                                .warnings()
-                                .iter()
-                                .map(|w| w.to_string())
-                                .collect(),
-                        )?;
+                        let mut details = startup_warnings.clone();
+                        details.extend(skill_library.warnings().iter().cloned());
+                        chat_ui.set_warning_details(details)?;
                         chat_ui.set_warnings_expanded(true)?;
                         chat_ui.set_warnings_visible(true)?;
                         chat_ui.notice("Warning details expanded.")?;
@@ -704,8 +706,10 @@ where
                                 now_disabled,
                             ) {
                                 Ok(()) => {
-                                    disabled_skills =
-                                        crate::settings::load_disabled_skills(project.root());
+                                    let report = crate::settings::load_disabled_skills_report(
+                                        project.root(),
+                                    );
+                                    disabled_skills = report.disabled;
                                     // Skill block is part of the frozen head: refresh next turn.
                                     head_messages = None;
                                     head_rebuilt_this_turn = true;
@@ -833,6 +837,9 @@ where
                 head_messages = None;
                 memory_dirty = true;
                 prefix_guard = cache::PrefixGuard::new(active.send_session_id);
+                if let Some(hub) = hub.as_ref() {
+                    refresh_model_source(&config, &active.name, hub);
+                }
                 continue;
             }
             if command == "/status" {
@@ -1447,6 +1454,7 @@ where
             };
 
             let mut content = String::new();
+            let mut reasoning = String::new();
             let mut ttft: Option<Duration> = None;
             // Styles the streamed text a line at a time. `content` keeps the raw markdown, since
             // that is what gets persisted and re-sent to the model.
@@ -1480,6 +1488,10 @@ where
                     }
                 };
                 match event {
+                    Some(Ok(StreamEvent::Reasoning(delta))) => {
+                        reasoning.push_str(&delta);
+                        chat_ui.thinking_update(&reasoning)?;
+                    }
                     Some(Ok(StreamEvent::Delta(delta))) => {
                         stop_spinner(&mut spinner, &mut chat_ui).await;
                         if ttft.is_none() {
@@ -2152,7 +2164,11 @@ where
     for warning in skill_library.warnings() {
         eprintln!("warning: {warning}");
     }
-    let disabled_skills = crate::settings::load_disabled_skills(project.root());
+    let settings_report = crate::settings::load_disabled_skills_report(project.root());
+    for warning in &settings_report.warnings {
+        eprintln!("warning: {warning}");
+    }
+    let disabled_skills = settings_report.disabled;
     let expanded_command = command_library.expand(prompt);
     let expanded_skill = if expanded_command.is_none() {
         skill_library.expand_filtered(prompt, &disabled_skills)
@@ -3305,14 +3321,34 @@ fn print_history_preview(messages: &[Message]) {
 /// figure tracks the live conversation.
 /// Model-picker entries: every configured profile plus the registry entry that opens the
 /// add-provider wizard (onboarding reused as an in-TUI model registry).
-fn model_dialog_items(config: &Config) -> Vec<(String, String)> {
+fn model_dialog_items(config: &Config, active_name: &str) -> Vec<(String, String)> {
     let mut items: Vec<(String, String)> = config
         .profiles
         .iter()
         .map(|profile| {
+            let mut capabilities = Vec::new();
+            if !profile.tools {
+                capabilities.push("tools off".to_string());
+            }
+            if profile.send_session_id {
+                capabilities.push("Coding/sticky".to_string());
+            }
+            if let Some(window) = profile.context_window {
+                capabilities.push(format!("{}k context", window / 1_000));
+            }
+            let active = if profile.name == active_name {
+                "● "
+            } else {
+                "  "
+            };
+            let metadata = if capabilities.is_empty() {
+                String::new()
+            } else {
+                format!(" · {}", capabilities.join(" · "))
+            };
             (
                 profile.name.clone(),
-                format!("{} · {}", profile.name, profile.model),
+                format!("{active}{} · {}{metadata}", profile.name, profile.model),
             )
         })
         .collect();
@@ -3324,8 +3360,8 @@ fn model_dialog_items(config: &Config) -> Vec<(String, String)> {
 }
 
 /// Refreshes the picker source from the live config (after adds/switches).
-fn refresh_model_source(config: &Config, hub: &InputHub) {
-    hub.set_models(model_dialog_items(config));
+fn refresh_model_source(config: &Config, active_name: &str, hub: &InputHub) {
+    hub.set_models(model_dialog_items(config, active_name));
 }
 /// Pushes recent sessions into the Ctrl+S switcher (id -> title labels).
 fn refresh_session_source(database: &Database, hub: &InputHub) {
@@ -3334,7 +3370,20 @@ fn refresh_session_source(database: &Database, hub: &InputHub) {
             sessions
                 .into_iter()
                 .take(15)
-                .map(|session| (session.id.clone(), session.title))
+                .map(|session| {
+                    let tokens = if session.total_tokens >= 1_000 {
+                        format!("{:.1}k tok", session.total_tokens as f64 / 1_000.0)
+                    } else {
+                        format!("{} tok", session.total_tokens)
+                    };
+                    (
+                        session.id.clone(),
+                        format!(
+                            "{} · {} msgs · {tokens}",
+                            session.title, session.message_count
+                        ),
+                    )
+                })
                 .collect(),
         );
     }
@@ -5306,6 +5355,29 @@ mod tests {
             completions_path: None,
             send_session_id: false,
         }
+    }
+
+    #[test]
+    fn model_picker_labels_profile_model_active_state_and_capabilities() {
+        let mut coding = profile("coding", "coder-v2", true);
+        coding.send_session_id = true;
+        coding.context_window = Some(128_000);
+        let config = Config {
+            profiles: vec![coding, profile("chat", "small", false)],
+            default_profile: "coding".into(),
+            mcp_servers: Vec::new(),
+            allow_commands: Vec::new(),
+            command_timeout_secs: 30,
+            background_max_secs: 1800,
+            prices: Default::default(),
+            theme: Default::default(),
+        };
+        let items = model_dialog_items(&config, "coding");
+        assert!(items[0].1.contains("● coding · coder-v2"));
+        assert!(items[0].1.contains("Coding/sticky"));
+        assert!(items[0].1.contains("128k context"));
+        assert!(items[1].1.contains("chat · small · tools off"));
+        assert_eq!(items.last().unwrap().0, "__add__");
     }
 
     #[test]
