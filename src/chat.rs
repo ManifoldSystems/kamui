@@ -273,8 +273,8 @@ where
     let mut plan_requested = false;
     // `/warnings` flips this; the transcript only renders the warning rail when it is set.
     let mut show_warnings = true;
-    // In-flight "Add provider" wizard: base URL + API key awaiting a picked model id.
-    let mut pending_add: Option<(String, String)> = None;
+    // In-flight "Add provider" wizard: base URL + API key + Coding flag awaiting a model.
+    let mut pending_add: Option<(String, String, bool)> = None;
     // Background jobs already reported as finished, so each is announced once.
     let mut announced_jobs: HashSet<String> = HashSet::new();
     // One fixed tool array per Session (prefix-cache stability): computed once from the
@@ -458,18 +458,31 @@ where
             if command == "/model" && use_tui {
                 let hub_ref = hub.as_mut().expect("tui implies hub");
                 if argument == "__add__" {
-                    chat_ui
-                        .notice("Add provider — Base URL (Enter = https://api.openai.com/v1):")?;
-                    let base = hub_ref.request_line().await.unwrap_or_default();
-                    let base = base.trim().trim_end_matches('/');
-                    let base = if base.is_empty() {
-                        "https://api.openai.com/v1"
+                    hub_ref.open_dialog(
+                        "Provider Type",
+                        "/model __provider__ ",
+                        vec![
+                            ("orvix".into(), "Orvix Coding".into()),
+                            ("generic".into(), "Other OpenAI-compatible".into()),
+                        ],
+                    );
+                    continue;
+                }
+                if let Some(kind) = argument.strip_prefix("__provider__ ") {
+                    let orvix_coding = kind == "orvix";
+                    let base = if orvix_coding {
+                        crate::config::ORVIX_BASE_URL.to_string()
                     } else {
-                        base
-                    }
-                    .to_string();
-                    chat_ui.notice("API key (input is echoed):")?;
-                    let key = hub_ref.request_line().await.unwrap_or_default();
+                        chat_ui.notice("Base URL (Enter = https://api.openai.com/v1):")?;
+                        let entered = hub_ref.request_line().await.unwrap_or_default();
+                        let entered = entered.trim().trim_end_matches('/');
+                        if entered.is_empty() {
+                            "https://api.openai.com/v1".to_string()
+                        } else {
+                            entered.to_string()
+                        }
+                    };
+                    let key = hub_ref.request_secret().await.unwrap_or_default();
                     let key = key.trim().to_string();
                     if key.is_empty() {
                         chat_ui.notice("Cancelled—empty API key.")?;
@@ -479,7 +492,7 @@ where
                     match crate::provider::openai::OpenAIProvider::list_models(&key, &base).await {
                         Ok(models) if !models.is_empty() => {
                             chat_ui.notice(&format!("{} models found— pick one.", models.len()))?;
-                            pending_add = Some((base, key));
+                            pending_add = Some((base, key, orvix_coding));
                             hub_ref.open_dialog(
                                 "Pick Model",
                                 "/model __picked__ ",
@@ -494,12 +507,13 @@ where
                     continue;
                 }
                 if let Some(rest) = argument.strip_prefix("__picked__ ") {
-                    let Some((base, key)) = pending_add.as_ref() else {
+                    let Some((base, key, orvix_coding)) = pending_add.as_ref() else {
                         chat_ui.error("No pending provider registration.")?;
                         continue;
                     };
                     let path = crate::config::global_config_path()?;
-                    let name = crate::config::append_profile(&path, base, key, rest)?;
+                    let name =
+                        crate::config::append_profile(&path, base, key, rest, *orvix_coding)?;
                     let profile = crate::config::Profile {
                         name: name.clone(),
                         model: rest.to_string(),
@@ -508,8 +522,9 @@ where
                         context_window: None,
                         tools: true,
                         embedding_model: None,
-                        completions_path: None,
-                        send_session_id: false,
+                        completions_path: orvix_coding
+                            .then(|| crate::config::ORVIX_COMPLETIONS_PATH.to_string()),
+                        send_session_id: *orvix_coding,
                     };
                     active = profile.clone();
                     provider = build_provider(&active);
@@ -517,6 +532,10 @@ where
                     database.set_setting(ACTIVE_PROFILE_KEY, &name)?;
                     config.profiles.push(profile);
                     pending_add = None;
+                    session_tools = None;
+                    head_messages = None;
+                    memory_dirty = true;
+                    prefix_guard = cache::PrefixGuard::new(active.send_session_id);
                     refresh_model_source(&config, hub_ref);
                     update_sidebar(
                         &mut chat_ui,
@@ -813,6 +832,7 @@ where
                 session_tools = None;
                 head_messages = None;
                 memory_dirty = true;
+                prefix_guard = cache::PrefixGuard::new(active.send_session_id);
                 continue;
             }
             if command == "/status" {

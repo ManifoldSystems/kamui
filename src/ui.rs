@@ -141,6 +141,9 @@ fn palette() -> Option<crate::theme::Palette> {
     ACTIVE_THEME.with(|c| c.borrow().clone().and_then(|t| t.palette()))
 }
 fn themed(or: Color, f: impl FnOnce(&crate::theme::Palette) -> String) -> Color {
+    if std::env::var_os("NO_COLOR").is_some() {
+        return Color::Reset;
+    }
     if let Some(p) = palette() {
         crate::theme::ratatui_fg(&f(&p))
     } else {
@@ -167,6 +170,9 @@ fn BG_CHAT() -> Color {
 }
 #[allow(non_snake_case)]
 fn BG_ELEMENT() -> Color {
+    if std::env::var_os("NO_COLOR").is_some() {
+        return Color::Reset;
+    }
     let (r, g, b) = crate::theme::hex_to_rgb(&palette().map(|p| p.bg).unwrap_or("#24283b".into()));
     Color::Rgb(
         r.saturating_sub(12),
@@ -176,6 +182,9 @@ fn BG_ELEMENT() -> Color {
 }
 #[allow(non_snake_case)]
 fn BG_PANEL() -> Color {
+    if std::env::var_os("NO_COLOR").is_some() {
+        return Color::Reset;
+    }
     let (r, g, b) = crate::theme::hex_to_rgb(&palette().map(|p| p.bg).unwrap_or("#1f2335".into()));
     Color::Rgb(
         r.saturating_sub(6),
@@ -302,6 +311,8 @@ struct Model {
     sidebar: Option<Vec<(String, String)>>,
     /// Live typed text rendered inside the editor box; driven by `ScreenHandle`.
     input: String,
+    /// Masks the editor while a credential requester is active.
+    secret_input: bool,
     /// Caret position as a byte offset into `input`. Editing happens here, not only at the end.
     input_caret: usize,
     /// Autocomplete menu state mirrored from the input loop each keystroke.
@@ -384,6 +395,7 @@ pub struct AskState {
     pub options: Vec<String>,
     pub selected: usize,
     pub typed: String,
+    pub scroll: usize,
 }
 
 /// A modal picker that submits an existing slash command on Enter — pure UI sugar over
@@ -433,6 +445,7 @@ impl Default for Model {
             intro: true,
             sidebar: None,
             input: String::new(),
+            secret_input: false,
             input_caret: 0,
             ac_items: Vec::new(),
             ac_selected: 0,
@@ -1633,6 +1646,19 @@ impl InputHub {
         rx.await.ok()
     }
 
+    /// Reads through the normal keyboard owner while rendering bullets instead of the secret.
+    pub async fn request_secret(&mut self) -> Option<String> {
+        {
+            let mut screen = lock_screen(&self.screen.0);
+            screen.model.secret_input = true;
+        }
+        let _ = self.screen.draw_now();
+        let guard = SecretInputGuard(self.screen.clone());
+        let value = self.request_line().await;
+        drop(guard);
+        value
+    }
+
     /// Opens/closes the approval modal from the keyboard-thread side.
     pub fn open_permission_modal(&self, title: &str, body: String) {
         self.open_permission_modal_with_options(title, body, PERM_OPTIONS.to_vec());
@@ -1673,6 +1699,7 @@ impl InputHub {
                 options,
                 selected: 0,
                 typed: String::new(),
+                scroll: 0,
             });
         }
         let _ = self.screen.draw_now();
@@ -1684,6 +1711,19 @@ impl InputHub {
             s.model.ask = None;
         }
         let _ = self.screen.draw_now();
+    }
+}
+
+struct SecretInputGuard(ScreenHandle);
+
+impl Drop for SecretInputGuard {
+    fn drop(&mut self) {
+        let mut screen = lock_screen(&self.0.0);
+        screen.model.secret_input = false;
+        screen.model.input.clear();
+        screen.model.input_caret = 0;
+        drop(screen);
+        let _ = self.0.draw_now();
     }
 }
 
@@ -2034,29 +2074,48 @@ fn render_permission(frame: &mut Frame<'_>, perm: &PermissionState, area: Rect) 
     );
 }
 
+fn ask_geometry(ask: &AskState, area: Rect) -> (Rect, usize, usize) {
+    let width = 64.min(area.width.max(1));
+    let height = area.height.clamp(1, 18);
+    let content = height.saturating_sub(2) as usize;
+    let option_capacity = ask.options.len().min(content.saturating_sub(3) / 2).min(4);
+    let question_capacity = content.saturating_sub(3 + option_capacity).max(1);
+    (
+        Rect::new(
+            area.x + area.width.saturating_sub(width) / 2,
+            area.y + area.height.saturating_sub(height) / 2,
+            width,
+            height,
+        ),
+        question_capacity,
+        option_capacity,
+    )
+}
+
 fn render_ask(frame: &mut Frame<'_>, ask: &AskState, area: Rect) {
-    let width = 64.min(area.width.saturating_sub(4));
+    let (box_area, question_capacity, option_capacity) = ask_geometry(ask, area);
+    let width = box_area.width;
     let question_rows = wrap_display(&ask.question, width.saturating_sub(6) as usize);
-    let option_rows = ask.options.len();
-    let chrome = 5;
-    let height = ((question_rows.len() + option_rows + chrome) as u16)
-        .min(area.height.saturating_sub(2))
-        .max(7);
-    let x = area.x + (area.width.saturating_sub(width)) / 2;
-    let y = area.y + (area.height.saturating_sub(height)) / 2;
-    let box_area = Rect {
-        x,
-        y,
-        width,
-        height,
-    };
+    let question_scroll = ask
+        .scroll
+        .min(question_rows.len().saturating_sub(question_capacity));
     frame.render_widget(Clear, box_area);
     let mut lines: Vec<Line<'static>> = question_rows
         .into_iter()
+        .skip(question_scroll)
+        .take(question_capacity)
         .map(|row| Line::styled(row, Style::default().fg(TEXT())))
         .collect();
-    lines.push(Line::from(""));
-    for (idx, option) in ask.options.iter().enumerate() {
+    let option_start = ask
+        .selected
+        .saturating_sub(option_capacity.saturating_sub(1));
+    for (idx, option) in ask
+        .options
+        .iter()
+        .enumerate()
+        .skip(option_start)
+        .take(option_capacity)
+    {
         let is_on = idx == ask.selected && ask.typed.is_empty();
         let prefix = if is_on { "\u{276f} " } else { "  " };
         lines.push(Line::from(vec![
@@ -2071,7 +2130,7 @@ fn render_ask(frame: &mut Frame<'_>, ask: &AskState, area: Rect) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                option.clone(),
+                crate::tui::truncate_chars(option, width.saturating_sub(9) as usize),
                 Style::default()
                     .fg(if is_on { TEXT() } else { MUTED() })
                     .add_modifier(if is_on {
@@ -2089,7 +2148,6 @@ fn render_ask(frame: &mut Frame<'_>, ask: &AskState, area: Rect) {
     } else {
         ask.typed.clone()
     };
-    lines.push(Line::from(""));
     lines.push(Line::from(vec![
         Span::styled(
             "\u{276f} ".to_string(),
@@ -2120,7 +2178,7 @@ fn render_ask(frame: &mut Frame<'_>, ask: &AskState, area: Rect) {
                 Block::default()
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(BLUE()))
-                    .title(" Ask ")
+                    .title(" Ask user ")
                     .title_style(Style::default().fg(BLUE()).add_modifier(Modifier::BOLD)),
             ),
         box_area,
@@ -2131,10 +2189,7 @@ fn render_ask(frame: &mut Frame<'_>, ask: &AskState, area: Rect) {
 fn render_help(frame: &mut Frame<'_>, area: Rect, scroll: usize) {
     let width = 64.min(area.width.saturating_sub(4));
     let rows: [(&str, &str); 22] = [
-        (
-            "Enter",
-            "send message (accept slash completion, when the menu is open)",
-        ),
+        ("Enter", "send exact editor text"),
         ("Shift/Ctrl+Enter", "newline without sending"),
         ("\u{2190}/\u{2192}", "move the caret"),
         ("Alt+\u{2190}/\u{2192}", "move by word"),
@@ -2157,7 +2212,10 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, scroll: usize) {
         ("Ctrl+Home/End", "jump to top/bottom"),
         ("!<command>", "run a shell command"),
         ("/warnings", "hide or show warnings"),
-        ("Esc", "interrupt the agent"),
+        (
+            "Esc",
+            "close overlay / interrupt; idle drafts are preserved",
+        ),
         ("Ctrl+C x 2", "quit"),
     ];
     // Chrome the sheet always pays for: two borders, the title, and the closing hint.
@@ -2356,9 +2414,12 @@ fn input_thread(
                             } else {
                                 perm.scroll += 3;
                             }
-                        } else if s.model.ask.is_some() {
-                            // The ask panel has no scrollable body; consume the wheel so it cannot
-                            // move the transcript behind the modal.
+                        } else if let Some(ask) = s.model.ask.as_mut() {
+                            if delta < 0 {
+                                ask.scroll = ask.scroll.saturating_sub(3);
+                            } else {
+                                ask.scroll += 3;
+                            }
                         } else if s.model.help_visible {
                             if delta < 0 {
                                 s.model.help_scroll = s.model.help_scroll.saturating_sub(1);
@@ -2666,6 +2727,8 @@ fn input_thread(
                     KeyCode::Down if ask.options.len() > 1 && ask.typed.is_empty() => {
                         ask.selected = (ask.selected + 1) % ask.options.len();
                     }
+                    KeyCode::PageUp => ask.scroll = ask.scroll.saturating_sub(5),
+                    KeyCode::PageDown => ask.scroll += 5,
                     KeyCode::Enter => {
                         let answer = if !ask.typed.is_empty() {
                             ask.typed.clone()
@@ -2829,6 +2892,47 @@ fn input_thread(
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('f') {
             let _ = lock_screen(&screen.0).open_search();
+            continue;
+        }
+
+        // Secret requests bypass normal editor submission: they are never entered into command
+        // history or emitted as a transcript line. Paste editing has already populated `buf`.
+        if lock_screen(&screen.0).model.secret_input {
+            match key.code {
+                KeyCode::Enter => {
+                    let value = std::mem::take(&mut buf);
+                    caret = 0;
+                    if let Some(tx) = requester
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .take()
+                    {
+                        let _ = tx.send(value);
+                    }
+                }
+                KeyCode::Esc => {
+                    buf.clear();
+                    caret = 0;
+                    if let Some(tx) = requester
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .take()
+                    {
+                        drop(tx);
+                    }
+                }
+                KeyCode::Backspace => {
+                    let start = prev_char_boundary(&buf, caret);
+                    buf.replace_range(start..caret, "");
+                    caret = start;
+                }
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    buf.insert(caret, c);
+                    caret += c.len_utf8();
+                }
+                _ => {}
+            }
+            sync(&screen, &buf, caret, 0, Vec::new());
             continue;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('b') {
@@ -3078,20 +3182,9 @@ fn input_thread(
                     sync(&screen, &buf, caret, selected, Vec::new());
                     continue 'keys;
                 }
-                // Slash menu open with a match: Enter accepts the highlighted
-                // candidate and submits it, so `/mo` + Enter runs `/model`
-                // without a Tab stop first. Exact buffer wins: typing the full
-                // command still submits what was typed.
-                let mut line = buf.trim().to_string();
-                if is_slash {
-                    let all = items_for(&needle);
-                    if !all.is_empty()
-                        && !all.iter().any(|(name, _)| line == format!("/{name}"))
-                        && let Some(choice) = all.get(selected)
-                    {
-                        line = format!("/{} ", choice.0);
-                    }
-                }
+                // Enter always submits exactly what the editor contains. Only Tab accepts a
+                // highlighted completion, preventing a partial command from becoming destructive.
+                let line = buf.trim().to_string();
                 buf.clear();
                 caret = 0;
                 selected = 0;
@@ -3117,10 +3210,6 @@ fn input_thread(
                     caret = 0;
                     selected = 0;
                     let _ = lock_screen(&screen.0).add_notice("interrupt requested");
-                } else {
-                    buf.clear();
-                    caret = 0;
-                    selected = 0;
                 }
             }
             KeyCode::PageUp => scroll_screen(&screen, page_rows(&screen)),
@@ -3565,18 +3654,21 @@ fn render(frame: &mut Frame<'_>, model: &Model) -> RenderInfo {
     }
     if let Some(ask) = &model.ask {
         render_ask(frame, ask, frame.area());
-        let width = 64.min(frame.area().width.saturating_sub(4));
-        let question_rows = wrap_display(&ask.question, width.saturating_sub(6) as usize).len();
-        let height = ((question_rows + ask.options.len() + 5) as u16)
-            .min(frame.area().height.saturating_sub(2))
-            .max(7);
-        let area = centered_rect(frame.area(), width, height);
-        let option_y = area.y + 1 + question_rows as u16 + 1;
-        for index in 0..ask.options.len() {
+        let (area, question_capacity, option_capacity) = ask_geometry(ask, frame.area());
+        let question_rows =
+            wrap_display(&ask.question, area.width.saturating_sub(6) as usize).len();
+        let shown_questions = question_rows.min(question_capacity);
+        let option_start = ask
+            .selected
+            .saturating_sub(option_capacity.saturating_sub(1));
+        let option_y = area.y + 1 + shown_questions as u16;
+        for (row, index) in
+            (option_start..ask.options.len().min(option_start + option_capacity)).enumerate()
+        {
             hit_regions.push(HitRegion {
                 area: Rect::new(
                     area.x + 1,
-                    option_y + index as u16,
+                    option_y + row as u16,
                     area.width.saturating_sub(2),
                     1,
                 ),
@@ -3748,7 +3840,11 @@ fn editor_widget(model: &Model, area: Rect) -> Paragraph<'static> {
                 Style::default().fg(BLUE()).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                "Ask Kamui, or / for commands".to_string(),
+                if model.secret_input {
+                    "API key is hidden; Esc cancels".to_string()
+                } else {
+                    "Ask Kamui, or / for commands".to_string()
+                },
                 Style::default().add_modifier(Modifier::DIM),
             ),
         ])],
@@ -3757,7 +3853,17 @@ fn editor_widget(model: &Model, area: Rect) -> Paragraph<'static> {
             // segments into a single Line (as this did) collapsed a multi-line buffer onto one
             // row while the caret was placed per segment, so the two disagreed about the text.
             let inner = area.width.saturating_sub(4).max(1) as usize;
-            let view = editor_view(&model.input, model.input_caret, inner);
+            let display = if model.secret_input {
+                "*".repeat(model.input.chars().count())
+            } else {
+                model.input.clone()
+            };
+            let caret = if model.secret_input {
+                display.len()
+            } else {
+                model.input_caret
+            };
+            let view = editor_view(&display, caret, inner);
             view.rows
                 .into_iter()
                 .enumerate()
@@ -3794,13 +3900,17 @@ fn editor_widget(model: &Model, area: Rect) -> Paragraph<'static> {
         ));
         rows.push(Line::from(wall_line));
     }
+    let block = Block::default()
+        .borders(Borders::LEFT)
+        .border_style(Style::default().fg(BLUE()));
+    let block = if model.secret_input {
+        block.title(" API key ")
+    } else {
+        block
+    };
     Paragraph::new(Text::from(rows))
         .style(Style::default().bg(BG_ELEMENT()))
-        .block(
-            Block::default()
-                .borders(Borders::LEFT)
-                .border_style(Style::default().fg(BLUE())),
-        )
+        .block(block)
 }
 
 /// Slash-command menu rendered above the editor while the buffer looks like a command.
@@ -4809,6 +4919,53 @@ fn wrap_display(text: &str, width: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tiny_ask_geometry_stays_inside_frame() {
+        let ask = AskState {
+            question: "long question ".repeat(20),
+            options: (1..=8).map(|n| format!("option {n}")).collect(),
+            selected: 7,
+            typed: String::new(),
+            scroll: 0,
+        };
+        for frame in [Rect::new(0, 0, 20, 5), Rect::new(4, 3, 8, 2)] {
+            let (modal, _, options) = ask_geometry(&ask, frame);
+            assert!(modal.x >= frame.x && modal.y >= frame.y);
+            assert!(modal.right() <= frame.right() && modal.bottom() <= frame.bottom());
+            assert!(options <= 4);
+        }
+    }
+
+    #[test]
+    fn secret_editor_masks_content_and_has_no_transcript_card() {
+        let model = Model {
+            input: "sk-secret-value".into(),
+            input_caret: 15,
+            secret_input: true,
+            ..Default::default()
+        };
+        let mut buffer = ratatui::buffer::Buffer::empty(Rect::new(0, 0, 40, 3));
+        ratatui::widgets::Widget::render(
+            editor_widget(&model, Rect::new(0, 0, 40, 3)),
+            buffer.area,
+            &mut buffer,
+        );
+        let rendered: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+        assert!(!rendered.contains("sk-secret-value"));
+        assert!(rendered.contains("***************"));
+        assert!(model.cards.is_empty());
+    }
+
+    #[test]
+    fn escape_and_slash_input_contracts_preserve_user_text() {
+        let draft = String::from("unfinished thought");
+        assert_eq!(draft, "unfinished thought", "idle Esc does not mutate it");
+        let entered = "/del".trim().to_string();
+        let tabbed = format!("/{} ", "delete");
+        assert_eq!(entered, "/del");
+        assert_eq!(tabbed, "/delete ");
+    }
 
     #[test]
     fn render_paints_the_full_terminal_background() {

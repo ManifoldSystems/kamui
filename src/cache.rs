@@ -132,7 +132,7 @@ pub fn side_session_id(conversation_id: Option<&str>, kind: SideRequest) -> Opti
     conversation_id
         .map(str::trim)
         .filter(|id| !id.is_empty())
-        .map(|id| format!("{id}{}", kind.suffix()))
+        .map(|id| bounded_routing_id(id, kind.suffix()))
 }
 
 /// Sticky id for one `spawn_agent` tool call. Every round of that sub-agent reuses this id, while
@@ -141,7 +141,16 @@ pub fn sub_agent_session_id(conversation_id: Option<&str>, tool_call_id: &str) -
     conversation_id
         .map(str::trim)
         .filter(|id| !id.is_empty())
-        .map(|id| format!("{id}:agent:{tool_call_id}"))
+        .map(|id| bounded_routing_id(id, &format!(":agent:{tool_call_id}")))
+}
+
+/// Provider routing fields share one conservative 64-character bound.
+pub fn bounded_routing_id(id: &str, suffix: &str) -> String {
+    let suffix: String = suffix.chars().take(63).collect();
+    let room = 64usize.saturating_sub(suffix.chars().count());
+    let mut value: String = id.trim().chars().take(room).collect();
+    value.push_str(&suffix);
+    value
 }
 
 /// Watches the prefix of a cache-pinned session for drift.
@@ -483,5 +492,17 @@ mod tests {
             sub_agent_session_id(Some("abc-123"), "call-1"),
             side_session_id(Some("abc-123"), SideRequest::Title)
         );
+    }
+
+    #[test]
+    fn every_derived_routing_id_is_bounded() {
+        let id = "x".repeat(100);
+        for derived in [
+            bounded_routing_id(&id, ""),
+            side_session_id(Some(&id), SideRequest::Title).unwrap(),
+            sub_agent_session_id(Some(&id), "call-1").unwrap(),
+        ] {
+            assert!(derived.chars().count() <= 64, "{derived}");
+        }
     }
 }

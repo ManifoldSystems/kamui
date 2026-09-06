@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 
 const CONFIG_FILE: &str = "kamui.toml";
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
+pub const ORVIX_BASE_URL: &str = "https://api.orvix.id/v1";
+pub const ORVIX_COMPLETIONS_PATH: &str = "/coding/completions";
 const DEFAULT_PROFILE_NAME: &str = "default";
 /// Default foreground `run_command` timeout, applied when `[commands].timeout_secs` is unset.
 const DEFAULT_COMMAND_TIMEOUT_SECS: u64 = 30;
@@ -326,7 +328,13 @@ fn has_usable_configuration(file: &ConfigFile, project: Option<&ConfigFile>) -> 
 
 /// Save the simple provider selected by first-run onboarding while preserving unrelated global
 /// settings such as context limits and MCP servers.
-pub fn save_onboarding(path: &Path, base_url: &str, api_key: &str, model: &str) -> Result<()> {
+pub fn save_onboarding(
+    path: &Path,
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+    orvix_coding: bool,
+) -> Result<()> {
     ensure_onboarding_supported(path)?;
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read {}", path.display()))?;
@@ -349,10 +357,19 @@ pub fn save_onboarding(path: &Path, base_url: &str, api_key: &str, model: &str) 
         "api_key".to_owned(),
         toml::Value::String(api_key.to_owned()),
     );
+    if orvix_coding {
+        provider.insert(
+            "completions_path".to_owned(),
+            toml::Value::String(ORVIX_COMPLETIONS_PATH.to_owned()),
+        );
+        provider.insert("send_session_id".to_owned(), toml::Value::Boolean(true));
+    } else {
+        provider.remove("completions_path");
+        provider.remove("send_session_id");
+    }
 
     let content = toml::to_string_pretty(&document).context("failed to serialize configuration")?;
-    std::fs::write(path, content).with_context(|| format!("failed to write {}", path.display()))?;
-    restrict_permissions(path)
+    atomic_write(path, &content)
 }
 
 pub fn ensure_onboarding_supported(path: &Path) -> Result<()> {
@@ -528,7 +545,12 @@ fn resolve_flat(global: ConfigFile, project: Option<ConfigFile>) -> Result<Confi
     let send_session_id = project_provider
         .and_then(|provider| provider.send_session_id)
         .or_else(|| global_provider.and_then(|provider| provider.send_session_id))
-        .unwrap_or(false);
+        .unwrap_or_else(|| completions_path.as_deref() == Some(ORVIX_COMPLETIONS_PATH));
+    validate_coding_pair(
+        DEFAULT_PROFILE_NAME,
+        completions_path.as_deref(),
+        send_session_id,
+    )?;
 
     let profile = Profile {
         name: DEFAULT_PROFILE_NAME.to_string(),
@@ -598,7 +620,8 @@ fn resolve_profiles(global: ConfigFile, project: Option<ConfigFile>) -> Result<C
         let send_session_id = section
             .send_session_id
             .or_else(|| shared.and_then(|provider| provider.send_session_id))
-            .unwrap_or(false);
+            .unwrap_or_else(|| completions_path.as_deref() == Some(ORVIX_COMPLETIONS_PATH));
+        validate_coding_pair(name, completions_path.as_deref(), send_session_id)?;
         profiles.push(Profile {
             name: name.clone(),
             model,
@@ -668,9 +691,13 @@ pub fn save_theme(path: &Path, theme: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn append_profile(path: &Path, base_url: &str, api_key: &str, model: &str) -> Result<String> {
-    use std::io::Write;
-
+pub fn append_profile(
+    path: &Path,
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+    orvix_coding: bool,
+) -> Result<String> {
     let mut name: String = model
         .chars()
         .map(|c| {
@@ -682,33 +709,71 @@ pub fn append_profile(path: &Path, base_url: &str, api_key: &str, model: &str) -
         })
         .collect();
     let name = name.as_mut_str();
-    // De-duplicate: read existing names from the file text.
     let existing = std::fs::read_to_string(path).unwrap_or_default();
-    let taken: Vec<String> = existing
-        .lines()
-        .filter_map(|l| l.strip_prefix("[profiles."))
-        .map(|l| l.trim_end_matches(']').trim().to_string())
-        .collect();
+    let mut document: toml::Value = if existing.trim().is_empty() {
+        toml::Value::Table(Default::default())
+    } else {
+        toml::from_str(&existing).with_context(|| format!("failed to parse {}", path.display()))?
+    };
+    let root = document
+        .as_table_mut()
+        .context("global kamui.toml must contain a TOML table")?;
+    let profiles = root
+        .entry("profiles")
+        .or_insert_with(|| toml::Value::Table(Default::default()))
+        .as_table_mut()
+        .context("[profiles] must be a TOML table")?;
     let mut final_name = name.to_string();
     let mut counter = 2;
-    while taken.iter().any(|t| t.eq_ignore_ascii_case(&final_name)) {
+    while profiles
+        .keys()
+        .any(|taken| taken.eq_ignore_ascii_case(&final_name))
+    {
         final_name = format!("{name}-{counter}");
         counter += 1;
     }
 
-    if !path.exists() {
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        std::fs::File::create(path)?;
+    let mut profile = toml::map::Map::new();
+    profile.insert("model".into(), toml::Value::String(model.into()));
+    profile.insert(
+        "base_url".into(),
+        toml::Value::String(base_url.trim_end_matches('/').into()),
+    );
+    profile.insert("api_key".into(), toml::Value::String(api_key.into()));
+    if orvix_coding {
+        profile.insert(
+            "completions_path".into(),
+            toml::Value::String(ORVIX_COMPLETIONS_PATH.into()),
+        );
+        profile.insert("send_session_id".into(), toml::Value::Boolean(true));
     }
-    let mut file = std::fs::OpenOptions::new().append(true).open(path)?;
-    writeln!(file)?;
-    writeln!(file, "[profiles.{final_name}]")?;
-    writeln!(file, "model = \"{model}\"")?;
-    writeln!(file, "base_url = \"{base_url}\"")?;
-    writeln!(file, "api_key = \"{api_key}\"")?;
+    profiles.insert(final_name.clone(), toml::Value::Table(profile));
+    let rendered =
+        toml::to_string_pretty(&document).context("failed to serialize configuration")?;
+    atomic_write(path, &rendered)?;
     Ok(final_name)
+}
+
+fn validate_coding_pair(name: &str, path: Option<&str>, send_session_id: bool) -> Result<()> {
+    if send_session_id && path != Some(ORVIX_COMPLETIONS_PATH) {
+        anyhow::bail!(
+            "profile '{name}' enables send_session_id but does not use completions_path = \"{ORVIX_COMPLETIONS_PATH}\"; set both for Orvix Coding or disable send_session_id"
+        );
+    }
+    Ok(())
+}
+
+fn atomic_write(path: &Path, content: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let temporary = path.with_extension(format!("toml.tmp-{}", uuid::Uuid::new_v4()));
+    std::fs::write(&temporary, content)
+        .with_context(|| format!("failed to write {}", temporary.display()))?;
+    restrict_permissions(&temporary)?;
+    std::fs::rename(&temporary, path)
+        .with_context(|| format!("failed to replace {}", path.display()))?;
+    restrict_permissions(path)
 }
 
 pub(crate) fn global_config_path() -> Result<PathBuf> {
@@ -781,6 +846,50 @@ model = "orvix/deepseek-v4-flash"
             Some("/coding/completions")
         );
         assert!(profile.send_session_id);
+    }
+
+    #[test]
+    fn exact_coding_path_derives_session_routing() {
+        let profile = resolve(
+            file(
+                "model = \"m\"\n[provider]\nbase_url = \"https://api.orvix.id/v1\"\napi_key = \"k\"\ncompletions_path = \"/coding/completions\"",
+            ),
+            None,
+        )
+        .unwrap()
+        .default()
+        .clone();
+        assert!(profile.send_session_id);
+    }
+
+    #[test]
+    fn rejects_session_routing_without_coding_path() {
+        let error = resolve(
+            file("model = \"m\"\n[provider]\napi_key = \"k\"\nsend_session_id = true"),
+            None,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("set both for Orvix Coding"));
+    }
+
+    #[test]
+    fn profile_writer_escapes_toml_and_preserves_advanced_config() {
+        let path = temporary_config("[mcp.files]\ncommand = \"server\"\n");
+        let name = append_profile(
+            &path,
+            "https://example.test/v1",
+            "key-\"quoted\"",
+            "model-\"quoted\"",
+            false,
+        )
+        .unwrap();
+        let saved = read_config_file(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(
+            saved.profiles[&name].api_key.as_deref(),
+            Some("key-\"quoted\"")
+        );
+        assert_eq!(saved.mcp["files"].command.as_deref(), Some("server"));
     }
 
     #[test]
@@ -858,7 +967,7 @@ api_key = "k"
             "context_window = 8000\n[provider]\ntools = false\n[mcp.files]\ncommand = \"server\"",
         );
 
-        save_onboarding(&path, "https://api.example.com/v1/", "sk-1", "gpt-5").unwrap();
+        save_onboarding(&path, "https://api.example.com/v1/", "sk-1", "gpt-5", false).unwrap();
         let saved = read_config_file(&path).unwrap();
         std::fs::remove_file(path).unwrap();
 
@@ -875,8 +984,8 @@ api_key = "k"
     fn onboarding_does_not_replace_advanced_profiles() {
         let path = temporary_config("[profiles.main]\nmodel = \"gpt-5\"");
 
-        let error =
-            save_onboarding(&path, "https://api.example.com/v1", "sk-1", "gpt-5").unwrap_err();
+        let error = save_onboarding(&path, "https://api.example.com/v1", "sk-1", "gpt-5", false)
+            .unwrap_err();
         std::fs::remove_file(path).unwrap();
 
         assert!(error.to_string().contains("advanced profiles"));

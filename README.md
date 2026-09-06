@@ -43,8 +43,10 @@ Any service implementing the OpenAI Chat Completions API can be used by changing
 model, and API key. Chat responses use the API's SSE streaming mode and are rendered as deltas
 arrive.
 
-**Orvix Coding Plan (internal):** point a shared provider at `https://api.orvix.id/v1`, set
-`completions_path = "/coding/completions"` and `send_session_id = true`, and use a key with
+**Orvix Coding:** choose the native Orvix Coding option during first-run setup or from the TUI's
+"+ Add provider / model" flow. Kamui derives `https://api.orvix.id/v1`,
+`completions_path = "/coding/completions"`, and `send_session_id = true`; the API key is entered in
+a masked field and the resulting config is atomically written with owner-only permissions. Use a key with
 `coding:invoke`. Kamui sends its session UUID as top-level `session_id` so Orvix can stick the
 upstream route for cache. Switch with `/model orvix-coding-flash`. Keep `/v1` profiles for A/B.
 
@@ -64,6 +66,12 @@ Prompt cache:  median 96% over 12 turns | ≥90%: 92% | ≥95%: 75% | warm-up: 1
 
 The first turn of a session is excluded from those ratios — there is nothing cached to hit yet — but
 a later warm-up turn is counted, because that is a prefix that churned mid-session.
+
+Coding entitlement, quota, concurrency, request-id conflict, authentication, rate-limit, and
+temporary server errors are rendered as bounded, actionable messages. Requests have connect and
+first-response deadlines; streams have an idle deadline. Before any output is visible, transient
+transport errors and HTTP 408/429/502/503/504 are retried up to three attempts using the same body
+and session id, respecting a capped `Retry-After`. A stream is never retried after output starts.
 
 ### OpenAI-compatible providers
 
@@ -535,7 +543,8 @@ Highlights:
 - **Unknown commands name themselves** and suggest the nearest built-in (`/sesions` → "Did you
   mean /sessions?").
 
-`-p`, pipes, redirects, and `NO_COLOR` retain the script-friendly line-oriented output path.
+`-p`, pipes, and redirects retain the script-friendly line-oriented output path. On an interactive
+TTY, `NO_COLOR` keeps the fullscreen TUI but removes its semantic foreground/background colours.
 
 ### Session commands
 

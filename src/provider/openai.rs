@@ -4,9 +4,67 @@ use super::{
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use reqwest::Client;
+use reqwest::{StatusCode, header::RETRY_AFTER};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::mpsc;
+use tokio::time::{Duration, timeout};
+
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
+const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
+const MAX_ERROR_BODY: usize = 2048;
+
+#[derive(Debug)]
+pub struct ProviderHttpError {
+    pub status: StatusCode,
+    pub code: Option<String>,
+    pub message: String,
+    pub retry_after: Option<Duration>,
+}
+
+impl std::fmt::Display for ProviderHttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let action = match self.code.as_deref() {
+            Some("coding_not_entitled") => "Enable Coding access for this key.",
+            Some("coding_quota_exceeded") => {
+                "Coding quota is exhausted; wait for the quota reset or upgrade the plan."
+            }
+            Some("coding_concurrency_exceeded") => {
+                "Too many Coding requests; retry after another request finishes."
+            }
+            Some("coding_request_id_conflict") => {
+                "The Coding session is already active; retry shortly."
+            }
+            Some("coding_quota_unavailable") => {
+                "Coding quota is temporarily unavailable; retry shortly."
+            }
+            _ if self.status == StatusCode::UNAUTHORIZED
+                || self.status == StatusCode::FORBIDDEN =>
+            {
+                "Check the API key and its permissions."
+            }
+            _ if self.status == StatusCode::TOO_MANY_REQUESTS => "Rate limited; retry later.",
+            _ if self.status.is_server_error() => {
+                "Provider is temporarily unavailable; retry later."
+            }
+            _ => "Check the provider configuration and request.",
+        };
+        write!(f, "provider returned {}", self.status)?;
+        if let Some(code) = &self.code {
+            write!(f, " ({code})")?;
+        }
+        if !self.message.is_empty() {
+            write!(f, ": {}", self.message)?;
+        }
+        if let Some(wait) = self.retry_after {
+            write!(f, " Retry after {}s.", wait.as_secs())?;
+        }
+        write!(f, " {action}")
+    }
+}
+
+impl std::error::Error for ProviderHttpError {}
 
 pub struct OpenAIProvider {
     client: Client,
@@ -32,7 +90,10 @@ impl OpenAIProvider {
         send_session_id: bool,
     ) -> Self {
         Self {
-            client: Client::new(),
+            client: Client::builder()
+                .connect_timeout(CONNECT_TIMEOUT)
+                .build()
+                .expect("reqwest client configuration is valid"),
             api_key,
             base_url: base_url.trim_end_matches('/').to_string(),
             completions_path,
@@ -82,16 +143,19 @@ impl OpenAIProvider {
 
     /// Discover model identifiers exposed by an OpenAI-compatible provider.
     pub async fn list_models(api_key: &str, base_url: &str) -> Result<Vec<String>> {
-        let response = Client::new()
+        let response = Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .build()?
             .get(format!("{}/models", base_url.trim_end_matches('/')))
             .bearer_auth(api_key)
-            .send()
+            .send();
+        let response = timeout(RESPONSE_TIMEOUT, response)
             .await
+            .context("provider models request timed out")?
             .context("failed to call the provider models endpoint")?;
         let status = response.status();
         if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            bail!("provider returned {status}: {body}");
+            return Err(http_error(response).await.into());
         }
 
         let response: ModelsResponse = response
@@ -145,6 +209,40 @@ fn clamp_prompt_cache_key(key: &str) -> Option<String> {
         return None;
     }
     Some(trimmed.chars().take(64).collect())
+}
+
+fn parse_retry_after(value: Option<&reqwest::header::HeaderValue>) -> Option<Duration> {
+    value?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(|s| Duration::from_secs(s.min(30)))
+}
+
+async fn http_error(response: reqwest::Response) -> ProviderHttpError {
+    let status = response.status();
+    let retry_after = parse_retry_after(response.headers().get(RETRY_AFTER));
+    let body = response.text().await.unwrap_or_default();
+    let body: String = body.chars().take(MAX_ERROR_BODY).collect();
+    let value: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+    let error = value.get("error").unwrap_or(&value);
+    let code = error.get("code").and_then(Value::as_str).map(str::to_owned);
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .or_else(|| value.get("message").and_then(Value::as_str))
+        .unwrap_or(&body)
+        .chars()
+        .take(512)
+        .collect();
+    ProviderHttpError {
+        status,
+        code,
+        message,
+        retry_after,
+    }
 }
 
 // Request wire types. These belong to the provider; the core stays agnostic and never
@@ -499,14 +597,15 @@ impl Provider for OpenAIProvider {
             .post(self.chat_url())
             .bearer_auth(&self.api_key)
             .json(&body)
-            .send()
+            .send();
+        let response = timeout(RESPONSE_TIMEOUT, response)
             .await
+            .context("provider request timed out")?
             .context("failed to call provider")?;
 
         let status = response.status();
         if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            bail!("provider returned {status}: {body}");
+            return Err(http_error(response).await.into());
         }
 
         let response: OpenAIResponse = response
@@ -536,14 +635,40 @@ impl Provider for OpenAIProvider {
             session_id,
             prompt_cache_key: cache_key.as_deref(),
         };
-        let mut response = self
-            .client
-            .post(self.chat_url())
-            .bearer_auth(&self.api_key)
-            .json(&body)
-            .send()
-            .await
-            .context("failed to call provider")?;
+        let mut attempts = 0;
+        let mut response = loop {
+            attempts += 1;
+            let sent = self
+                .client
+                .post(self.chat_url())
+                .bearer_auth(&self.api_key)
+                .json(&body)
+                .send();
+            match timeout(RESPONSE_TIMEOUT, sent).await {
+                Ok(Ok(response)) if response.status().is_success() => break response,
+                Ok(Ok(response)) => {
+                    let error = http_error(response).await;
+                    let retryable = matches!(error.status.as_u16(), 408 | 429 | 502 | 503 | 504);
+                    if attempts >= 3 || !retryable {
+                        return Err(error.into());
+                    }
+                    tokio::time::sleep(
+                        error
+                            .retry_after
+                            .unwrap_or(Duration::from_millis(250 * attempts)),
+                    )
+                    .await;
+                }
+                Ok(Err(error)) if attempts < 3 && (error.is_connect() || error.is_timeout()) => {
+                    tokio::time::sleep(Duration::from_millis(250 * attempts)).await;
+                }
+                Ok(Err(error)) => return Err(error).context("failed to call provider"),
+                Err(_) if attempts < 3 => {
+                    tokio::time::sleep(Duration::from_millis(250 * attempts)).await
+                }
+                Err(_) => bail!("provider request timed out"),
+            }
+        };
 
         let status = response.status();
         if !status.is_success() {
@@ -599,9 +724,9 @@ async fn read_stream(
     let mut buffer = Vec::new();
     let mut state = StreamState::default();
 
-    while let Some(chunk) = response
-        .chunk()
+    while let Some(chunk) = timeout(STREAM_IDLE_TIMEOUT, response.chunk())
         .await
+        .context("provider stream was idle for too long")?
         .context("failed to read provider stream")?
     {
         buffer.extend_from_slice(&chunk);
@@ -631,7 +756,18 @@ async fn read_stream(
         }
     }
 
-    bail!("provider stream ended before [DONE]")
+    if !state.finish_reason.is_empty() {
+        sender
+            .send(Ok(StreamEvent::Done {
+                usage: state.usage,
+                finish_reason: state.finish_reason,
+                tool_calls: assemble_tool_calls(state.tool_calls),
+            }))
+            .map_err(|_| anyhow::anyhow!("stream consumer disconnected"))?;
+        Ok(())
+    } else {
+        bail!("provider stream ended before a terminal finish event")
+    }
 }
 
 fn find_event_end(buffer: &[u8]) -> Option<usize> {
@@ -958,6 +1094,32 @@ mod tests {
         let mut state = StreamState::default();
 
         assert!(parse_event(b"data: {not json}", &sender, &mut state).is_err());
+    }
+
+    #[test]
+    fn parses_and_caps_retry_after() {
+        use reqwest::header::HeaderValue;
+        assert_eq!(
+            parse_retry_after(Some(&HeaderValue::from_static("12"))),
+            Some(Duration::from_secs(12))
+        );
+        assert_eq!(
+            parse_retry_after(Some(&HeaderValue::from_static("120"))),
+            Some(Duration::from_secs(30))
+        );
+    }
+
+    #[test]
+    fn coding_error_message_is_actionable_and_bounded() {
+        let error = ProviderHttpError {
+            status: StatusCode::FORBIDDEN,
+            code: Some("coding_not_entitled".into()),
+            message: "not entitled".into(),
+            retry_after: None,
+        };
+        let message = error.to_string();
+        assert!(message.contains("Enable Coding access"));
+        assert!(!message.contains("API key:"));
     }
 
     #[test]
