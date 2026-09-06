@@ -166,6 +166,10 @@ fn BORDER() -> Color {
     })
 }
 #[allow(non_snake_case)]
+fn SEPARATOR() -> Color {
+    themed(Color::Rgb(0x73, 0x7a, 0xa8), |p| p.fg.clone())
+}
+#[allow(non_snake_case)]
 fn BG_CHAT() -> Color {
     themed(Color::Rgb(0x1a, 0x1b, 0x26), |p| p.bg.clone())
 }
@@ -1932,8 +1936,10 @@ fn page_rows(screen: &ScreenHandle) -> i64 {
 
 fn scroll_screen(screen: &ScreenHandle, rows: i64) {
     let mut s = lock_screen(&screen.0);
+    let total = wrapped_transcript(&s.model, s.last_transcript_width.max(1)).len();
+    let max_offset = total.saturating_sub(s.last_viewport_rows.max(1));
     let next = s.model.scroll_from_bottom as i64 + rows;
-    s.model.scroll_from_bottom = next.clamp(0, 100_000) as usize;
+    s.model.scroll_from_bottom = next.clamp(0, max_offset as i64) as usize;
     let _ = s.draw();
 }
 
@@ -2509,7 +2515,7 @@ fn input_thread(
                             s.model.ac_selected = selected;
                         } else {
                             drop(s);
-                            scroll_screen(&screen, if delta < 0 { 3 } else { -3 });
+                            scroll_screen(&screen, if delta < 0 { 1 } else { -1 });
                             continue 'keys;
                         }
                         let _ = s.draw();
@@ -3521,7 +3527,7 @@ fn render(frame: &mut Frame<'_>, model: &Model) -> RenderInfo {
         .buffer_mut()
         .set_style(whole, Style::default().bg(BG_CHAT()));
     // OpenCode layout: transcript on top, autocomplete menu above the bordered editor, a
-    // one-line footer, and the sidebar rail splitting the body horizontally.
+    // footer below a visible rule, and the sidebar rail splitting the body horizontally.
     // The search bar and the slash menu never coexist: opening search closes the editor's menu.
     let popup_height = if model.search.is_some() {
         1
@@ -3542,7 +3548,7 @@ fn render(frame: &mut Frame<'_>, model: &Model) -> RenderInfo {
         (input_lines.min(EDITOR_VISIBLE_LINES) as u16) + 2 + u16::from(model.thinking.is_some());
     let screen_rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .constraints([Constraint::Min(1), Constraint::Length(2)])
         .split(frame.area());
     let main_area = screen_rows[0];
     let footer_area = screen_rows[1];
@@ -3684,6 +3690,7 @@ fn render(frame: &mut Frame<'_>, model: &Model) -> RenderInfo {
     frame.render_widget(editor_widget(model, editor_area), editor_area);
     if model.thinking.is_some() {
         let wall_row = editor_area.y
+            + 1
             + if model.input.is_empty() {
                 0
             } else {
@@ -3708,10 +3715,9 @@ fn render(frame: &mut Frame<'_>, model: &Model) -> RenderInfo {
     {
         let inner = editor_area.width.saturating_sub(4).max(1) as usize;
         let view = editor_view(&model.input, model.input_caret, inner);
-        // The editor block draws a LEFT border: one column, no rows. Text then starts after the
-        // two-cell row prefix, so the caret belongs at x + 3 on the block's own first row --
-        // an earlier `y + 1` aimed at a top border that this block never draws.
-        let row = editor_area.y + view.caret_row as u16;
+        // The textarea has a one-cell border. Text starts after that border and the two-cell
+        // prompt prefix, while the caret row starts below the top rule.
+        let row = editor_area.y + 1 + view.caret_row as u16;
         let col = editor_area.x + 3 + view.caret_col.min(inner) as u16;
         frame.set_cursor_position((
             col.min(editor_area.right().saturating_sub(1)),
@@ -3942,8 +3948,8 @@ fn visible_around_caret(segment: &str, caret_chars: usize, width: usize) -> (Str
 /// How many buffer rows the editor shows at once; longer buffers scroll to the newest.
 const EDITOR_VISIBLE_LINES: usize = 5;
 
-/// The opencode-style prompt: left accent border, element background, `❯` glyph with the live
-/// buffer, and the caret sitting at the end of the buffer.
+/// The opencode-style prompt: a clear textarea border, element background, `❯` glyph with the
+/// live buffer, and the caret sitting at the end of the buffer.
 fn editor_widget(model: &Model, area: Rect) -> Paragraph<'static> {
     // Horizontal viewport: keep the caret (always at the end of the buffer) on screen.
     // Empty + thinking: skip the placeholder — the bouncing wall already says a turn is live.
@@ -4011,7 +4017,9 @@ fn editor_widget(model: &Model, area: Rect) -> Paragraph<'static> {
         let dots = ".".repeat(frame_idx % 4);
         wall_line.push(Span::styled(
             format!("{label}{dots}"),
-            Style::default().fg(MUTED()).add_modifier(Modifier::DIM),
+            Style::default()
+                .fg(NOTICE_FG())
+                .add_modifier(Modifier::BOLD),
         ));
         if model
             .cards
@@ -4026,8 +4034,8 @@ fn editor_widget(model: &Model, area: Rect) -> Paragraph<'static> {
         rows.push(Line::from(wall_line));
     }
     let block = Block::default()
-        .borders(Borders::LEFT)
-        .border_style(Style::default().fg(BLUE()));
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(SEPARATOR()));
     let block = if model.secret_input {
         block.title(" API key ")
     } else {
@@ -4269,6 +4277,8 @@ fn sidebar_paragraph(
         .style(Style::default().bg(BG_PANEL()))
         .block(
             Block::default()
+                .borders(Borders::LEFT)
+                .border_style(Style::default().fg(SEPARATOR()))
                 .padding(Padding::new(1, 0, 1, 0))
                 .style(Style::default().bg(BG_PANEL())),
         )
@@ -4332,9 +4342,10 @@ fn push_sidebar_value(lines: &mut Vec<Line<'static>>, key: &str, value_line: &st
         return;
     }
     if let Some((label, rest)) = value_line.split_once('\t') {
-        let label_w = 5usize;
+        let label_w = 7usize.min(max.saturating_sub(1));
         let value_max = max.saturating_sub(label_w + 1);
         let style = sidebar_value_style(key, label, rest);
+        let label = crate::tui::truncate_chars(label, label_w);
         lines.push(Line::from(vec![
             Span::styled(
                 format!("{label:<label_w$} "),
@@ -4504,7 +4515,16 @@ fn footer_widget(model: &Model, area: Rect) -> Paragraph<'static> {
         spans.push(Span::raw(" ".repeat(gap)));
         spans.extend(right);
     }
-    Paragraph::new(Line::from(spans)).style(Style::default().bg(BG_PANEL()))
+    let footer = Paragraph::new(Line::from(spans)).style(Style::default().bg(BG_PANEL()));
+    if area.height >= 2 {
+        footer.block(
+            Block::default()
+                .borders(Borders::TOP)
+                .border_style(Style::default().fg(SEPARATOR())),
+        )
+    } else {
+        footer
+    }
 }
 
 /// The transcript as it is actually drawn: every source line wrapped to `width`, each wrapped
@@ -6293,7 +6313,7 @@ mod tests {
             "caret rests on the continuation indent of the empty last line"
         );
         assert!(
-            row.trim_start_matches('\u{2502}').trim().is_empty(),
+            row.trim_matches('\u{2502}').trim().is_empty(),
             "last row is the empty segment: {row:?}"
         );
         // Height is derived from the same split, so the caret cannot fall past the editor.

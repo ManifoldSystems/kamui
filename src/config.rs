@@ -9,6 +9,7 @@ const CONFIG_FILE: &str = "kamui.toml";
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 pub const ORVIX_BASE_URL: &str = "https://api.orvix.id/v1";
 pub const ORVIX_COMPLETIONS_PATH: &str = "/coding/completions";
+pub const ORVIX_MODELS_PATH: &str = "/coding/models";
 const DEFAULT_PROFILE_NAME: &str = "default";
 /// Default foreground `run_command` timeout, applied when `[commands].timeout_secs` is unset.
 const DEFAULT_COMMAND_TIMEOUT_SECS: u64 = 30;
@@ -42,7 +43,8 @@ api_key = \"\"
 # tools = true
 
 # Orvix Coding Plan (internal): POST /coding/completions with sticky session_id.
-# Keep base_url on /v1 so /models still works; override only the chat path.
+# Keep base_url on /v1; chat goes to /coding/completions and model discovery to
+# /coding/models (not GET /v1/models — that catalogue is refused at Coding).
 # completions_path = \"/coding/completions\"
 # send_session_id = true
 

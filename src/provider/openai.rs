@@ -142,11 +142,20 @@ impl OpenAIProvider {
     }
 
     /// Discover model identifiers exposed by an OpenAI-compatible provider.
-    pub async fn list_models(api_key: &str, base_url: &str) -> Result<Vec<String>> {
+    ///
+    /// `models_path` follows the same rewrite rules as `completions_path`: an
+    /// absolute `/…` path is resolved against the origin of `base_url`. Orvix
+    /// Coding uses `/coding/models` so onboarding does not offer the `/v1`
+    /// catalogue (managed + BYOK ids that `/coding/completions` will refuse).
+    pub async fn list_models(
+        api_key: &str,
+        base_url: &str,
+        models_path: Option<&str>,
+    ) -> Result<Vec<String>> {
         let response = Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
             .build()?
-            .get(format!("{}/models", base_url.trim_end_matches('/')))
+            .get(models_url(base_url, models_path))
             .bearer_auth(api_key)
             .send();
         let response = timeout(RESPONSE_TIMEOUT, response)
@@ -173,6 +182,21 @@ impl OpenAIProvider {
             bail!("provider returned no models");
         }
         Ok(models)
+    }
+}
+
+fn models_url(base_url: &str, models_path: Option<&str>) -> String {
+    let base = base_url.trim_end_matches('/');
+    match models_path.map(str::trim).filter(|path| !path.is_empty()) {
+        Some(path) if path.starts_with("http://") || path.starts_with("https://") => {
+            path.trim_end_matches('/').to_owned()
+        }
+        Some(path) if path.starts_with('/') => match origin_of(base) {
+            Some(origin) => format!("{origin}{path}"),
+            None => format!("{base}{path}"),
+        },
+        Some(path) => format!("{base}/{}", path.trim_start_matches('/')),
+        None => format!("{base}/models"),
     }
 }
 
@@ -1138,6 +1162,18 @@ mod tests {
         assert_eq!(
             origin_of("https://api.orvix.id/v1"),
             Some("https://api.orvix.id".into())
+        );
+    }
+
+    #[test]
+    fn coding_models_url_rewrites_absolute_path_against_origin() {
+        assert_eq!(
+            models_url("https://api.orvix.id/v1", Some("/coding/models")),
+            "https://api.orvix.id/coding/models"
+        );
+        assert_eq!(
+            models_url("https://api.openai.com/v1", None),
+            "https://api.openai.com/v1/models"
         );
     }
 

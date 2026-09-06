@@ -40,7 +40,8 @@ pub async fn run(path: &Path) -> Result<()> {
             .to_owned();
 
         println!("Checking available models...");
-        match OpenAIProvider::list_models(&api_key, &base_url).await {
+        let models_path = orvix_coding.then_some(config::ORVIX_MODELS_PATH);
+        match OpenAIProvider::list_models(&api_key, &base_url, models_path).await {
             // A provider can answer successfully with an empty list -- a key with no model
             // entitlements, or a base URL pointing at something that is not a model API.
             // `FuzzySelect` over no items has nothing to return, and indexing the empty list

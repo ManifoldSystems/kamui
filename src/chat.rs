@@ -495,7 +495,14 @@ where
                         continue;
                     }
                     chat_ui.notice("Fetching models…")?;
-                    match crate::provider::openai::OpenAIProvider::list_models(&key, &base).await {
+                    let models_path = orvix_coding.then_some(crate::config::ORVIX_MODELS_PATH);
+                    match crate::provider::openai::OpenAIProvider::list_models(
+                        &key,
+                        &base,
+                        models_path,
+                    )
+                    .await
+                    {
                         Ok(models) if !models.is_empty() => {
                             chat_ui.notice(&format!("{} models found— pick one.", models.len()))?;
                             pending_add = Some((base, key, orvix_coding));

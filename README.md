@@ -45,7 +45,8 @@ arrive.
 
 **Orvix Coding:** choose the native Orvix Coding option during first-run setup or from the TUI's
 "+ Add provider / model" flow. Kamui derives `https://api.orvix.id/v1`,
-`completions_path = "/coding/completions"`, and `send_session_id = true`; the API key is entered in
+`completions_path = "/coding/completions"`, and `send_session_id = true`; models are listed from
+`GET /coding/models` (the Coding allowlist), not `/v1/models`. The API key is entered in
 a masked field and the resulting config is atomically written with owner-only permissions. Use a key with
 `coding:invoke`. Kamui sends its session UUID as top-level `session_id` so Orvix can stick the
 upstream route for cache. Switch with `/model orvix-coding-flash`. Keep `/v1` profiles for A/B.
