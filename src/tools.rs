@@ -1423,7 +1423,8 @@ impl Tool for CommandStatusTool {
             name: self.name().to_string(),
             description: "Check on a background job started by run_command(background: true). \
                           Omit job_id to list every job; pass it to see that job's status and \
-                          captured output so far."
+                          captured output. When the job is running, this waits up to 30 seconds \
+                          for it to finish before returning, so do not poll repeatedly."
                 .to_string(),
             parameters: json!({
                 "type": "object",
@@ -1445,10 +1446,22 @@ impl Tool for CommandStatusTool {
         let Some(job_id) = job_id else {
             return Ok(describe_jobs(&self.jobs));
         };
-        let registry = self.jobs.lock().unwrap();
-        let entry = registry
+        let entry = self
+            .jobs
+            .lock()
+            .unwrap()
             .get(job_id)
+            .cloned()
             .with_context(|| format!("no background job '{job_id}'"))?;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if entry.state.lock().unwrap().status != JobStatus::Running
+                || Instant::now() >= deadline
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
         let state = entry.state.lock().unwrap();
         let mut body = format!(
             "job {job_id}: {}\nstatus: {}\nelapsed: {}s",

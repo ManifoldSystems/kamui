@@ -776,7 +776,9 @@ see `[commands]` below.
 For something that legitimately runs longer than that — a dev server, a slow test suite — the model
 can pass `background: true` instead. It returns a job id immediately rather than waiting, and can
 check on it with `command_status` (omit `job_id` to list every job) or stop it early with
-`stop_command`. `/jobs` lists them directly without going through the model. Background jobs are
+`stop_command`. A check for one running job waits up to 30 seconds for completion, avoiding rapid
+model polling and repeated context input. `/jobs` lists them directly without going through the
+model. Background jobs are
 in-memory only: they are killed when Kamui exits (including a plain `-p` run) and do not survive a
 restart, and each has a `background_max_secs` (default 30 minutes) safety cap against a runaway or
 zombie process — not a limit meant to constrain a legitimately long-running command.
