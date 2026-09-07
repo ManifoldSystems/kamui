@@ -257,7 +257,7 @@ The process working directory is the project root.
   so `.gitignore`, global excludes, and hidden files are honoured (`require_git(false)`, so rules
   apply outside a repository too). Attachment stops at the shared context budget or 50 files;
   leftovers are reported in a trailing note rather than failing the prompt.
-- Each file is limited to 64 KiB and all attached context is limited to 128 KiB per request.
+- Each file is limited to 1 MiB and all attached context is limited to 2 MiB per request.
 - Absolute paths, directories, binary/non-UTF-8 files, and paths or symlinks outside the project root
   are rejected.
 - Duplicate references are attached once.

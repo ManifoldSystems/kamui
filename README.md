@@ -681,7 +681,7 @@ stay out. Files are attached until the context budget or a 50-file cap runs out;
 as omitted instead of failing the prompt.
 
 Referenced files are attached only to that request and are not copied into session history. Each
-file is limited to 64 KiB and all attached files together are limited to 128 KiB. Absolute paths,
+file is limited to 1 MiB and all attached files together are limited to 2 MiB. Absolute paths,
 binary files, and paths or symlinks outside the project are rejected. Quote references that contain
 spaces with `@"path with spaces.md"` or `@'path with spaces.md'`.
 
@@ -759,7 +759,7 @@ like any other tool call, so a resumed session shows the plan as it stood at eac
 
 If the model calls a tool, Kamui prints a short trace of each call, runs it, feeds the result back,
 and continues streaming until a final answer. The read tools reuse the same path safety as `@file`
-(project-relative only, no escaping the root, 64 KiB per file) and the loop is bounded so it cannot
+(project-relative only, no escaping the root, 1 MiB per file) and the loop is bounded so it cannot
 run away.
 
 `run_command` never runs on its own. Kamui shows you the exact command and waits for you to approve
