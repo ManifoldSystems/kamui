@@ -2014,6 +2014,7 @@ where
             &active.model,
             &final_finish,
         )?;
+        chat_ui.copy_answer(&final_answer)?;
         // Persist plan state after save (session now exists). Approved clears pending.
         if let Some(state) = plan_mode.as_ref() {
             match state.status {

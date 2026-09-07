@@ -19,7 +19,7 @@ pub async fn run(path: &Path) -> Result<()> {
     loop {
         let provider = FuzzySelect::with_theme(&theme)
             .with_prompt("Provider profile")
-            .items(&["Orvix Coding", "Other OpenAI-compatible"])
+            .items(["Orvix Coding", "Other OpenAI-compatible"])
             .default(0)
             .interact()?;
         let orvix_coding = provider == 0;

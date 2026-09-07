@@ -396,6 +396,8 @@ pub struct PermissionState {
     /// could not finish reading.
     pub scroll: usize,
     pub options: Vec<(&'static str, &'static str)>,
+    /// Patch approvals start as a compact summary; Space reveals the complete preview.
+    pub expanded: bool,
 }
 
 /// Clarifying question from the model (`ask_user`), rendered as a modal like permission.
@@ -985,6 +987,7 @@ enum FooterAction {
     Models,
     Sessions,
     Interrupt,
+    Reasoning,
     Live,
 }
 
@@ -1303,6 +1306,17 @@ impl ChatUi {
                 Ok(())
             }
         }
+    }
+
+    /// Copies a completed interactive answer without treating intermediate tool rounds as final.
+    pub fn copy_answer(&mut self, text: &str) -> Result<()> {
+        if self.fullscreen.is_none() || text.trim().is_empty() {
+            return Ok(());
+        }
+        // Auto-copy is background convenience, not transcript content. Manual Ctrl+Y/right-click
+        // still report success or failure; an unavailable clipboard must not fail a completed turn.
+        let _ = set_clipboard_text(text);
+        Ok(())
     }
 
     pub fn notice(&mut self, text: &str) -> Result<()> {
@@ -1746,6 +1760,7 @@ impl InputHub {
                 selected: 0,
                 scroll: 0,
                 options,
+                expanded: !title.contains("patch_file"),
             });
         }
         let _ = self.screen.draw_now();
@@ -2043,10 +2058,16 @@ fn render_dialog(frame: &mut Frame<'_>, dialog: &DialogState, area: Rect) {
 
 /// Approval modal: preview body plus the three opencode options.
 fn render_permission(frame: &mut Frame<'_>, perm: &PermissionState, area: Rect) {
-    let width = 64.min(area.width.max(1));
-    let all_rows: Vec<String> = wrap_display(&perm.body, width.saturating_sub(6) as usize);
+    let width = area.width.saturating_sub(4).clamp(1, 100);
+    let patch = perm.title.contains("patch_file");
+    let body = if patch && !perm.expanded {
+        patch_summary(&perm.body)
+    } else {
+        perm.body.clone()
+    };
+    let all_rows: Vec<String> = wrap_display(&body, width.saturating_sub(6) as usize);
     // Everything the box spends on chrome: blank row, options, the scroll note, the key hint.
-    let chrome = perm.options.len() + 5;
+    let chrome = perm.options.len() + 5 + usize::from(patch);
     let ceiling = area.height.max(1) as usize;
     let capacity = ceiling.saturating_sub(chrome).max(1);
     let scroll = perm.scroll.min(all_rows.len().saturating_sub(capacity));
@@ -2092,6 +2113,16 @@ fn render_permission(frame: &mut Frame<'_>, perm: &PermissionState, area: Rect) 
                 all_rows.len()
             ),
             Style::default().fg(WARN()),
+        ));
+    }
+    if patch {
+        lines.push(Line::styled(
+            if perm.expanded {
+                "Space compact diff"
+            } else {
+                "Space review full diff"
+            },
+            Style::default().fg(BLUE()),
         ));
     }
     lines.push(Line::from(""));
@@ -2145,6 +2176,22 @@ fn render_permission(frame: &mut Frame<'_>, perm: &PermissionState, area: Rect) 
             ),
         box_area,
     );
+}
+
+fn patch_summary(body: &str) -> String {
+    let path = body
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("--- "))
+        .unwrap_or("file");
+    let removed = body
+        .lines()
+        .filter(|line| line.trim_start().starts_with("- "))
+        .count();
+    let added = body
+        .lines()
+        .filter(|line| line.trim_start().starts_with("+ "))
+        .count();
+    format!("{path}\n+{added}  -{removed}")
 }
 
 fn ask_geometry(ask: &AskState, area: Rect) -> (Rect, usize, usize) {
@@ -2670,6 +2717,9 @@ fn input_thread(
                                     interrupt.notify_one();
                                 }
                             }
+                            Some(HitTarget::Footer(FooterAction::Reasoning)) => {
+                                let _ = lock_screen(&screen.0).toggle_thinking_card();
+                            }
                             Some(HitTarget::Thinking) => {
                                 let _ = lock_screen(&screen.0).toggle_thinking_card();
                             }
@@ -2738,6 +2788,10 @@ fn input_thread(
                     }
                     KeyCode::PageDown => {
                         perm.scroll += 5;
+                    }
+                    KeyCode::Char(' ') if perm.title.contains("patch_file") => {
+                        perm.expanded = !perm.expanded;
+                        perm.scroll = 0;
                     }
                     KeyCode::Enter => {
                         let answer = perm.options[perm.selected.min(perm.options.len() - 1)]
@@ -3538,15 +3592,23 @@ fn render(frame: &mut Frame<'_>, model: &Model) -> RenderInfo {
     } else {
         menu_height(model.ac_items.len())
     };
-    // Multiline editor: grows with the buffer's newlines (backslash-newline continuation).
-    // Split the same way `editor_widget` does: `lines()` drops a trailing empty segment, which
-    // would leave the caret a row below the text after the buffer ends with a newline.
+    // Multiline editor: size from the same wrapped rows that `editor_widget` renders. Counting
+    // only explicit newlines makes long lines overflow the box and puts the caret out of sync.
     // While thinking with an empty buffer the placeholder row is omitted, so count zero content
     // rows and let the wall occupy the only text line.
     let input_lines = if model.input.is_empty() && model.thinking.is_some() {
         0
+    } else if model.input.is_empty() {
+        1
     } else {
-        model.input.split('\n').count().max(1)
+        editor_view(
+            &model.input,
+            model.input_caret,
+            frame.area().width.saturating_sub(4).max(1) as usize,
+        )
+        .rows
+        .len()
+        .max(1)
     };
     let editor_rows =
         (input_lines.min(EDITOR_VISIBLE_LINES) as u16) + 2 + u16::from(model.thinking.is_some());
@@ -3861,6 +3923,13 @@ fn footer_hit_regions(model: &Model, area: Rect) -> Vec<HitRegion> {
     if model.thinking.is_some() {
         add("  ·  Esc interrupts", FooterAction::Interrupt);
     }
+    if model
+        .cards
+        .iter()
+        .any(|card| matches!(card.kind, CardKind::Thinking) && !card.body.trim().is_empty())
+    {
+        add("  ·  Ctrl+T reasoning", FooterAction::Reasoning);
+    }
     if model.scroll_from_bottom > 0 {
         add("  ·  Ctrl+End live", FooterAction::Live);
     }
@@ -4024,16 +4093,6 @@ fn editor_widget(model: &Model, area: Rect) -> Paragraph<'static> {
                 .fg(NOTICE_FG())
                 .add_modifier(Modifier::BOLD),
         ));
-        if model
-            .cards
-            .iter()
-            .any(|card| matches!(card.kind, CardKind::Thinking) && !card.body.trim().is_empty())
-        {
-            wall_line.push(Span::styled(
-                "  Ctrl+T / click to show reasoning".to_string(),
-                Style::default().fg(BORDER()),
-            ));
-        }
         rows.push(Line::from(wall_line));
     }
     let block = Block::default()
@@ -4218,7 +4277,6 @@ fn sidebar_rows(model: &Model, area: Rect) -> Vec<SidebarRow> {
         }
     }
     if let Some(entries) = &model.sidebar {
-        let compact = area.height < (entries.len() as u16).saturating_mul(4);
         for (i, (key, value)) in entries.iter().enumerate() {
             // Section headers (Session/Runtime/Context/Activity/Last turn) render as a
             // small muted rule so groups read apart without a blank line each.
@@ -4244,6 +4302,10 @@ fn sidebar_rows(model: &Model, area: Rect) -> Vec<SidebarRow> {
                         _ => None,
                     };
                     actions.extend(std::iter::repeat_n(action, lines.len() - before));
+                    if !matches!(key.as_str(), "Context" | "Activity" | "Last turn") {
+                        lines.push(Line::from(""));
+                        actions.push(None);
+                    }
                 }
                 continue;
             }
@@ -4263,10 +4325,10 @@ fn sidebar_rows(model: &Model, area: Rect) -> Vec<SidebarRow> {
                 let before = lines.len();
                 push_sidebar_value(&mut lines, key, value_line, max);
                 actions.extend(std::iter::repeat_n(None, lines.len() - before));
-            }
-            if !compact && i + 1 < entries.len() {
-                lines.push(Line::from(""));
-                actions.push(None);
+                if !matches!(key.as_str(), "Context" | "Activity" | "Last turn") {
+                    lines.push(Line::from(""));
+                    actions.push(None);
+                }
             }
         }
     }
@@ -4350,17 +4412,20 @@ fn push_sidebar_value(lines: &mut Vec<Line<'static>>, key: &str, value_line: &st
         return;
     }
     if let Some((label, rest)) = value_line.split_once('\t') {
-        let label_w = 7usize.min(max.saturating_sub(1));
-        let value_max = max.saturating_sub(label_w + 1);
         let style = sidebar_value_style(key, label, rest);
-        let label = crate::tui::truncate_chars(label, label_w);
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("{label:<label_w$} "),
-                Style::default().fg(TEXT()).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(crate::tui::truncate_chars(rest, value_max), style),
-        ]));
+        lines.push(Line::styled(
+            crate::tui::truncate_chars(label, max),
+            Style::default().fg(TEXT()).add_modifier(Modifier::BOLD),
+        ));
+        let value = if label == "project" {
+            compact_project_path(rest, 3)
+        } else {
+            rest.to_string()
+        };
+        lines.push(Line::styled(
+            crate::tui::truncate_left_chars(&value, max),
+            style,
+        ));
         return;
     }
     let truncated = if key == "Project" {
@@ -4369,6 +4434,15 @@ fn push_sidebar_value(lines: &mut Vec<Line<'static>>, key: &str, value_line: &st
         crate::tui::truncate_chars(value_line, max)
     };
     lines.push(Line::styled(truncated, Style::default().fg(NOTICE_FG())));
+}
+
+fn compact_project_path(path: &str, components: usize) -> String {
+    let normalized = path.replace('\\', "/");
+    let parts: Vec<&str> = normalized
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect();
+    parts[parts.len().saturating_sub(components)..].join("/")
 }
 
 /// The home screen: two-tone block-letter logo centered above the version/model line and the
@@ -4457,9 +4531,17 @@ fn footer_widget(model: &Model, area: Rect) -> Paragraph<'static> {
     // Keep action/status hints ahead of discoverability hints: truncation should not hide control
     // of an in-flight turn or the fact that input was queued.
     if model.thinking.is_some() {
-        left.push_str(
-            "  \u{b7}  Esc interrupts  \u{b7}  click thinking  \u{b7}  Enter queues for next step",
-        );
+        left.push_str("  \u{b7}  Esc interrupts  \u{b7}  Enter queues for next step");
+    }
+    if model
+        .cards
+        .iter()
+        .any(|card| matches!(card.kind, CardKind::Thinking) && !card.body.trim().is_empty())
+    {
+        left.push_str("  \u{b7}  Ctrl+T reasoning");
+    }
+    if matches!(model.hovered, Some(HitTarget::Card(_))) {
+        left.push_str("  \u{b7}  right-click copy  \u{b7}  Shift+drag select");
     }
     if model.scroll_from_bottom > 0 {
         left.push_str(&format!(
@@ -4703,6 +4785,18 @@ const COLLAPSED_PEEK: usize = 2;
 /// One-line call header: the tool name plus a trimmed peek at its arguments, so a folded card
 /// still says what ran and against what.
 fn tool_header(name: &str, args: &str) -> String {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(args) {
+        if name == "patch_file"
+            && let Some(path) = value.get("path").and_then(|value| value.as_str())
+        {
+            return format!("Edit {path}");
+        }
+        if name == "run_command"
+            && let Some(command) = value.get("command").and_then(|value| value.as_str())
+        {
+            return format!("$ {}", crate::tui::truncate_chars(command, 72));
+        }
+    }
     let compact = args.split_whitespace().collect::<Vec<_>>().join(" ");
     let compact = crate::tui::truncate_chars(&compact, 60);
     if compact.is_empty() {
@@ -4852,6 +4946,27 @@ fn card_lines(card: &Card, width: usize) -> Vec<Line<'static>> {
         for line in wrap_display(&card.body, wrap_width) {
             push_bordered(&mut out, vec![Span::styled(line, body_style)]);
         }
+        return out;
+    }
+
+    if matches!(card.kind, CardKind::Tool)
+        && card.collapsed
+        && let Some((status, ok)) = &card.status
+    {
+        push_bordered(
+            &mut out,
+            vec![
+                Span::styled(
+                    card.title.clone(),
+                    Style::default().fg(TEXT()).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("  {} {status}", if *ok { "\u{2713}" } else { "\u{2717}" }),
+                    Style::default().fg(if *ok { GREEN() } else { RED() }),
+                ),
+                Span::styled("  \u{203a}".to_string(), Style::default().fg(MUTED())),
+            ],
+        );
         return out;
     }
 
@@ -6039,7 +6154,11 @@ mod tests {
             collapsed: true,
         };
         let rows = rendered(&card, 70);
-        assert_eq!(rows.len(), 3, "header + outcome + fold hint: {rows:?}");
+        assert_eq!(
+            rows.len(),
+            1,
+            "completed tools collapse to one row: {rows:?}"
+        );
         assert!(
             rows[0].contains("read_file"),
             "header names the tool: {rows:?}"
@@ -6049,16 +6168,16 @@ mod tests {
             "header peeks at args: {rows:?}"
         );
         assert!(
-            rows[1].contains("completed"),
+            rows[0].contains("completed"),
             "outcome stays visible: {rows:?}"
         );
         assert!(
-            rows[1].contains('\u{2713}'),
+            rows[0].contains('\u{2713}'),
             "outcome is marked as success: {rows:?}"
         );
         assert!(
-            rows[2].contains("20 more line(s)"),
-            "everything else folds: {rows:?}"
+            rows.iter().all(|row| !row.contains("line 1")),
+            "output stays folded: {rows:?}"
         );
     }
 
@@ -6073,9 +6192,9 @@ mod tests {
             collapsed: true,
         };
         let rows = rendered(&card, 70);
-        assert!(rows[1].contains('\u{2717}'), "failure is marked: {rows:?}");
+        assert!(rows[0].contains('\u{2717}'), "failure is marked: {rows:?}");
         assert!(
-            rows[1].contains("failed"),
+            rows[0].contains("failed"),
             "outcome says it failed: {rows:?}"
         );
         assert!(
@@ -6334,6 +6453,18 @@ mod tests {
     }
 
     #[test]
+    fn project_path_keeps_only_the_last_three_components() {
+        assert_eq!(
+            compact_project_path("/Users/eric/Documents/GitHub/kamui", 3),
+            "Documents/GitHub/kamui"
+        );
+        assert_eq!(
+            compact_project_path(r"C:\Users\eric\kamui", 3),
+            "Users/eric/kamui"
+        );
+    }
+
+    #[test]
     fn user_cards_use_thick_left_border() {
         let card = Card {
             id: 1,
@@ -6370,6 +6501,7 @@ mod tests {
             selected: 0,
             scroll: 0,
             options: PERM_OPTIONS.to_vec(),
+            expanded: true,
         };
         let backend = ratatui::backend::TestBackend::new(80, 30);
         let mut terminal = Terminal::new(backend).expect("test terminal");
