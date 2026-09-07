@@ -3,8 +3,8 @@ use anyhow::{Context, Result};
 use crossterm::{
     cursor::SetCursorStyle,
     event::{
-        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
+        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind,
+        KeyModifiers, MouseButton, MouseEventKind,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -516,7 +516,6 @@ impl FullScreen {
                 SetCursorStyle::DefaultUserShape,
                 DisableBracketedPaste,
                 LeaveAlternateScreen,
-                DisableMouseCapture
             );
             previous_hook(info);
         }));
@@ -525,7 +524,6 @@ impl FullScreen {
         execute!(
             stdout,
             EnterAlternateScreen,
-            EnableMouseCapture,
             EnableBracketedPaste,
             SetCursorStyle::BlinkingBar
         )
@@ -535,14 +533,14 @@ impl FullScreen {
             Ok(terminal) => terminal,
             Err(error) => {
                 let mut stdout = io::stdout();
-                let _ = execute!(stdout, LeaveAlternateScreen, DisableMouseCapture);
+                let _ = execute!(stdout, LeaveAlternateScreen);
                 let _ = disable_raw_mode();
                 return Err(error).context("could not create Ratatui terminal");
             }
         };
         if let Err(error) = terminal.clear() {
             let mut stdout = io::stdout();
-            let _ = execute!(stdout, LeaveAlternateScreen, DisableMouseCapture);
+            let _ = execute!(stdout, LeaveAlternateScreen);
             let _ = disable_raw_mode();
             return Err(error).context("could not clear terminal");
         }
@@ -1023,7 +1021,6 @@ impl FullScreen {
             SetCursorStyle::DefaultUserShape,
             DisableBracketedPaste,
             LeaveAlternateScreen,
-            DisableMouseCapture
         );
         let _ = disable_raw_mode();
         let _ = self.terminal.backend_mut().flush();
@@ -1313,8 +1310,8 @@ impl ChatUi {
         if self.fullscreen.is_none() || text.trim().is_empty() {
             return Ok(());
         }
-        // Auto-copy is background convenience, not transcript content. Manual Ctrl+Y/right-click
-        // still report success or failure; an unavailable clipboard must not fail a completed turn.
+        // Auto-copy is background convenience, not transcript content. Manual Ctrl+Y still reports
+        // success or failure; an unavailable clipboard must not fail a completed turn.
         let _ = set_clipboard_text(text);
         Ok(())
     }
@@ -2316,12 +2313,12 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, scroll: usize) {
         ("Home/End, Ctrl+A/E", "start / end of line"),
         ("Ctrl+K", "switch model"),
         ("Ctrl+S", "resume a session"),
-        ("Ctrl+O / click", "expand or fold tool output"),
-        ("Ctrl+T / click thinking", "expand or fold reasoning"),
+        ("Ctrl+O", "expand or fold tool output"),
+        ("Ctrl+T", "expand or fold reasoning"),
         ("Ctrl+F", "search the transcript"),
         ("Ctrl+B", "show or hide the sidebar"),
         ("Ctrl+Y", "copy the latest answer"),
-        ("Right click", "copy the cell under the pointer"),
+        ("Mouse drag", "select any transcript text"),
         ("?", "toggle this help"),
         ("Tab / Shift+Tab", "cycle mode (build / auto / plan)"),
         ("Tab", "accept slash completion without sending"),
@@ -2337,7 +2334,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, scroll: usize) {
             "Esc",
             "close overlay / interrupt; idle drafts are preserved",
         ),
-        ("Ctrl+C x 2", "quit"),
+        ("Ctrl+C", "clear input; twice more to quit"),
     ];
     // Chrome the sheet always pays for: two borders, the title, and the closing hint.
     const HELP_CHROME: usize = 4;
@@ -2486,9 +2483,9 @@ fn input_thread(
     };
 
     sync(&screen, "", 0, 0, Vec::new());
-    // Feed loop: the wheel scrolls right here; only key presses fall through to the editor.
+    // Feed loop. Mouse capture stays disabled so normal drag-selection can copy any response.
     // Read errors are tolerated briefly, then quit gracefully (never process::exit - that
-    // would skip FullScreen's Drop and leave raw mode + mouse capture enabled).
+    // would skip FullScreen's Drop and leave raw mode enabled).
     let mut feed_errors = 0u32;
     'keys: loop {
         let key = 'feed: {
@@ -3369,6 +3366,13 @@ fn input_thread(
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if is_busy {
                     interrupt.notify_one();
+                } else if !buf.is_empty() {
+                    buf.clear();
+                    caret = 0;
+                    selected = 0;
+                    saved_buf.clear();
+                    history_idx = history.len();
+                    last_ctrl_c = None;
                 } else if last_ctrl_c
                     .map(|t| t.elapsed() < std::time::Duration::from_secs(3))
                     .unwrap_or(false)
@@ -4540,9 +4544,7 @@ fn footer_widget(model: &Model, area: Rect) -> Paragraph<'static> {
     {
         left.push_str("  \u{b7}  Ctrl+T reasoning");
     }
-    if matches!(model.hovered, Some(HitTarget::Card(_))) {
-        left.push_str("  \u{b7}  right-click copy  \u{b7}  Shift+drag select");
-    }
+    left.push_str("  \u{b7}  drag to select");
     if model.scroll_from_bottom > 0 {
         left.push_str(&format!(
             "  \u{b7}  \u{2191} {} row(s) back  \u{b7}  Ctrl+End live",
@@ -4936,7 +4938,7 @@ fn card_lines(card: &Card, width: usize) -> Vec<Line<'static>> {
                 push_bordered(
                     &mut out,
                     vec![Span::styled(
-                        "\u{2026} ctrl+o or click".to_string(),
+                        "\u{2026} ctrl+o to expand".to_string(),
                         Style::default().fg(MUTED()),
                     )],
                 );
@@ -5016,7 +5018,7 @@ fn card_lines(card: &Card, width: usize) -> Vec<Line<'static>> {
             push_bordered(
                 &mut out,
                 vec![Span::styled(
-                    format!("\u{2026} {hidden} more line(s) \u{b7} ctrl+o or click"),
+                    format!("\u{2026} {hidden} more line(s) \u{b7} ctrl+o to expand"),
                     Style::default().fg(MUTED()),
                 )],
             );
@@ -5296,7 +5298,7 @@ mod tests {
             "body stays folded: {rows:?}"
         );
         assert!(
-            rows.iter().any(|row| row.contains("ctrl+o or click")),
+            rows.iter().any(|row| row.contains("ctrl+o to expand")),
             "expand hint is present: {rows:?}"
         );
 
