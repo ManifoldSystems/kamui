@@ -169,6 +169,10 @@ effort or operational risk is disproportionate to their immediate value.
 - Multiple approval-gated calls in one response receive a grouped one-time review before execution.
   Allow-all does not create permission grants; individual review retains exact command/path grants,
   and every call still dispatches sequentially through validation, journaling, and edit snapshots.
+- Primary coding turns track repository-inspection calls and returned bytes. Sustained read-only
+  exploration without a successful `patch_file` injects up to two private system reminders to
+  narrow the search and implement or report a blocker. This is soft steering, not a tool ban; it is
+  not persisted in conversation history and is intentionally disabled for read-only child agents.
 - Fullscreen input submitted while a turn is busy is persisted in `queued_inputs` before the UI
   acknowledges it. A stable queue id follows steering/next-turn promotion and is deleted in the
   same transaction that saves the completed turn; claimed rows return to queued on resume.

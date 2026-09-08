@@ -846,6 +846,12 @@ allow the reviewed batch, reject it, or fall back to the existing per-item appro
 approval is one-time only, never a session grant, and calls still execute sequentially with their
 normal path checks, journals, and undo snapshots.
 
+On coding turns, Kamui also watches for exploration drift. If repeated repository reads consume a
+large number of calls or bytes without a successful file edit, it adds a private steering reminder
+to the current model request to narrow the investigation and implement or state a precise blocker.
+The reminder is advisory rather than a hard tool limit, is emitted at most twice per turn, is not
+stored as user conversation history, and does not apply to deliberately read-only child agents.
+
 In the fullscreen UI, prompts submitted while the agent is busy are persisted before Kamui labels
 them queued. Their FIFO IDs follow them into steering or the next turn and are removed atomically
 with the completed turn. Restarting and resuming restores both queued and previously claimed input,

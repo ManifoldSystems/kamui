@@ -35,6 +35,65 @@ const RESUME_REPLAY_MESSAGES: usize = 10;
 /// Upper bound on model/tool round-trips within a single user turn, to stop runaway tool loops.
 /// Generous enough for multi-file edits while still bounding a stuck loop.
 const MAX_TOOL_ROUNDS: usize = 25;
+const EXPLORATION_WARNING_CALLS: usize = 10;
+const EXPLORATION_WARNING_BYTES: usize = 128 * 1024;
+const EXPLORATION_FINAL_CALLS: usize = 18;
+const EXPLORATION_FINAL_BYTES: usize = 256 * 1024;
+
+#[derive(Default)]
+struct ExplorationGuard {
+    calls: usize,
+    bytes: usize,
+    warnings: usize,
+}
+
+impl ExplorationGuard {
+    fn observe(&mut self, tool: &str, output: &str) {
+        if is_inspection_tool(tool) {
+            self.calls += 1;
+            self.bytes = self.bytes.saturating_add(output.len());
+        } else if is_successful_mutation(tool, output) {
+            self.calls = 0;
+            self.bytes = 0;
+            self.warnings = 0;
+        }
+    }
+
+    fn warning(&mut self) -> Option<&'static str> {
+        let final_pressure =
+            self.calls >= EXPLORATION_FINAL_CALLS || self.bytes >= EXPLORATION_FINAL_BYTES;
+        if final_pressure && self.warnings < 2 {
+            self.warnings = 2;
+            return Some(
+                "Exploration budget is exhausted. Stop broad reconnaissance and do not reread \
+                 resources already inspected. Make the smallest concrete edit now, or return a \
+                 precise blocker if editing would be unsafe.",
+            );
+        }
+        let initial_pressure =
+            self.calls >= EXPLORATION_WARNING_CALLS || self.bytes >= EXPLORATION_WARNING_BYTES;
+        if initial_pressure && self.warnings == 0 {
+            self.warnings = 1;
+            return Some(
+                "You have spent substantial context exploring without making implementation \
+                 progress. Narrow the investigation and make the smallest correct edit now, or \
+                 state the exact blocker. Do not reread resources already inspected.",
+            );
+        }
+        None
+    }
+}
+
+fn is_inspection_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "read_file" | "read_image" | "list_directory" | "grep" | "glob" | "search_code"
+    )
+}
+
+fn is_successful_mutation(name: &str, output: &str) -> bool {
+    name == "patch_file" && !output.starts_with("Error: ")
+}
 const REPEATED_TOOL_BATCH_LIMIT: usize = 3;
 
 fn tool_batch_signature(calls: &[ToolCall]) -> Vec<(String, String)> {
@@ -1547,6 +1606,7 @@ where
         let mut last_content = String::new();
         let mut tool_trail: Vec<Message> = Vec::new();
         let mut recent_tool_batches = Vec::new();
+        let mut exploration_guard = ExplorationGuard::default();
         // Pre-edit snapshot of every file an approved patch_file call touches this turn, so an
         // interrupted multi-file edit can be reverted instead of left half-applied (see
         // `snapshot_patch_target`/`revert_on_cancel`).
@@ -2292,6 +2352,7 @@ where
                 let result_message = Message::tool_result(&call.id, output.clone());
                 turn_messages.push(result_message.clone());
                 tool_trail.push(result_message);
+                exploration_guard.observe(&call.name, &output);
                 // Defer vision attachments until every tool result in this batch is
                 // on the wire. A `user` message mid-batch breaks OpenAI's rule that
                 // every tool_call_id must be answered contiguously after the
@@ -2312,6 +2373,12 @@ where
             for visual in pending_visuals {
                 turn_messages.push(visual.clone());
                 tool_trail.push(visual);
+            }
+            if let Some(warning) = exploration_guard.warning() {
+                chat_ui.notice(
+                    "exploration drift detected; steering the agent toward implementation",
+                )?;
+                turn_messages.push(Message::system(warning));
             }
         };
 
@@ -2553,6 +2620,7 @@ where
     let user_message = Message::user(prompt);
     let mut tool_trail: Vec<Message> = Vec::new();
     let mut recent_tool_batches = Vec::new();
+    let mut exploration_guard = ExplorationGuard::default();
     // Files `patch_file` targeted this turn, so the code index can be refreshed once at the end.
     // Interactive chat reads the same set out of its revert snapshot, which `-p` has no use for.
     let mut edited: Vec<PathBuf> = Vec::new();
@@ -2689,6 +2757,7 @@ where
             let result_message = Message::tool_result(&call.id, output.clone());
             turn_messages.push(result_message.clone());
             tool_trail.push(result_message);
+            exploration_guard.observe(&call.name, &output);
             // Defer vision attachments until every tool result in this batch is
             // on the wire. A `user` message mid-batch breaks OpenAI's rule that
             // every tool_call_id must be answered contiguously after the
@@ -2709,6 +2778,10 @@ where
         for visual in pending_visuals {
             turn_messages.push(visual.clone());
             tool_trail.push(visual);
+        }
+        if let Some(warning) = exploration_guard.warning() {
+            eprintln!("(exploration drift detected; steering the agent toward implementation)");
+            turn_messages.push(Message::system(warning));
         }
     };
 
@@ -5796,6 +5869,47 @@ mod tests {
         assert!(!repeated_tool_batch(&mut recent, &call("b")));
         assert!(!repeated_tool_batch(&mut recent, &call("b")));
         assert!(repeated_tool_batch(&mut recent, &call("b")));
+    }
+
+    #[test]
+    fn exploration_guard_warns_once_then_escalates() {
+        let mut guard = ExplorationGuard::default();
+        for _ in 0..EXPLORATION_WARNING_CALLS {
+            guard.observe("read_file", "small");
+        }
+        assert!(guard.warning().unwrap().contains("substantial context"));
+        assert!(guard.warning().is_none());
+
+        for _ in EXPLORATION_WARNING_CALLS..EXPLORATION_FINAL_CALLS {
+            guard.observe("grep", "small");
+        }
+        assert!(guard.warning().unwrap().contains("budget is exhausted"));
+        assert!(guard.warning().is_none());
+    }
+
+    #[test]
+    fn exploration_guard_counts_bytes_and_ignores_non_inspection_tools() {
+        let mut guard = ExplorationGuard::default();
+        guard.observe("update_plan", &"x".repeat(EXPLORATION_WARNING_BYTES));
+        assert!(guard.warning().is_none());
+        guard.observe("read_file", &"x".repeat(EXPLORATION_WARNING_BYTES));
+        assert!(guard.warning().is_some());
+    }
+
+    #[test]
+    fn successful_patch_resets_exploration_but_failed_patch_does_not() {
+        let mut guard = ExplorationGuard::default();
+        for _ in 0..EXPLORATION_WARNING_CALLS {
+            guard.observe("glob", "result");
+        }
+        guard.observe("patch_file", "Error: no exact match");
+        assert!(guard.warning().is_some());
+
+        guard.observe("patch_file", "patched src/main.rs");
+        assert!(guard.warning().is_none());
+        assert_eq!(guard.calls, 0);
+        assert_eq!(guard.bytes, 0);
+        assert_eq!(guard.warnings, 0);
     }
     use crate::pricing::ModelPrice;
     use std::fs;
