@@ -909,6 +909,84 @@ fn parse_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::ImageAttachment;
+
+    #[test]
+    fn compatibility_matrix_preserves_mixed_request_order_and_shape() {
+        let request = ChatRequest {
+            model: "compat-model".into(),
+            messages: vec![
+                Message::system("follow instructions"),
+                Message::user_with_images(
+                    "inspect this",
+                    vec![ImageAttachment {
+                        media_type: "image/png".into(),
+                        data: "QUJD".into(),
+                    }],
+                ),
+                Message::tool_request(
+                    String::new(),
+                    vec![ToolCall {
+                        id: "call_1".into(),
+                        name: "read_file".into(),
+                        arguments: r#"{"path":"src/main.rs"}"#.into(),
+                    }],
+                ),
+                Message::tool_result("call_1", "fn main() {}"),
+            ],
+            tools: vec![ToolDefinition {
+                name: "read_file".into(),
+                description: "Read a project file".into(),
+                parameters: serde_json::json!({"type": "object"}),
+            }],
+            session_id: Some("session-1".into()),
+        };
+        let cache_key = clamp_prompt_cache_key(request.session_id.as_deref().unwrap());
+        let body = OpenAIRequest {
+            model: &request.model,
+            messages: wire_messages(&request.messages),
+            tools: wire_tools(&request.tools),
+            session_id: request.session_id.as_deref(),
+            prompt_cache_key: cache_key.as_deref(),
+        };
+        let value = serde_json::to_value(body).unwrap();
+
+        assert_eq!(value["session_id"], "session-1");
+        assert_eq!(value["prompt_cache_key"], "session-1");
+        assert_eq!(value["messages"][0]["role"], "system");
+        assert_eq!(value["messages"][1]["content"][0]["type"], "text");
+        assert_eq!(value["messages"][1]["content"][1]["type"], "image_url");
+        assert_eq!(value["messages"][2]["tool_calls"][0]["id"], "call_1");
+        assert!(value["messages"][2]["content"].is_null());
+        assert_eq!(value["messages"][3]["tool_call_id"], "call_1");
+        assert_eq!(value["tools"][0]["function"]["name"], "read_file");
+    }
+
+    #[test]
+    fn compatibility_matrix_parses_cache_usage_and_rejects_bad_responses() {
+        let fixtures = [
+            (
+                r#"{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":100,"completion_tokens":2,"total_tokens":102,"prompt_tokens_details":{"cached_tokens":80}}}"#,
+                80,
+            ),
+            (
+                r#"{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],"usage":{"input_tokens":100,"output_tokens":2,"cache_read_input_tokens":70}}"#,
+                70,
+            ),
+        ];
+        for (json, expected_cached) in fixtures {
+            let response: OpenAIResponse = serde_json::from_str(json).unwrap();
+            assert_eq!(
+                response_into_chat(response).unwrap().usage.cached_tokens,
+                expected_cached
+            );
+        }
+
+        assert!(serde_json::from_str::<OpenAIResponse>(r#"{"choices":"wrong"}"#).is_err());
+        let unsupported: OpenAIResponse =
+            serde_json::from_str(r#"{"output":[{"type":"message","content":[]}]}"#).unwrap();
+        assert!(response_into_chat(unsupported).is_err());
+    }
 
     #[test]
     fn parses_delta_finish_and_usage_events() {
@@ -1065,7 +1143,6 @@ mod tests {
 
     #[test]
     fn serializes_images_as_content_parts() {
-        use crate::provider::ImageAttachment;
         let messages = vec![Message::user_with_images(
             "what is this?",
             vec![ImageAttachment {

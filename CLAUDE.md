@@ -641,8 +641,8 @@ release build when changing dependencies, platform behavior, installers, or rele
 
 Current tests cover persistence, cascade deletion, session summaries, hidden empty sessions, SSE
 parsing, project instruction precedence, file-reference expansion, duplicate references, unchanged
-plain prompts, and staged Git diff expansion. Add focused tests for new parsing, storage, safety, and
-cross-platform path behavior.
+plain prompts, staged Git diff expansion, and the OpenAI-compatible mixed text/image/tool/cache wire
+contract. Add focused tests for new parsing, storage, safety, and cross-platform path behavior.
 
 ## Git and Releases
 
