@@ -56,7 +56,7 @@ effort or operational risk is disproportionate to their immediate value.
   prompt shuts down gracefully. Windows stdin uses a reader thread and Tokio channel so the async
   runtime does not block on terminal input.
 - Supported chat commands are `/help`, `/new`, `/sessions`, `/resume <id>`, `/model [name]`,
-  `/rename <id> <title>`, `/search <text>`, `/compact`, `/undo`, `/redo`, `/audit`, `/jobs`, `/index`, `/commands`,
+  `/rename <id> <title>`, `/search <text>`, `/compact`, `/undo`, `/redo`, `/audit`, `/agents`, `/jobs`, `/index`, `/commands`,
   `/delete <id>`, `/stats`, `/usage`, `/status`, `/memory`, `/forget <text>` (or `/forget all`),
   and `/exit`. Plain `exit` also quits.
 - Users define their own slash commands as markdown files (`src/commands.rs`): global ones in
@@ -461,6 +461,8 @@ after title generation while later turns are fine.
   are recovered on resume, and completion is atomic with turn persistence.
 - `user_version = 16` adds `edit_snapshots`, migrating the previous one-level session snapshot into
   the undo stack. New rows carry before/after states for durable multi-level undo and redo.
+- `user_version = 17` adds `child_agent_runs`. Existing read-only sub-agents persist their task,
+  status, and final result; running rows become interrupted after a crash and are never auto-retried.
 
 ## Configuration
 

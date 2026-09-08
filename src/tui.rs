@@ -11,6 +11,7 @@ pub const BUILTINS: &[(&str, &str)] = &[
     ("undo", "Revert the last turn's file edits"),
     ("redo", "Reapply the last undone file edits"),
     ("audit", "Show recent mutating tool executions"),
+    ("agents", "Show recent child-agent runs"),
     ("jobs", "List session and scheduled jobs"),
     ("index", "Rebuild the semantic-search index"),
     ("commands", "List your own prompt commands"),

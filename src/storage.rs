@@ -112,6 +112,13 @@ pub struct ToolExecution {
     pub started_at: i64,
 }
 
+pub struct ChildAgentRun {
+    pub id: String,
+    pub status: String,
+    pub prompt: String,
+    pub result: Option<String>,
+}
+
 fn scheduled_job_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScheduledJob> {
     Ok(ScheduledJob {
         id: row.get(0)?,
@@ -398,8 +405,29 @@ impl Database {
                  PRAGMA user_version = 16;",
             )?;
         }
+        if version < 17 {
+            connection.execute_batch(
+                "CREATE TABLE child_agent_runs (
+                     id TEXT PRIMARY KEY,
+                     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                     tool_call_id TEXT NOT NULL,
+                     prompt TEXT NOT NULL,
+                     status TEXT NOT NULL CHECK (status IN ('running', 'completed', 'error', 'interrupted')),
+                     result TEXT,
+                     created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                     finished_at INTEGER
+                 );
+                 CREATE INDEX child_agent_runs_session_id ON child_agent_runs(session_id, created_at);
+                 PRAGMA user_version = 17;",
+            )?;
+        }
         connection.execute(
             "UPDATE tool_executions SET status = 'interrupted', finished_at = unixepoch()
+             WHERE status = 'running'",
+            [],
+        )?;
+        connection.execute(
+            "UPDATE child_agent_runs SET status = 'interrupted', finished_at = unixepoch()
              WHERE status = 'running'",
             [],
         )?;
@@ -962,6 +990,53 @@ impl Database {
                 arguments: row.get(2)?,
                 output: row.get(3)?,
                 started_at: row.get(4)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn start_child_agent(
+        &self,
+        session_id: &str,
+        tool_call_id: &str,
+        prompt: &str,
+    ) -> Result<String> {
+        let id = Uuid::new_v4().to_string();
+        self.connection.execute(
+            "INSERT INTO child_agent_runs (id, session_id, tool_call_id, prompt, status)
+             VALUES (?1, ?2, ?3, ?4, 'running')",
+            params![id, session_id, tool_call_id, prompt],
+        )?;
+        Ok(id)
+    }
+
+    pub fn finish_child_agent(&self, id: &str, result: &str) -> Result<()> {
+        let status = if result.starts_with("Error: ") {
+            "error"
+        } else {
+            "completed"
+        };
+        self.connection.execute(
+            "UPDATE child_agent_runs SET status = ?2, result = ?3, finished_at = unixepoch()
+             WHERE id = ?1 AND status = 'running'",
+            params![id, status, result],
+        )?;
+        Ok(())
+    }
+
+    pub fn child_agent_runs(&self, session_id: &str, limit: usize) -> Result<Vec<ChildAgentRun>> {
+        let limit = i64::try_from(limit).context("child agent limit overflow")?;
+        let mut statement = self.connection.prepare(
+            "SELECT id, status, prompt, result FROM child_agent_runs
+             WHERE session_id = ?1 ORDER BY created_at DESC, rowid DESC LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![session_id, limit], |row| {
+            Ok(ChildAgentRun {
+                id: row.get(0)?,
+                status: row.get(1)?,
+                prompt: row.get(2)?,
+                result: row.get(3)?,
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -1879,7 +1954,7 @@ mod tests {
         let resumed = database.find_session(&session.id).unwrap().unwrap();
         assert_eq!(resumed.compaction_summary.as_deref(), Some("earlier work"));
         assert_eq!(resumed.summarized_upto, 7);
-        assert_eq!(database.schema_version().unwrap(), 16);
+        assert_eq!(database.schema_version().unwrap(), 17);
     }
 
     #[test]
@@ -1920,7 +1995,7 @@ mod tests {
                 .0,
             first.0
         );
-        assert_eq!(database.schema_version().unwrap(), 16);
+        assert_eq!(database.schema_version().unwrap(), 17);
     }
 
     #[test]
@@ -1961,7 +2036,7 @@ mod tests {
                 .unwrap(),
             "interrupted"
         );
-        assert_eq!(database.schema_version().unwrap(), 16);
+        assert_eq!(database.schema_version().unwrap(), 17);
         let rows = database.tool_executions(&session.id, 20).unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].tool_name, "run_command");
@@ -2000,7 +2075,27 @@ mod tests {
             database.recover_queued_inputs(&session.id).unwrap().len(),
             1
         );
-        assert_eq!(database.schema_version().unwrap(), 16);
+        assert_eq!(database.schema_version().unwrap(), 17);
+    }
+
+    #[test]
+    fn child_agent_runs_persist_results_and_recover_interruptions() {
+        let database = database();
+        let session = database.create_session("test", "model").unwrap();
+        let completed = database
+            .start_child_agent(&session.id, "c1", "inspect")
+            .unwrap();
+        database.finish_child_agent(&completed, "found it").unwrap();
+        database
+            .start_child_agent(&session.id, "c2", "search")
+            .unwrap();
+        let Database { connection, path } = database;
+        let database = Database::initialize(connection, path).unwrap();
+        let rows = database.child_agent_runs(&session.id, 20).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].status, "interrupted");
+        assert_eq!(rows[1].result.as_deref(), Some("found it"));
+        assert_eq!(database.schema_version().unwrap(), 17);
     }
 
     #[test]

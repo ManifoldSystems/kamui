@@ -572,6 +572,7 @@ TTY, `NO_COLOR` keeps the fullscreen TUI but removes its semantic foreground/bac
 | `/undo` | Revert the files patched by the last turn |
 | `/redo` | Reapply the last undone file edits |
 | `/audit` | Show recent mutating tool executions for this session |
+| `/agents` | Show recent child-agent runs for this session |
 | `/jobs` | List temporary session jobs and persistent scheduled jobs |
 | `/index` | Rebuild the semantic-search index (needs `embedding_model`) |
 | `/commands` | List your own prompt commands |
@@ -823,6 +824,10 @@ are marked interrupted and shown when their session is resumed. Kamui never retr
 automatically because the command or file write may already have taken effect.
 Use `/audit` to inspect the 20 most recent entries for the active session; arguments and outputs are
 shown as bounded previews so large command output cannot flood the terminal.
+
+Read-only `spawn_agent` runs also have durable lifecycle records. `/agents` shows their task,
+status, and bounded final result for the active session. A process crash changes running children to
+`interrupted`; Kamui does not automatically repeat them and spend the provider request twice.
 
 Choosing `always` at an approval is scoped to the exact normalized command or canonical file path
 for the active session. It does not grant every future `run_command` or `patch_file` call; different

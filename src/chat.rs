@@ -1092,6 +1092,15 @@ where
                 }
                 continue;
             }
+            if command == "/agents" {
+                match session.as_ref() {
+                    Some(active) => chat_ui.notice(&format_child_agents(
+                        &database.child_agent_runs(&active.id, 20)?,
+                    ))?,
+                    None => chat_ui.notice("No active session.")?,
+                }
+                continue;
+            }
             if command == "/jobs" {
                 let text = format!(
                     "Session jobs:\n{}\n\nScheduled jobs:\n{}",
@@ -1462,12 +1471,16 @@ where
         );
 
         let is_first_exchange = session.is_none();
-        let active_session = match session.as_ref() {
-            Some(active_session) => active_session,
-            None => session.insert(database.create_session(provider.name(), &active.model)?),
-        };
+        if session.is_none() {
+            session = Some(database.create_session(provider.name(), &active.model)?);
+        }
+        let active_session_id = session
+            .as_ref()
+            .expect("session was created above")
+            .id
+            .clone();
         if let Some(hub) = hub.as_ref() {
-            hub.set_queue_context(database.path().to_path_buf(), active_session.id.clone());
+            hub.set_queue_context(database.path().to_path_buf(), active_session_id.clone());
         }
         let mut admitted_inputs: Vec<String> = admitted_input.into_iter().collect();
         if let Some(id) = admitted_inputs.first() {
@@ -1844,6 +1857,7 @@ where
                         project,
                         &spawn_calls,
                         coding_session_id.clone(),
+                        Some((database, active_session_id.as_str())),
                     ) => output,
                     signal = tokio::signal::ctrl_c() => {
                         signal.context("failed to listen for Ctrl+C")?;
@@ -2330,7 +2344,7 @@ where
         .cloned()
         .unwrap_or_else(|| config.default().clone());
     let provider = build_provider(&active);
-    let session = if active.send_session_id {
+    let mut session = if active.send_session_id {
         Some(database.create_session(provider.name(), &active.model)?)
     } else {
         None
@@ -2438,12 +2452,18 @@ where
             .iter()
             .filter(|call| call.name == tools::SPAWN_AGENT_TOOL)
             .collect();
+        if !spawn_calls.is_empty() && session.is_none() {
+            session = Some(database.create_session(provider.name(), &active.model)?);
+        }
         let spawned_outputs = dispatch_spawn_agents(
             provider.as_ref(),
             &active.model,
             project,
             &spawn_calls,
             coding_session_id.clone(),
+            session
+                .as_ref()
+                .map(|parent| (database, parent.id.as_str())),
         )
         .await;
         let mut pending_visuals = Vec::new();
@@ -3468,6 +3488,29 @@ fn audit_preview(value: &str, limit: usize) -> String {
     preview
 }
 
+fn format_child_agents(rows: &[storage::ChildAgentRun]) -> String {
+    if rows.is_empty() {
+        return "No child-agent runs recorded for this session.".to_string();
+    }
+    let mut output = String::from("Recent child-agent runs:\n");
+    for row in rows {
+        let result = row
+            .result
+            .as_deref()
+            .map(|value| audit_preview(value, 120))
+            .unwrap_or_else(|| "-".to_string());
+        let _ = writeln!(
+            output,
+            "{} | {} | task: {} | result: {}",
+            &row.id[..8.min(row.id.len())],
+            row.status,
+            audit_preview(&row.prompt, 120),
+            result
+        );
+    }
+    output.trim_end().to_string()
+}
+
 async fn dispatch_with_journal(
     tools: &ToolRegistry,
     call: &crate::provider::ToolCall,
@@ -4372,21 +4415,29 @@ async fn dispatch_spawn_agents(
     project: &ProjectContext,
     calls: &[&ToolCall],
     session_id: Option<String>,
+    persistence: Option<(&Database, &str)>,
 ) -> HashMap<String, (String, Duration)> {
     let mut outputs = HashMap::with_capacity(calls.len());
     for batch in calls.chunks(MAX_CONCURRENT_SUB_AGENTS) {
         let futures = batch.iter().map(|call| {
             let session_id = cache::sub_agent_session_id(session_id.as_deref(), &call.id);
+            let child_id = persistence.and_then(|(database, parent_id)| {
+                let prompt = serde_json::from_str::<SpawnAgentArguments>(&call.arguments)
+                    .ok()?
+                    .prompt;
+                database
+                    .start_child_agent(parent_id, &call.id, &prompt)
+                    .ok()
+            });
             async move {
                 let started = Instant::now();
-                (
-                    call.id.clone(),
-                    (
-                        dispatch_spawn_agent(provider, model, project, &call.arguments, session_id)
-                            .await,
-                        started.elapsed(),
-                    ),
-                )
+                let output =
+                    dispatch_spawn_agent(provider, model, project, &call.arguments, session_id)
+                        .await;
+                if let (Some((database, _)), Some(child_id)) = (persistence, child_id.as_deref()) {
+                    let _ = database.finish_child_agent(child_id, &output);
+                }
+                (call.id.clone(), (output, started.elapsed()))
             }
         });
         outputs.extend(join_all(futures).await);
@@ -5130,6 +5181,7 @@ pub(crate) fn print_help(out: &mut String) {
         out,
         "/audit            Show recent mutating tool executions"
     );
+    let _ = writeln!(out, "/agents           Show recent child-agent runs");
     let _ = writeln!(
         out,
         "/jobs             List session and persistent scheduled jobs"
@@ -7027,6 +7079,7 @@ mod tests {
             &project,
             &references,
             Some("parent".to_string()),
+            None,
         )
         .await;
 
