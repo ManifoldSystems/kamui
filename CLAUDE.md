@@ -114,8 +114,8 @@ effort or operational risk is disproportionate to their immediate value.
   `[y/N/a]`; `y`/`yes` approves once, declining feeds a refusal back to the model. Three ways to
   skip the prompt: `a`/`always` — ported from the sibling Kumo project's "Always allow" button,
   adapted from Telegram inline buttons to a plain third answer — both approves that call and grants
-  the *tool* (not that specific command) a standing pass in `start_chat`'s `always_allowed:
-  HashSet<String>` for the rest of the active session, cleared on `/new` or deleting the active
+  its exact normalized command or canonical patch target a standing pass in `start_chat`'s
+  `always_allowed: HashSet<String>` for the rest of the active session, cleared on `/new` or deleting the active
   session (`handle_command` takes `&mut HashSet<String>` for this); a global-only `[permissions]
   allow_commands = [...]` exact-match allowlist (`Tool::requires_confirmation_for`, checked instead
   of the no-arg `requires_confirmation` at dispatch time), configured ahead of time rather than

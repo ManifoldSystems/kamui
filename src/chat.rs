@@ -2030,7 +2030,7 @@ where
                     dispatch_memory_tool(database, &call.name, &call.arguments)
                 } else if tools.requires_confirmation_for(&call.name, &call.arguments)
                     && !auto_approve
-                    && !always_allowed.contains(&call.name)
+                    && !session_permission_matches(&always_allowed, project.root(), call)
                 {
                     let preview = tools.preview(call);
                     if !use_tui {
@@ -2056,10 +2056,10 @@ where
                     let always = matches!(trimmed, Some("a" | "A" | "always" | "Always"));
                     let approved = always || matches!(trimmed, Some("y" | "Y" | "yes" | "Yes"));
                     if always {
-                        always_allowed.insert(call.name.clone());
+                        let scope = session_permission_scope(project.root(), call);
+                        always_allowed.insert(scope.clone());
                         chat_ui.notice(&format!(
-                            "always allowing {} for the rest of this session — /new clears this",
-                            call.name
+                            "always allowing {scope} for the rest of this session — /new clears this"
                         ))?;
                     }
                     if approved {
@@ -3387,6 +3387,29 @@ fn snapshot_patch_target(
     } else {
         snapshot.insert(target, None);
     }
+}
+
+fn session_permission_scope(root: &Path, call: &crate::provider::ToolCall) -> String {
+    if call.name == "run_command"
+        && let Ok(value) = serde_json::from_str::<serde_json::Value>(&call.arguments)
+        && let Some(command) = value.get("command").and_then(|value| value.as_str())
+    {
+        return format!("run_command:{}", command.trim());
+    }
+    if call.name == tools::PATCH_FILE_TOOL
+        && let Some(path) = tools::patch_target(root, &call.arguments)
+    {
+        return format!("patch_file:{}", path.display());
+    }
+    format!("tool:{}", call.name)
+}
+
+fn session_permission_matches(
+    grants: &HashSet<String>,
+    root: &Path,
+    call: &crate::provider::ToolCall,
+) -> bool {
+    grants.contains(&session_permission_scope(root, call))
 }
 
 fn report_interrupted_tools(
@@ -6583,6 +6606,42 @@ mod tests {
         let after = snapshot_current_files(&before).unwrap();
         assert_eq!(after.get(&edited).unwrap().as_deref(), Some("after"));
         assert_eq!(after.get(&deleted), Some(&None));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn session_command_grants_match_only_the_exact_normalized_command() {
+        let root = temporary_directory();
+        let call = crate::provider::ToolCall {
+            id: "1".into(),
+            name: "run_command".into(),
+            arguments: r#"{"command":" cargo test "}"#.into(),
+        };
+        let grants = HashSet::from([session_permission_scope(&root, &call)]);
+        assert!(session_permission_matches(&grants, &root, &call));
+        let different = crate::provider::ToolCall {
+            arguments: r#"{"command":"cargo test --all"}"#.into(),
+            ..call
+        };
+        assert!(!session_permission_matches(&grants, &root, &different));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn session_patch_grants_match_only_the_canonical_target() {
+        let root = temporary_directory().canonicalize().unwrap();
+        let call = crate::provider::ToolCall {
+            id: "1".into(),
+            name: tools::PATCH_FILE_TOOL.into(),
+            arguments: r#"{"path":"a.txt","old_text":"","new_text":"a"}"#.into(),
+        };
+        let grants = HashSet::from([session_permission_scope(&root, &call)]);
+        assert!(session_permission_matches(&grants, &root, &call));
+        let different = crate::provider::ToolCall {
+            arguments: r#"{"path":"b.txt","old_text":"","new_text":"b"}"#.into(),
+            ..call
+        };
+        assert!(!session_permission_matches(&grants, &root, &different));
         fs::remove_dir_all(root).unwrap();
     }
 

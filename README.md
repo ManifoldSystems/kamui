@@ -820,6 +820,10 @@ Mutating tool calls are also journaled in SQLite before execution. On a restart,
 are marked interrupted and shown when their session is resumed. Kamui never retries them
 automatically because the command or file write may already have taken effect.
 
+Choosing `always` at an approval is scoped to the exact normalized command or canonical file path
+for the active session. It does not grant every future `run_command` or `patch_file` call; different
+flags and different files still require approval, and `/new` clears all session grants.
+
 In the fullscreen UI, prompts submitted while the agent is busy are persisted before Kamui labels
 them queued. Their FIFO IDs follow them into steering or the next turn and are removed atomically
 with the completed turn. Restarting and resuming restores both queued and previously claimed input,
