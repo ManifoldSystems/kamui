@@ -16,6 +16,15 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
 const MAX_ERROR_BODY: usize = 2048;
+const MAX_REQUEST_ATTEMPTS: u32 = 3;
+
+fn retryable_status(status: StatusCode) -> bool {
+    matches!(status.as_u16(), 408 | 429 | 502 | 503 | 504)
+}
+
+fn retry_delay(attempt: u32, retry_after: Option<Duration>) -> Duration {
+    retry_after.unwrap_or(Duration::from_millis(250 * u64::from(attempt)))
+}
 
 #[derive(Debug)]
 pub struct ProviderHttpError {
@@ -640,19 +649,35 @@ impl Provider for OpenAIProvider {
             session_id,
             prompt_cache_key: cache_key.as_deref(),
         };
-        let response = self
-            .add_coding_headers(self.client.post(self.chat_url()).bearer_auth(&self.api_key))
-            .json(&body)
-            .send();
-        let response = timeout(RESPONSE_TIMEOUT, response)
-            .await
-            .context("provider request timed out")?
-            .context("failed to call provider")?;
-
-        let status = response.status();
-        if !status.is_success() {
-            return Err(http_error(response).await.into());
-        }
+        let mut attempts = 0;
+        let response = loop {
+            attempts += 1;
+            let sent = self
+                .add_coding_headers(self.client.post(self.chat_url()).bearer_auth(&self.api_key))
+                .json(&body)
+                .send();
+            match timeout(RESPONSE_TIMEOUT, sent).await {
+                Ok(Ok(response)) if response.status().is_success() => break response,
+                Ok(Ok(response)) => {
+                    let error = http_error(response).await;
+                    if attempts >= MAX_REQUEST_ATTEMPTS || !retryable_status(error.status) {
+                        return Err(error.into());
+                    }
+                    tokio::time::sleep(retry_delay(attempts, error.retry_after)).await;
+                }
+                Ok(Err(error))
+                    if attempts < MAX_REQUEST_ATTEMPTS
+                        && (error.is_connect() || error.is_timeout()) =>
+                {
+                    tokio::time::sleep(retry_delay(attempts, None)).await;
+                }
+                Ok(Err(error)) => return Err(error).context("failed to call provider"),
+                Err(_) if attempts < MAX_REQUEST_ATTEMPTS => {
+                    tokio::time::sleep(retry_delay(attempts, None)).await
+                }
+                Err(_) => bail!("provider request timed out"),
+            }
+        };
 
         let response: OpenAIResponse = response
             .json()
@@ -692,23 +717,20 @@ impl Provider for OpenAIProvider {
                 Ok(Ok(response)) if response.status().is_success() => break response,
                 Ok(Ok(response)) => {
                     let error = http_error(response).await;
-                    let retryable = matches!(error.status.as_u16(), 408 | 429 | 502 | 503 | 504);
-                    if attempts >= 3 || !retryable {
+                    if attempts >= MAX_REQUEST_ATTEMPTS || !retryable_status(error.status) {
                         return Err(error.into());
                     }
-                    tokio::time::sleep(
-                        error
-                            .retry_after
-                            .unwrap_or(Duration::from_millis(250 * attempts)),
-                    )
-                    .await;
+                    tokio::time::sleep(retry_delay(attempts, error.retry_after)).await;
                 }
-                Ok(Err(error)) if attempts < 3 && (error.is_connect() || error.is_timeout()) => {
-                    tokio::time::sleep(Duration::from_millis(250 * attempts)).await;
+                Ok(Err(error))
+                    if attempts < MAX_REQUEST_ATTEMPTS
+                        && (error.is_connect() || error.is_timeout()) =>
+                {
+                    tokio::time::sleep(retry_delay(attempts, None)).await;
                 }
                 Ok(Err(error)) => return Err(error).context("failed to call provider"),
-                Err(_) if attempts < 3 => {
-                    tokio::time::sleep(Duration::from_millis(250 * attempts)).await
+                Err(_) if attempts < MAX_REQUEST_ATTEMPTS => {
+                    tokio::time::sleep(retry_delay(attempts, None)).await
                 }
                 Err(_) => bail!("provider request timed out"),
             }
@@ -1203,6 +1225,19 @@ mod tests {
         assert_eq!(
             parse_retry_after(Some(&HeaderValue::from_static("120"))),
             Some(Duration::from_secs(30))
+        );
+    }
+
+    #[test]
+    fn retry_policy_is_shared_and_bounded() {
+        assert!(retryable_status(StatusCode::REQUEST_TIMEOUT));
+        assert!(retryable_status(StatusCode::TOO_MANY_REQUESTS));
+        assert!(retryable_status(StatusCode::BAD_GATEWAY));
+        assert!(!retryable_status(StatusCode::BAD_REQUEST));
+        assert_eq!(retry_delay(2, None), Duration::from_millis(500));
+        assert_eq!(
+            retry_delay(2, Some(Duration::from_secs(3))),
+            Duration::from_secs(3)
         );
     }
 

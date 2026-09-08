@@ -75,6 +75,9 @@ temporary server errors are rendered as bounded, actionable messages. Requests h
 first-response deadlines; streams have an idle deadline. Before any output is visible, transient
 transport errors and HTTP 408/429/502/503/504 are retried up to three attempts using the same body
 and session id, respecting a capped `Retry-After`. A stream is never retried after output starts.
+The same pre-output retry policy covers non-streaming title, compaction, and sub-agent calls. If a
+model asks for an identical batch of tools three rounds in a row, Kamui stops before executing the
+third batch rather than spending the rest of the round limit repeating the same side effect.
 
 ### OpenAI-compatible providers
 

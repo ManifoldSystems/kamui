@@ -252,6 +252,8 @@ median, the share of turns at or above 90%/95%, and how many turns were warm-ups
 and compaction use derived sticky ids (`{session}:title` / `{session}:compact`) so side requests
 cannot evict the conversation's warm prefix. The fullscreen Context rail and token badge surface
 per-turn cache (including warm-up zeros on pinned profiles) plus the session median when measured.
+Streaming and non-streaming calls share the same bounded pre-output retry policy, and an identical
+tool batch requested for three consecutive rounds is stopped before its third execution.
 
 ## Phase 6: Terminal Experience
 
@@ -617,5 +619,4 @@ Kamui should feel intentional and polished rather than like a chat log wrapped i
 - [ ] Add snapshot/golden tests for important screens, dialogs, wrapping, and theme variants
 - [ ] Run usability tests for first-time approval, batch review, context inspection, and recovery from errors
 - [ ] Establish measurable UX budgets for keypresses, modal depth, visual jitter, and time-to-understand
-
 

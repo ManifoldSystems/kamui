@@ -35,6 +35,28 @@ const RESUME_REPLAY_MESSAGES: usize = 10;
 /// Upper bound on model/tool round-trips within a single user turn, to stop runaway tool loops.
 /// Generous enough for multi-file edits while still bounding a stuck loop.
 const MAX_TOOL_ROUNDS: usize = 25;
+const REPEATED_TOOL_BATCH_LIMIT: usize = 3;
+
+fn tool_batch_signature(calls: &[ToolCall]) -> Vec<(String, String)> {
+    calls
+        .iter()
+        .map(|call| {
+            let arguments = serde_json::from_str::<serde_json::Value>(&call.arguments)
+                .and_then(|value| serde_json::to_string(&value))
+                .unwrap_or_else(|_| call.arguments.trim().to_owned());
+            (call.name.clone(), arguments)
+        })
+        .collect()
+}
+
+fn repeated_tool_batch(recent: &mut Vec<Vec<(String, String)>>, calls: &[ToolCall]) -> bool {
+    let signature = tool_batch_signature(calls);
+    recent.push(signature);
+    if recent.len() > REPEATED_TOOL_BATCH_LIMIT {
+        recent.remove(0);
+    }
+    recent.len() == REPEATED_TOOL_BATCH_LIMIT && recent.windows(2).all(|pair| pair[0] == pair[1])
+}
 const MAX_CONCURRENT_SUB_AGENTS: usize = 4;
 const EMBEDDING_BATCH_SIZE: usize = 64;
 /// Settings key for the persisted active provider profile.
@@ -1344,6 +1366,7 @@ where
         let mut final_finish = String::new();
         let mut last_content = String::new();
         let mut tool_trail: Vec<Message> = Vec::new();
+        let mut recent_tool_batches = Vec::new();
         // Pre-edit snapshot of every file an approved patch_file call touches this turn, so an
         // interrupted multi-file edit can be reverted instead of left half-applied (see
         // `snapshot_patch_target`/`revert_on_cancel`).
@@ -1664,6 +1687,17 @@ where
 
             if tool_calls.is_empty() {
                 break 'agent Message::assistant(content);
+            }
+
+            if repeated_tool_batch(&mut recent_tool_batches, &tool_calls) {
+                chat_ui.notice(
+                    "Stopped before repeating the same tool batch a third time. Review the tool error or change the approach.",
+                )?;
+                break 'agent Message::assistant(if content.is_empty() {
+                    "(stopped: repeated the same tool calls three times)".to_string()
+                } else {
+                    content
+                });
             }
 
             // The model requested tools. Record the request, run each tool, feed the results back.
@@ -2218,6 +2252,7 @@ where
 
     let user_message = Message::user(prompt);
     let mut tool_trail: Vec<Message> = Vec::new();
+    let mut recent_tool_batches = Vec::new();
     // Files `patch_file` targeted this turn, so the code index can be refreshed once at the end.
     // Interactive chat reads the same set out of its revert snapshot, which `-p` has no use for.
     let mut edited: Vec<PathBuf> = Vec::new();
@@ -2243,6 +2278,18 @@ where
                 Message::assistant(response.content),
                 response.usage,
                 response.finish_reason,
+            );
+        }
+
+        if repeated_tool_batch(&mut recent_tool_batches, &response.tool_calls) {
+            break (
+                Message::assistant(if response.content.is_empty() {
+                    "(stopped: repeated the same tool calls three times)".to_string()
+                } else {
+                    response.content
+                }),
+                response.usage,
+                "repeated_tool_calls".to_string(),
             );
         }
 
@@ -5086,6 +5133,47 @@ fn git_status(root: &Path) -> Option<GitStatus> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repeated_tool_batches_ignore_ids_and_normalize_json() {
+        let batch = |id: &str, arguments: &str| {
+            vec![ToolCall {
+                id: id.to_string(),
+                name: "read_file".to_string(),
+                arguments: arguments.to_string(),
+            }]
+        };
+        let mut recent = Vec::new();
+        assert!(!repeated_tool_batch(
+            &mut recent,
+            &batch("one", r#"{"path":"src/main.rs"}"#)
+        ));
+        assert!(!repeated_tool_batch(
+            &mut recent,
+            &batch("two", r#"{ "path": "src/main.rs" }"#)
+        ));
+        assert!(repeated_tool_batch(
+            &mut recent,
+            &batch("three", r#"{"path":"src/main.rs"}"#)
+        ));
+    }
+
+    #[test]
+    fn changing_a_tool_batch_resets_the_repeat_guard() {
+        let call = |path: &str| {
+            vec![ToolCall {
+                id: path.to_string(),
+                name: "read_file".to_string(),
+                arguments: format!(r#"{{"path":"{path}"}}"#),
+            }]
+        };
+        let mut recent = Vec::new();
+        assert!(!repeated_tool_batch(&mut recent, &call("a")));
+        assert!(!repeated_tool_batch(&mut recent, &call("a")));
+        assert!(!repeated_tool_batch(&mut recent, &call("b")));
+        assert!(!repeated_tool_batch(&mut recent, &call("b")));
+        assert!(repeated_tool_batch(&mut recent, &call("b")));
+    }
     use crate::pricing::ModelPrice;
     use std::fs;
     use uuid::Uuid;
