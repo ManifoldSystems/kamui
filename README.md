@@ -429,6 +429,7 @@ Create a JSON suite and run it repeatedly against the default or a named profile
     {
       "name": "rust-basics",
       "prompt": "Name Rust's ownership rules in one paragraph.",
+      "follow_up_prompt": "Repeat the answer in one sentence.",
       "expect_contains": ["ownership", "borrow"]
     }
   ]
@@ -444,7 +445,9 @@ missing, making the same suite usable locally and in CI. Expectations are option
 case-insensitively. On an Orvix Coding profile, repeated runs of each case form one append-only
 session with a stable session ID. The result also reports median and aggregate cache hit rates,
 shares at or above 90% and 95%, measured turns, and warm-ups; the first run of each case is excluded
-from the steady-state ratios.
+from the steady-state ratios. Optional `follow_up_prompt` replaces `prompt` after the first run,
+which lets a long initial context measure steady-state prefix caching with short incremental turns.
+When omitted, the initial prompt repeats on every run for compatibility with existing suites.
 
 ### Scheduled jobs
 

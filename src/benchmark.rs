@@ -19,7 +19,19 @@ struct Case {
     name: String,
     prompt: String,
     #[serde(default)]
+    follow_up_prompt: Option<String>,
+    #[serde(default)]
     expect_contains: Vec<String>,
+}
+
+impl Case {
+    fn prompt_for_run(&self, run: usize) -> &str {
+        if run > 1 {
+            self.follow_up_prompt.as_deref().unwrap_or(&self.prompt)
+        } else {
+            &self.prompt
+        }
+    }
 }
 
 #[derive(Default)]
@@ -67,7 +79,7 @@ where
         let session_id = profile.send_session_id.then(|| Uuid::new_v4().to_string());
         let mut messages = Vec::new();
         for run in 1..=runs {
-            messages.push(Message::user(&case.prompt));
+            messages.push(Message::user(case.prompt_for_run(run)));
             let started = Instant::now();
             let response = provider
                 .chat(ChatRequest {
@@ -192,6 +204,16 @@ fn validate_suite(suite: &Suite) -> Result<()> {
             anyhow::bail!("benchmark case '{}' has an empty prompt", case.name);
         }
         if case
+            .follow_up_prompt
+            .as_deref()
+            .is_some_and(|prompt| prompt.trim().is_empty())
+        {
+            anyhow::bail!(
+                "benchmark case '{}' has an empty follow_up_prompt",
+                case.name
+            );
+        }
+        if case
             .expect_contains
             .iter()
             .any(|expected| expected.trim().is_empty())
@@ -238,10 +260,31 @@ mod tests {
                 cases: vec![Case {
                     name: "empty".to_string(),
                     prompt: "  ".to_string(),
+                    follow_up_prompt: None,
                     expect_contains: Vec::new(),
                 }],
             })
             .is_err()
         );
+    }
+
+    #[test]
+    fn follow_up_prompt_is_used_after_the_first_run() {
+        let case = Case {
+            name: "cache".into(),
+            prompt: "long initial context".into(),
+            follow_up_prompt: Some("short follow-up".into()),
+            expect_contains: Vec::new(),
+        };
+        assert_eq!(case.prompt_for_run(1), "long initial context");
+        assert_eq!(case.prompt_for_run(2), "short follow-up");
+        assert_eq!(case.prompt_for_run(9), "short follow-up");
+    }
+
+    #[test]
+    fn legacy_cases_repeat_the_initial_prompt() {
+        let suite: Suite =
+            serde_json::from_str(r#"{"cases":[{"name":"legacy","prompt":"repeat me"}]}"#).unwrap();
+        assert_eq!(suite.cases[0].prompt_for_run(2), "repeat me");
     }
 }
