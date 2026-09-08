@@ -344,6 +344,28 @@ impl Database {
                  PRAGMA user_version = 13;",
             )?;
         }
+        if version < 14 {
+            connection.execute_batch(
+                "CREATE TABLE tool_executions (
+                     id TEXT PRIMARY KEY,
+                     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                     tool_call_id TEXT NOT NULL,
+                     tool_name TEXT NOT NULL,
+                     arguments TEXT NOT NULL,
+                     status TEXT NOT NULL CHECK (status IN ('running', 'completed', 'error', 'interrupted')),
+                     output TEXT,
+                     started_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                     finished_at INTEGER
+                 );
+                 CREATE INDEX tool_executions_session_id ON tool_executions(session_id, started_at);
+                 PRAGMA user_version = 14;",
+            )?;
+        }
+        connection.execute(
+            "UPDATE tool_executions SET status = 'interrupted', finished_at = unixepoch()
+             WHERE status = 'running'",
+            [],
+        )?;
         Ok(Self { connection, path })
     }
 
@@ -801,6 +823,49 @@ impl Database {
             [session_id],
         )?;
         Ok(())
+    }
+
+    pub fn start_tool_execution(
+        &self,
+        session_id: &str,
+        tool_call_id: &str,
+        tool_name: &str,
+        arguments: &str,
+    ) -> Result<String> {
+        let id = Uuid::new_v4().to_string();
+        self.connection.execute(
+            "INSERT INTO tool_executions
+                 (id, session_id, tool_call_id, tool_name, arguments, status)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'running')",
+            params![id, session_id, tool_call_id, tool_name, arguments],
+        )?;
+        Ok(id)
+    }
+
+    pub fn finish_tool_execution(&self, id: &str, output: &str) -> Result<()> {
+        let status = if output.starts_with("Error: ") {
+            "error"
+        } else {
+            "completed"
+        };
+        self.connection.execute(
+            "UPDATE tool_executions
+             SET status = ?2, output = ?3, finished_at = unixepoch()
+             WHERE id = ?1 AND status = 'running'",
+            params![id, status, output],
+        )?;
+        Ok(())
+    }
+
+    pub fn interrupted_tool_executions(&self, session_id: &str) -> Result<Vec<String>> {
+        let mut statement = self.connection.prepare(
+            "SELECT tool_name FROM tool_executions
+             WHERE session_id = ?1 AND status = 'interrupted'
+             ORDER BY started_at, rowid",
+        )?;
+        let rows = statement.query_map([session_id], |row| row.get(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
     }
 
     pub fn save_generated_title(
@@ -1672,7 +1737,7 @@ mod tests {
         let resumed = database.find_session(&session.id).unwrap().unwrap();
         assert_eq!(resumed.compaction_summary.as_deref(), Some("earlier work"));
         assert_eq!(resumed.summarized_upto, 7);
-        assert_eq!(database.schema_version().unwrap(), 13);
+        assert_eq!(database.schema_version().unwrap(), 14);
     }
 
     #[test]
@@ -1704,6 +1769,47 @@ mod tests {
                 .undo_snapshot
                 .is_none()
         );
+    }
+
+    #[test]
+    fn tool_execution_journal_records_outcomes_and_recovers_running_rows() {
+        let database = database();
+        let session = database.create_session("test", "model").unwrap();
+        let completed = database
+            .start_tool_execution(&session.id, "call-1", "patch_file", "{}")
+            .unwrap();
+        database
+            .finish_tool_execution(&completed, "patched file")
+            .unwrap();
+        let running = database
+            .start_tool_execution(&session.id, "call-2", "run_command", "{}")
+            .unwrap();
+        assert_eq!(
+            database
+                .connection
+                .query_row(
+                    "SELECT status FROM tool_executions WHERE id = ?1",
+                    [&completed],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "completed"
+        );
+
+        let Database { connection, path } = database;
+        let database = Database::initialize(connection, path).unwrap();
+        assert_eq!(
+            database
+                .connection
+                .query_row(
+                    "SELECT status FROM tool_executions WHERE id = ?1",
+                    [&running],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "interrupted"
+        );
+        assert_eq!(database.schema_version().unwrap(), 14);
     }
 
     #[test]

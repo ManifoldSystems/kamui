@@ -160,6 +160,10 @@ effort or operational risk is disproportionate to their immediate value.
   with no trace in session history. `/undo` performs the same revert for the most recently
   *completed* turn — one level, persisted atomically with the turn in SQLite, restored on resume,
   and cleared after successful use or when a later turn replaces it.
+- Mutating tool calls are written to the SQLite execution journal before dispatch. Completed and
+  failed outcomes close the row; any row still running when the database reopens becomes
+  `interrupted`, is reported on resume, and is never retried automatically because its side effects
+  are unknown.
 - Session IDs may be resolved from an unambiguous prefix. The UI normally displays the first eight
   characters.
 - Resume displays the six most recent messages and reports how many earlier messages were omitted.
@@ -446,6 +450,8 @@ after title generation while later turns are fine.
 - `user_version = 10` adds `indexed_files.embedding_model`, `code_chunks.lsh_bucket`, and the FTS5
   mirror. `replace_file_index` swaps a fully prepared file index transactionally. Search uses full
   cosine scoring below 2,000 chunks and bounded FTS/LSH candidate scoring above it.
+- `user_version = 14` adds `tool_executions`. Running mutating calls are recovered as interrupted,
+  not retried; this table is durable audit data and cascades with its session.
 
 ## Configuration
 

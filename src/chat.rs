@@ -206,6 +206,7 @@ where
                 session.title,
                 short_id(&session.id)
             ))?;
+            report_interrupted_tools(&mut chat_ui, database, &session.id)?;
             if use_tui {
                 replay_tui_history(&mut chat_ui, &messages)?;
             } else {
@@ -1991,7 +1992,9 @@ where
                             );
                         }
                         tokio::select! {
-                            output = tools.dispatch(call) => output,
+                            output = dispatch_with_journal(
+                                &tools, call, database, &mut session, provider.name(), &active.model,
+                            ) => output?,
                             signal = tokio::signal::ctrl_c() => {
                                 signal.context("failed to listen for Ctrl+C")?;
                                 revert_on_cancel(&mut chat_ui, &turn_snapshot);
@@ -2012,7 +2015,9 @@ where
                         snapshot_patch_target(project.root(), &call.arguments, &mut turn_snapshot);
                     }
                     tokio::select! {
-                        output = tools.dispatch(call) => output,
+                        output = dispatch_with_journal(
+                            &tools, call, database, &mut session, provider.name(), &active.model,
+                        ) => output?,
                         signal = tokio::signal::ctrl_c() => {
                             signal.context("failed to listen for Ctrl+C")?;
                             revert_on_cancel(&mut chat_ui, &turn_snapshot);
@@ -2680,6 +2685,14 @@ fn handle_command(
             *messages = database.load_messages(&resumed.id)?;
             *last_turn_snapshot = decode_undo_snapshot(resumed.undo_snapshot.as_deref())?;
             out!("Resumed: {} ({})\n", resumed.title, short_id(&resumed.id));
+            let interrupted = database.interrupted_tool_executions(&resumed.id)?;
+            if !interrupted.is_empty() {
+                out!(
+                    "Warning: {} tool execution(s) were interrupted: {}. Their side effects are unknown; Kamui will not retry them automatically.\n",
+                    interrupted.len(),
+                    interrupted.join(", ")
+                );
+            }
             // Note: Plan Mode restore is handled by the main loop's plan_mode state;
             // /resume via handle_command is not the startup resume path, so we don't
             // rehydrate here — the caller would need &mut plan_mode.
@@ -3286,6 +3299,47 @@ fn snapshot_patch_target(
     } else {
         snapshot.insert(target, None);
     }
+}
+
+fn report_interrupted_tools(
+    chat_ui: &mut ChatUi,
+    database: &Database,
+    session_id: &str,
+) -> Result<()> {
+    let interrupted = database.interrupted_tool_executions(session_id)?;
+    if !interrupted.is_empty() {
+        chat_ui.warning(&format!(
+            "{} tool execution(s) were interrupted: {}. Their side effects are unknown; Kamui will not retry them automatically.",
+            interrupted.len(),
+            interrupted.join(", ")
+        ))?;
+    }
+    Ok(())
+}
+
+async fn dispatch_with_journal(
+    tools: &ToolRegistry,
+    call: &crate::provider::ToolCall,
+    database: &Database,
+    session: &mut Option<Session>,
+    provider: &str,
+    model: &str,
+) -> Result<String> {
+    let journal = call.name == "run_command"
+        || call.name == tools::PATCH_FILE_TOOL
+        || tools.requires_confirmation_for(&call.name, &call.arguments);
+    if !journal {
+        return Ok(tools.dispatch(call).await);
+    }
+    let active = match session.as_ref() {
+        Some(active) => active,
+        None => session.insert(database.create_session(provider, model)?),
+    };
+    let execution =
+        database.start_tool_execution(&active.id, &call.id, &call.name, &call.arguments)?;
+    let output = tools.dispatch(call).await;
+    database.finish_tool_execution(&execution, &output)?;
+    Ok(output)
 }
 
 fn encode_undo_snapshot(

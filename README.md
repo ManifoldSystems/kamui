@@ -815,6 +815,10 @@ reverts the same way for a turn that *did* complete — one level, most recent t
 is stored with the session, so it remains available after restarting and resuming; a second `/undo`
 has nothing left to do.
 
+Mutating tool calls are also journaled in SQLite before execution. On a restart, calls left running
+are marked interrupted and shown when their session is resumed. Kamui never retries them
+automatically because the command or file write may already have taken effect.
+
 If the [RTK](https://github.com/rtk-ai/rtk) binary is installed, simple approved commands are
 automatically prefixed with `rtk` so their output is compressed before it reaches the model. RTK is
 optional: commands with shell operators, commands whose first word the shell runs itself (`cd`,
