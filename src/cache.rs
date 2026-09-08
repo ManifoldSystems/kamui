@@ -132,7 +132,7 @@ pub fn side_session_id(conversation_id: Option<&str>, kind: SideRequest) -> Opti
     conversation_id
         .map(str::trim)
         .filter(|id| !id.is_empty())
-        .map(|id| format!("{id}{}", kind.suffix()))
+        .map(|id| bounded_routing_id(id, kind.suffix()))
 }
 
 /// Sticky id for one `spawn_agent` tool call. Every round of that sub-agent reuses this id, while
@@ -141,7 +141,16 @@ pub fn sub_agent_session_id(conversation_id: Option<&str>, tool_call_id: &str) -
     conversation_id
         .map(str::trim)
         .filter(|id| !id.is_empty())
-        .map(|id| format!("{id}:agent:{tool_call_id}"))
+        .map(|id| bounded_routing_id(id, &format!(":agent:{tool_call_id}")))
+}
+
+/// Provider routing fields share one conservative 64-character bound.
+pub fn bounded_routing_id(id: &str, suffix: &str) -> String {
+    let suffix: String = suffix.chars().take(63).collect();
+    let room = 64usize.saturating_sub(suffix.chars().count());
+    let mut value: String = id.trim().chars().take(room).collect();
+    value.push_str(&suffix);
+    value
 }
 
 /// Watches the prefix of a cache-pinned session for drift.
@@ -251,9 +260,50 @@ pub fn report(samples: &[(i64, i64)]) -> Option<CacheReport> {
     })
 }
 
+/// Splits cache samples into observed prefix epochs. After a cached turn, the next zero-cache
+/// turn marks a new prefix and therefore a new warm-up epoch.
+pub fn epochs(samples: &[(i64, i64)]) -> Vec<&[(i64, i64)]> {
+    if samples.is_empty() {
+        return Vec::new();
+    }
+    let mut starts = vec![0];
+    let mut warmed = false;
+    for (index, (prompt, cached)) in samples.iter().enumerate().skip(1) {
+        if *prompt <= 0 {
+            continue;
+        }
+        if warmed && *cached == 0 {
+            starts.push(index);
+            warmed = false;
+        } else if *cached > 0 {
+            warmed = true;
+        }
+    }
+    starts
+        .iter()
+        .enumerate()
+        .map(|(index, start)| {
+            let end = starts.get(index + 1).copied().unwrap_or(samples.len());
+            &samples[*start..end]
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn epochs_split_on_a_cold_turn_after_the_cache_warmed() {
+        let samples = [(100, 0), (200, 150), (300, 0), (400, 350)];
+        assert_eq!(epochs(&samples), vec![&samples[..2], &samples[2..]]);
+    }
+
+    #[test]
+    fn consecutive_cold_turns_stay_together_until_the_cache_warms() {
+        let samples = [(100, 0), (200, 0), (300, 250), (400, 0)];
+        assert_eq!(epochs(&samples), vec![&samples[..3], &samples[3..]]);
+    }
     use serde_json::json;
 
     fn tool(name: &str) -> ToolDefinition {
@@ -483,5 +533,17 @@ mod tests {
             sub_agent_session_id(Some("abc-123"), "call-1"),
             side_session_id(Some("abc-123"), SideRequest::Title)
         );
+    }
+
+    #[test]
+    fn every_derived_routing_id_is_bounded() {
+        let id = "x".repeat(100);
+        for derived in [
+            bounded_routing_id(&id, ""),
+            side_session_id(Some(&id), SideRequest::Title).unwrap(),
+            sub_agent_session_id(Some(&id), "call-1").unwrap(),
+        ] {
+            assert!(derived.chars().count() <= 64, "{derived}");
+        }
     }
 }

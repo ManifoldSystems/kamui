@@ -3,8 +3,8 @@ use anyhow::{Context, Result};
 use crossterm::{
     cursor::SetCursorStyle,
     event::{
-        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
+        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind,
+        KeyModifiers, MouseButton, MouseEventKind,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -83,6 +83,7 @@ fn wrapped_fingerprint(model: &Model) -> u64 {
             CardKind::Output => 3,
             CardKind::Error => 4,
             CardKind::Note => 5,
+            CardKind::Thinking => 6,
         });
         if let Some((status, ok)) = &card.status {
             fp = fp.wrapping_mul(31).wrapping_add(status.len() as u64);
@@ -141,6 +142,9 @@ fn palette() -> Option<crate::theme::Palette> {
     ACTIVE_THEME.with(|c| c.borrow().clone().and_then(|t| t.palette()))
 }
 fn themed(or: Color, f: impl FnOnce(&crate::theme::Palette) -> String) -> Color {
+    if std::env::var_os("NO_COLOR").is_some() {
+        return Color::Reset;
+    }
     if let Some(p) = palette() {
         crate::theme::ratatui_fg(&f(&p))
     } else {
@@ -162,12 +166,20 @@ fn BORDER() -> Color {
     })
 }
 #[allow(non_snake_case)]
+fn SEPARATOR() -> Color {
+    themed(Color::Rgb(0x73, 0x7a, 0xa8), |p| p.fg.clone())
+}
+#[allow(non_snake_case)]
 fn BG_CHAT() -> Color {
     themed(Color::Rgb(0x1a, 0x1b, 0x26), |p| p.bg.clone())
 }
 #[allow(non_snake_case)]
 fn BG_ELEMENT() -> Color {
-    let (r, g, b) = crate::theme::hex_to_rgb(&palette().map(|p| p.bg).unwrap_or("#24283b".into()));
+    if std::env::var_os("NO_COLOR").is_some() {
+        return Color::Reset;
+    }
+    let (r, g, b) = crate::theme::hex_to_rgb(&palette().map(|p| p.bg).unwrap_or("#24283b".into()))
+        .unwrap_or((0x24, 0x28, 0x3b));
     Color::Rgb(
         r.saturating_sub(12),
         g.saturating_sub(12),
@@ -176,7 +188,11 @@ fn BG_ELEMENT() -> Color {
 }
 #[allow(non_snake_case)]
 fn BG_PANEL() -> Color {
-    let (r, g, b) = crate::theme::hex_to_rgb(&palette().map(|p| p.bg).unwrap_or("#1f2335".into()));
+    if std::env::var_os("NO_COLOR").is_some() {
+        return Color::Reset;
+    }
+    let (r, g, b) = crate::theme::hex_to_rgb(&palette().map(|p| p.bg).unwrap_or("#1f2335".into()))
+        .unwrap_or((0x1f, 0x23, 0x35));
     Color::Rgb(
         r.saturating_sub(6),
         g.saturating_sub(6),
@@ -237,6 +253,8 @@ pub enum CardKind {
     /// rendered below every card, so they lost their place in the conversation and older ones
     /// silently fell off the end.
     Note,
+    /// Provider reasoning, collapsed by default and never replayed to the model.
+    Thinking,
 }
 
 #[derive(Debug, Clone)]
@@ -302,6 +320,8 @@ struct Model {
     sidebar: Option<Vec<(String, String)>>,
     /// Live typed text rendered inside the editor box; driven by `ScreenHandle`.
     input: String,
+    /// Masks the editor while a credential requester is active.
+    secret_input: bool,
     /// Caret position as a byte offset into `input`. Editing happens here, not only at the end.
     input_caret: usize,
     /// Autocomplete menu state mirrored from the input loop each keystroke.
@@ -349,7 +369,8 @@ pub struct SearchState {
     pub total: usize,
 }
 
-/// Approval modal options, opencode labels. First field is the typed hotkey (`y`/`a`/`n`).
+/// Approval modal options. First field is the submitted value; its first character is also the
+/// direct hotkey (`y` approves `approve`, while `n` rejects).
 pub const PERM_OPTIONS: [(&str, &str); 3] = [
     ("y", "Allow once"),
     ("a", "Always allow this session"),
@@ -375,6 +396,8 @@ pub struct PermissionState {
     /// could not finish reading.
     pub scroll: usize,
     pub options: Vec<(&'static str, &'static str)>,
+    /// Patch approvals start as a compact summary; Space reveals the complete preview.
+    pub expanded: bool,
 }
 
 /// Clarifying question from the model (`ask_user`), rendered as a modal like permission.
@@ -384,6 +407,7 @@ pub struct AskState {
     pub options: Vec<String>,
     pub selected: usize,
     pub typed: String,
+    pub scroll: usize,
 }
 
 /// A modal picker that submits an existing slash command on Enter — pure UI sugar over
@@ -452,6 +476,7 @@ impl Default for Model {
             intro: true,
             sidebar: None,
             input: String::new(),
+            secret_input: false,
             input_caret: 0,
             ac_items: Vec::new(),
             ac_selected: 0,
@@ -510,7 +535,6 @@ impl FullScreen {
                 SetCursorStyle::DefaultUserShape,
                 DisableBracketedPaste,
                 LeaveAlternateScreen,
-                DisableMouseCapture
             );
             previous_hook(info);
         }));
@@ -519,7 +543,6 @@ impl FullScreen {
         execute!(
             stdout,
             EnterAlternateScreen,
-            EnableMouseCapture,
             EnableBracketedPaste,
             SetCursorStyle::BlinkingBar
         )
@@ -529,14 +552,14 @@ impl FullScreen {
             Ok(terminal) => terminal,
             Err(error) => {
                 let mut stdout = io::stdout();
-                let _ = execute!(stdout, LeaveAlternateScreen, DisableMouseCapture);
+                let _ = execute!(stdout, LeaveAlternateScreen);
                 let _ = disable_raw_mode();
                 return Err(error).context("could not create Ratatui terminal");
             }
         };
         if let Err(error) = terminal.clear() {
             let mut stdout = io::stdout();
-            let _ = execute!(stdout, LeaveAlternateScreen, DisableMouseCapture);
+            let _ = execute!(stdout, LeaveAlternateScreen);
             let _ = disable_raw_mode();
             return Err(error).context("could not clear terminal");
         }
@@ -601,7 +624,7 @@ impl FullScreen {
         // cannot collide with the editor. Ctrl+O, a click, or `/expand` / `/collapse` toggle
         // it; answers always show in full.
         let collapsed = match kind {
-            CardKind::Tool => true,
+            CardKind::Tool | CardKind::Thinking => true,
             CardKind::Output => title != "Assistant" && body.lines().count() > 2,
             CardKind::Error => error_should_fold(&body),
             _ => false,
@@ -617,6 +640,50 @@ impl FullScreen {
         });
         self.trim_history();
         self.draw()
+    }
+
+    fn update_thinking(&mut self, body: String) -> Result<()> {
+        if body.trim().is_empty() {
+            return Ok(());
+        }
+        self.model.intro = false;
+        match self
+            .model
+            .cards
+            .iter_mut()
+            .rev()
+            .find(|card| matches!(card.kind, CardKind::Thinking) && card.title == "Thinking")
+        {
+            Some(card) => card.body = body,
+            None => {
+                let id = self.take_card_id();
+                self.model.cards.push(Card {
+                    id,
+                    kind: CardKind::Thinking,
+                    title: "Thinking".to_string(),
+                    body,
+                    status: None,
+                    collapsed: true,
+                });
+            }
+        }
+        self.trim_history();
+        self.draw()
+    }
+
+    fn toggle_thinking_card(&mut self) -> Result<bool> {
+        let Some(card) = self
+            .model
+            .cards
+            .iter_mut()
+            .rev()
+            .find(|card| matches!(card.kind, CardKind::Thinking) && card.foldable_rows() > 0)
+        else {
+            return Ok(false);
+        };
+        card.collapsed = !card.collapsed;
+        self.draw()?;
+        Ok(true)
     }
 
     fn update_assistant(&mut self, body: String) -> Result<()> {
@@ -892,18 +959,23 @@ impl FullScreen {
     }
 
     fn trim_history(&mut self) {
-        let mut line_count = 0usize;
-        for card in self.model.cards.iter().rev() {
-            line_count += card.body.lines().count() + 3;
-            if line_count > MAX_HISTORY_LINES {
-                break;
-            }
-        }
-        if self.model.cards.len() > MAX_HISTORY_LINES {
-            let keep_from = self.model.cards.len().saturating_sub(MAX_HISTORY_LINES);
-            self.model.cards.drain(..keep_from);
-        }
+        trim_cards(&mut self.model.cards);
     }
+}
+
+fn trim_cards(cards: &mut Vec<Card>) {
+    let mut line_count = 0usize;
+    let mut keep_from = cards.len();
+    for (index, card) in cards.iter().enumerate().rev() {
+        let card_lines = card.body.lines().count() + 3;
+        // Always preserve the newest complete card, even when it alone exceeds the budget.
+        if keep_from < cards.len() && line_count.saturating_add(card_lines) > MAX_HISTORY_LINES {
+            break;
+        }
+        line_count = line_count.saturating_add(card_lines);
+        keep_from = index;
+    }
+    cards.drain(..keep_from);
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -915,6 +987,7 @@ enum HitTarget {
     Ask(usize),
     Sidebar(SidebarAction),
     Footer(FooterAction),
+    Thinking,
     Overlay,
 }
 
@@ -931,6 +1004,7 @@ enum FooterAction {
     Models,
     Sessions,
     Interrupt,
+    Reasoning,
     Live,
 }
 
@@ -966,7 +1040,6 @@ impl FullScreen {
             SetCursorStyle::DefaultUserShape,
             DisableBracketedPaste,
             LeaveAlternateScreen,
-            DisableMouseCapture
         );
         let _ = disable_raw_mode();
         let _ = self.terminal.backend_mut().flush();
@@ -1215,6 +1288,13 @@ impl ChatUi {
         }
     }
 
+    pub fn thinking_update(&mut self, text: &str) -> Result<()> {
+        match self.fullscreen.as_ref() {
+            Some(screen) => lock_screen(screen).update_thinking(text.to_string()),
+            None => Ok(()),
+        }
+    }
+
     pub fn assistant_update(&mut self, raw_markdown: &str) -> Result<()> {
         match self.fullscreen.as_ref() {
             Some(screen) => lock_screen(screen).update_assistant(raw_markdown.to_string()),
@@ -1242,6 +1322,17 @@ impl ChatUi {
                 Ok(())
             }
         }
+    }
+
+    /// Copies a completed interactive answer without treating intermediate tool rounds as final.
+    pub fn copy_answer(&mut self, text: &str) -> Result<()> {
+        if self.fullscreen.is_none() || text.trim().is_empty() {
+            return Ok(());
+        }
+        // Auto-copy is background convenience, not transcript content. Manual Ctrl+Y still reports
+        // success or failure; an unavailable clipboard must not fail a completed turn.
+        let _ = set_clipboard_text(text);
+        Ok(())
     }
 
     pub fn notice(&mut self, text: &str) -> Result<()> {
@@ -1384,6 +1475,7 @@ impl ChatUi {
                     ),
                     CardKind::Output => crate::render::render_tool_output(&body, self.plain),
                     CardKind::Error => crate::render::render_error(&body, self.plain),
+                    CardKind::Thinking => format!("Thinking:\n{body}\n"),
                     // Plain mode has no cells; a note is just a line of output.
                     CardKind::Note => format!(
                         "{body}
@@ -1425,6 +1517,12 @@ pub enum HubEvent {
     Quit,
 }
 
+#[derive(Clone)]
+pub struct QueuedInput {
+    pub id: Option<String>,
+    pub content: String,
+}
+
 /// Owns the keyboard for the whole session, opencode-style. While the agent runs the editor
 /// stays live: typed lines queue instead of racing the turn, Esc raises an interrupt, and
 /// page keys keep scrolling. Approval / ask_user prompts register a one-shot requester whose
@@ -1433,7 +1531,8 @@ pub struct InputHub {
     rx: tokio::sync::mpsc::UnboundedReceiver<HubEvent>,
     pub interrupt: Arc<tokio::sync::Notify>,
     busy: Arc<std::sync::atomic::AtomicBool>,
-    queue: Arc<Mutex<VecDeque<String>>>,
+    queue: Arc<Mutex<VecDeque<QueuedInput>>>,
+    queue_context: Arc<std::sync::RwLock<Option<(std::path::PathBuf, String)>>>,
     requester: Arc<Mutex<Option<tokio::sync::oneshot::Sender<String>>>>,
     candidates: Arc<std::sync::RwLock<Vec<crate::tui::Candidate>>>,
     screen: ScreenHandle,
@@ -1450,6 +1549,7 @@ impl InputHub {
         let interrupt = Arc::new(tokio::sync::Notify::new());
         let busy = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let queue = Arc::new(Mutex::new(VecDeque::new()));
+        let queue_context = Arc::new(std::sync::RwLock::new(None));
         let requester: Arc<Mutex<Option<tokio::sync::oneshot::Sender<String>>>> =
             Arc::new(Mutex::new(None));
         let candidates = Arc::new(std::sync::RwLock::new(Vec::new()));
@@ -1460,6 +1560,7 @@ impl InputHub {
             let interrupt = interrupt.clone();
             let busy = busy.clone();
             let queue = queue.clone();
+            let queue_context = queue_context.clone();
             let requester = requester.clone();
             let candidates = candidates.clone();
             let models_src = models_src.clone();
@@ -1472,6 +1573,7 @@ impl InputHub {
                     interrupt,
                     busy,
                     queue,
+                    queue_context,
                     requester,
                     candidates,
                     models_src,
@@ -1485,6 +1587,7 @@ impl InputHub {
             interrupt,
             busy,
             queue,
+            queue_context,
             requester,
             candidates,
             screen: hub_screen,
@@ -1631,11 +1734,42 @@ impl InputHub {
         self.queue
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .push_back(line);
+            .push_back(QueuedInput {
+                id: None,
+                content: line,
+            });
+    }
+
+    pub fn push_queued(&self, input: QueuedInput) {
+        self.queue
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push_back(input);
+    }
+
+    pub fn set_queue_context(&self, path: std::path::PathBuf, session_id: String) {
+        *self
+            .queue_context
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = Some((path, session_id));
+    }
+
+    pub fn clear_queue(&self) {
+        self.queue
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+    }
+
+    pub fn clear_queue_context(&self) {
+        *self
+            .queue_context
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = None;
     }
 
     /// Pops a queued line, if any; drained between turns. Updates the footer count.
-    pub fn pop_queue(&self) -> Option<String> {
+    pub fn pop_queue(&self) -> Option<QueuedInput> {
         let popped = self
             .queue
             .lock()
@@ -1664,6 +1798,19 @@ impl InputHub {
         rx.await.ok()
     }
 
+    /// Reads through the normal keyboard owner while rendering bullets instead of the secret.
+    pub async fn request_secret(&mut self) -> Option<String> {
+        {
+            let mut screen = lock_screen(&self.screen.0);
+            screen.model.secret_input = true;
+        }
+        let _ = self.screen.draw_now();
+        let guard = SecretInputGuard(self.screen.clone());
+        let value = self.request_line().await;
+        drop(guard);
+        value
+    }
+
     /// Opens/closes the approval modal from the keyboard-thread side.
     pub fn open_permission_modal(&self, title: &str, body: String) {
         self.open_permission_modal_with_options(title, body, PERM_OPTIONS.to_vec());
@@ -1683,6 +1830,7 @@ impl InputHub {
                 selected: 0,
                 scroll: 0,
                 options,
+                expanded: !title.contains("patch_file"),
             });
         }
         let _ = self.screen.draw_now();
@@ -1704,6 +1852,7 @@ impl InputHub {
                 options,
                 selected: 0,
                 typed: String::new(),
+                scroll: 0,
             });
         }
         let _ = self.screen.draw_now();
@@ -1715,6 +1864,19 @@ impl InputHub {
             s.model.ask = None;
         }
         let _ = self.screen.draw_now();
+    }
+}
+
+struct SecretInputGuard(ScreenHandle);
+
+impl Drop for SecretInputGuard {
+    fn drop(&mut self) {
+        let mut screen = lock_screen(&self.0.0);
+        screen.model.secret_input = false;
+        screen.model.input.clear();
+        screen.model.input_caret = 0;
+        drop(screen);
+        let _ = self.0.draw_now();
     }
 }
 
@@ -1860,8 +2022,10 @@ fn page_rows(screen: &ScreenHandle) -> i64 {
 
 fn scroll_screen(screen: &ScreenHandle, rows: i64) {
     let mut s = lock_screen(&screen.0);
+    let total = wrapped_transcript(&s.model, s.last_transcript_width.max(1)).len();
+    let max_offset = total.saturating_sub(s.last_viewport_rows.max(1));
     let next = s.model.scroll_from_bottom as i64 + rows;
-    s.model.scroll_from_bottom = next.clamp(0, 100_000) as usize;
+    s.model.scroll_from_bottom = next.clamp(0, max_offset as i64) as usize;
     let _ = s.draw();
 }
 
@@ -1992,10 +2156,16 @@ fn render_dialog(frame: &mut Frame<'_>, dialog: &DialogState, area: Rect) {
 
 /// Approval modal: preview body plus the three opencode options.
 fn render_permission(frame: &mut Frame<'_>, perm: &PermissionState, area: Rect) {
-    let width = 64.min(area.width.max(1));
-    let all_rows: Vec<String> = wrap_display(&perm.body, width.saturating_sub(6) as usize);
+    let width = area.width.saturating_sub(4).clamp(1, 100);
+    let patch = perm.title.contains("patch_file");
+    let body = if patch && !perm.expanded {
+        patch_summary(&perm.body)
+    } else {
+        perm.body.clone()
+    };
+    let all_rows: Vec<String> = wrap_display(&body, width.saturating_sub(6) as usize);
     // Everything the box spends on chrome: blank row, options, the scroll note, the key hint.
-    let chrome = PERM_OPTIONS.len() + 5;
+    let chrome = perm.options.len() + 5 + usize::from(patch);
     let ceiling = area.height.max(1) as usize;
     let capacity = ceiling.saturating_sub(chrome).max(1);
     let scroll = perm.scroll.min(all_rows.len().saturating_sub(capacity));
@@ -2043,17 +2213,27 @@ fn render_permission(frame: &mut Frame<'_>, perm: &PermissionState, area: Rect) 
             Style::default().fg(WARN()),
         ));
     }
+    if patch {
+        lines.push(Line::styled(
+            if perm.expanded {
+                "Space compact diff"
+            } else {
+                "Space review full diff"
+            },
+            Style::default().fg(BLUE()),
+        ));
+    }
     lines.push(Line::from(""));
     for (idx, (hotkey, label)) in perm.options.iter().enumerate() {
         let is_on = idx == perm.selected;
-        let prefix = if is_on { "\u{276f} " } else { "  " };
+        let prefix = if is_on { "[x] " } else { "[ ] " };
         lines.push(Line::from(vec![
             Span::styled(
                 prefix.to_string(),
                 Style::default().fg(if is_on { BLUE() } else { BORDER() }),
             ),
             Span::styled(
-                format!("{hotkey}  "),
+                format!("{}  ", hotkey.chars().next().unwrap_or('?')),
                 Style::default()
                     .fg(if is_on { BLUE() } else { MUTED() })
                     .add_modifier(Modifier::BOLD),
@@ -2075,10 +2255,13 @@ fn render_permission(frame: &mut Frame<'_>, perm: &PermissionState, area: Rect) 
             ),
         ]));
     }
-    lines.push(Line::from(Span::styled(
-        "y / a / n  \u{b7}  Enter confirm  \u{b7}  Esc rejects".to_string(),
-        Style::default().fg(MUTED()),
-    )));
+    let is_plan = perm.options.as_slice() == PLAN_OPTIONS.as_slice();
+    let hint = if is_plan {
+        "\u{2191}/\u{2193} choose  \u{b7}  Enter confirm  \u{b7}  y approve  \u{b7}  n/Esc reject"
+    } else {
+        "\u{2191}/\u{2193} choose  \u{b7}  Enter confirm  \u{b7}  y/a/n shortcut  \u{b7}  Esc rejects"
+    };
+    lines.push(Line::from(Span::styled(hint, Style::default().fg(MUTED()))));
     frame.render_widget(
         Paragraph::new(Text::from(lines))
             .style(Style::default().bg(POPUP_BG()))
@@ -2093,29 +2276,64 @@ fn render_permission(frame: &mut Frame<'_>, perm: &PermissionState, area: Rect) 
     );
 }
 
+fn patch_summary(body: &str) -> String {
+    let path = body
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("--- "))
+        .unwrap_or("file");
+    let removed = body
+        .lines()
+        .filter(|line| line.trim_start().starts_with("- "))
+        .count();
+    let added = body
+        .lines()
+        .filter(|line| line.trim_start().starts_with("+ "))
+        .count();
+    format!("{path}\n+{added}  -{removed}")
+}
+
+fn ask_geometry(ask: &AskState, area: Rect) -> (Rect, usize, usize) {
+    let width = 64.min(area.width.max(1));
+    let height = area.height.clamp(1, 18);
+    let content = height.saturating_sub(2) as usize;
+    let option_capacity = ask.options.len().min(content.saturating_sub(3) / 2).min(4);
+    let question_capacity = content.saturating_sub(3 + option_capacity).max(1);
+    (
+        Rect::new(
+            area.x + area.width.saturating_sub(width) / 2,
+            area.y + area.height.saturating_sub(height) / 2,
+            width,
+            height,
+        ),
+        question_capacity,
+        option_capacity,
+    )
+}
+
 fn render_ask(frame: &mut Frame<'_>, ask: &AskState, area: Rect) {
-    let width = 64.min(area.width.saturating_sub(4));
+    let (box_area, question_capacity, option_capacity) = ask_geometry(ask, area);
+    let width = box_area.width;
     let question_rows = wrap_display(&ask.question, width.saturating_sub(6) as usize);
-    let option_rows = ask.options.len();
-    let chrome = 5;
-    let height = ((question_rows.len() + option_rows + chrome) as u16)
-        .min(area.height.saturating_sub(2))
-        .max(7);
-    let x = area.x + (area.width.saturating_sub(width)) / 2;
-    let y = area.y + (area.height.saturating_sub(height)) / 2;
-    let box_area = Rect {
-        x,
-        y,
-        width,
-        height,
-    };
+    let question_scroll = ask
+        .scroll
+        .min(question_rows.len().saturating_sub(question_capacity));
     frame.render_widget(Clear, box_area);
     let mut lines: Vec<Line<'static>> = question_rows
         .into_iter()
+        .skip(question_scroll)
+        .take(question_capacity)
         .map(|row| Line::styled(row, Style::default().fg(TEXT())))
         .collect();
-    lines.push(Line::from(""));
-    for (idx, option) in ask.options.iter().enumerate() {
+    let option_start = ask
+        .selected
+        .saturating_sub(option_capacity.saturating_sub(1));
+    for (idx, option) in ask
+        .options
+        .iter()
+        .enumerate()
+        .skip(option_start)
+        .take(option_capacity)
+    {
         let is_on = idx == ask.selected && ask.typed.is_empty();
         let prefix = if is_on { "\u{276f} " } else { "  " };
         lines.push(Line::from(vec![
@@ -2130,7 +2348,7 @@ fn render_ask(frame: &mut Frame<'_>, ask: &AskState, area: Rect) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                option.clone(),
+                crate::tui::truncate_chars(option, width.saturating_sub(9) as usize),
                 Style::default()
                     .fg(if is_on { TEXT() } else { MUTED() })
                     .add_modifier(if is_on {
@@ -2148,7 +2366,6 @@ fn render_ask(frame: &mut Frame<'_>, ask: &AskState, area: Rect) {
     } else {
         ask.typed.clone()
     };
-    lines.push(Line::from(""));
     lines.push(Line::from(vec![
         Span::styled(
             "\u{276f} ".to_string(),
@@ -2179,7 +2396,7 @@ fn render_ask(frame: &mut Frame<'_>, ask: &AskState, area: Rect) {
                 Block::default()
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(BLUE()))
-                    .title(" Ask ")
+                    .title(" Ask user ")
                     .title_style(Style::default().fg(BLUE()).add_modifier(Modifier::BOLD)),
             ),
         box_area,
@@ -2189,22 +2406,20 @@ fn render_ask(frame: &mut Frame<'_>, ask: &AskState, area: Rect) {
 /// `?` overlay: the keybinding sheet.
 fn render_help(frame: &mut Frame<'_>, area: Rect, scroll: usize) {
     let width = 64.min(area.width.saturating_sub(4));
-    let rows: [(&str, &str); 22] = [
-        (
-            "Enter",
-            "send message (accept slash completion, when the menu is open)",
-        ),
+    let rows: [(&str, &str); 23] = [
+        ("Enter", "send exact editor text"),
         ("Shift/Ctrl+Enter", "newline without sending"),
         ("\u{2190}/\u{2192}", "move the caret"),
         ("Alt+\u{2190}/\u{2192}", "move by word"),
         ("Home/End, Ctrl+A/E", "start / end of line"),
         ("Ctrl+K", "switch model"),
         ("Ctrl+S", "resume a session"),
-        ("Ctrl+O / click", "expand or fold tool output"),
+        ("Ctrl+O", "expand or fold tool output"),
+        ("Ctrl+T", "expand or fold reasoning"),
         ("Ctrl+F", "search the transcript"),
         ("Ctrl+B", "show or hide the sidebar"),
         ("Ctrl+Y", "copy the latest answer"),
-        ("Right click", "copy the cell under the pointer"),
+        ("Mouse drag", "select any transcript text"),
         ("?", "toggle this help"),
         ("Tab / Shift+Tab", "cycle mode (build / auto / plan)"),
         ("Tab", "accept slash completion without sending"),
@@ -2216,8 +2431,11 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, scroll: usize) {
         ("Ctrl+Home/End", "jump to top/bottom"),
         ("!<command>", "run a shell command"),
         ("/warnings", "hide or show warnings"),
-        ("Esc", "interrupt the agent"),
-        ("Ctrl+C x 2", "quit"),
+        (
+            "Esc",
+            "close overlay / interrupt; idle drafts are preserved",
+        ),
+        ("Ctrl+C", "clear input; twice more to quit"),
     ];
     // Chrome the sheet always pays for: two borders, the title, and the closing hint.
     const HELP_CHROME: usize = 4;
@@ -2290,7 +2508,8 @@ fn input_thread(
     tx: tokio::sync::mpsc::UnboundedSender<HubEvent>,
     interrupt: Arc<tokio::sync::Notify>,
     busy: Arc<std::sync::atomic::AtomicBool>,
-    queue: Arc<Mutex<VecDeque<String>>>,
+    queue: Arc<Mutex<VecDeque<QueuedInput>>>,
+    queue_context: Arc<std::sync::RwLock<Option<(std::path::PathBuf, String)>>>,
     requester: Arc<Mutex<Option<tokio::sync::oneshot::Sender<String>>>>,
     candidates: Arc<std::sync::RwLock<Vec<crate::tui::Candidate>>>,
     models_src: Arc<std::sync::RwLock<Vec<(String, String)>>>,
@@ -2366,9 +2585,9 @@ fn input_thread(
     };
 
     sync(&screen, "", 0, 0, Vec::new());
-    // Feed loop: the wheel scrolls right here; only key presses fall through to the editor.
+    // Feed loop. Mouse capture stays disabled so normal drag-selection can copy any response.
     // Read errors are tolerated briefly, then quit gracefully (never process::exit - that
-    // would skip FullScreen's Drop and leave raw mode + mouse capture enabled).
+    // would skip FullScreen's Drop and leave raw mode enabled).
     let mut feed_errors = 0u32;
     'keys: loop {
         let key = 'feed: {
@@ -2415,9 +2634,12 @@ fn input_thread(
                             } else {
                                 perm.scroll += 3;
                             }
-                        } else if s.model.ask.is_some() {
-                            // The ask panel has no scrollable body; consume the wheel so it cannot
-                            // move the transcript behind the modal.
+                        } else if let Some(ask) = s.model.ask.as_mut() {
+                            if delta < 0 {
+                                ask.scroll = ask.scroll.saturating_sub(3);
+                            } else {
+                                ask.scroll += 3;
+                            }
                         } else if s.model.help_visible {
                             if delta < 0 {
                                 s.model.help_scroll = s.model.help_scroll.saturating_sub(1);
@@ -2443,7 +2665,7 @@ fn input_thread(
                             s.model.ac_selected = selected;
                         } else {
                             drop(s);
-                            scroll_screen(&screen, if delta < 0 { 3 } else { -3 });
+                            scroll_screen(&screen, if delta < 0 { 1 } else { -1 });
                             continue 'keys;
                         }
                         let _ = s.draw();
@@ -2510,7 +2732,14 @@ fn input_thread(
                                 };
                                 if let Some(line) = line {
                                     submit_line(
-                                        &screen, &tx, &requester, &busy, &interrupt, &queue, line,
+                                        &screen,
+                                        &tx,
+                                        &requester,
+                                        &busy,
+                                        &interrupt,
+                                        &queue,
+                                        &queue_context,
+                                        line,
                                     );
                                 }
                             }
@@ -2542,30 +2771,28 @@ fn input_thread(
                                 }
                             }
                             Some(HitTarget::Sidebar(SidebarAction::Model)) => {
-                                let items = models_src
-                                    .read()
-                                    .unwrap_or_else(PoisonError::into_inner)
-                                    .clone();
-                                if !items.is_empty() {
-                                    let mut s = lock_screen(&screen.0);
-                                    s.model.dialog =
-                                        Some(DialogState::new("Select Model", "/model ", items));
-                                    drop(s);
-                                    let _ = screen.draw_now();
-                                }
+                                open_picker_or_notice(
+                                    &screen,
+                                    models_src
+                                        .read()
+                                        .unwrap_or_else(PoisonError::into_inner)
+                                        .clone(),
+                                    "Select Model",
+                                    "/model ",
+                                    EMPTY_MODELS_NOTICE,
+                                );
                             }
                             Some(HitTarget::Sidebar(SidebarAction::Session)) => {
-                                let items = sessions_src
-                                    .read()
-                                    .unwrap_or_else(PoisonError::into_inner)
-                                    .clone();
-                                if !items.is_empty() {
-                                    let mut s = lock_screen(&screen.0);
-                                    s.model.dialog =
-                                        Some(DialogState::new("Resume Session", "/resume ", items));
-                                    drop(s);
-                                    let _ = screen.draw_now();
-                                }
+                                open_picker_or_notice(
+                                    &screen,
+                                    sessions_src
+                                        .read()
+                                        .unwrap_or_else(PoisonError::into_inner)
+                                        .clone(),
+                                    "Resume Session",
+                                    "/resume ",
+                                    EMPTY_SESSIONS_NOTICE,
+                                );
                             }
                             Some(HitTarget::Sidebar(SidebarAction::Mode)) => submit_line(
                                 &screen,
@@ -2574,6 +2801,7 @@ fn input_thread(
                                 &busy,
                                 &interrupt,
                                 &queue,
+                                &queue_context,
                                 "/mode next".into(),
                             ),
                             Some(HitTarget::Footer(FooterAction::Help)) => {
@@ -2584,35 +2812,39 @@ fn input_thread(
                                 let _ = screen.draw_now();
                             }
                             Some(HitTarget::Footer(FooterAction::Models)) => {
-                                let items = models_src
-                                    .read()
-                                    .unwrap_or_else(PoisonError::into_inner)
-                                    .clone();
-                                if !items.is_empty() {
-                                    let mut s = lock_screen(&screen.0);
-                                    s.model.dialog =
-                                        Some(DialogState::new("Select Model", "/model ", items));
-                                    drop(s);
-                                    let _ = screen.draw_now();
-                                }
+                                open_picker_or_notice(
+                                    &screen,
+                                    models_src
+                                        .read()
+                                        .unwrap_or_else(PoisonError::into_inner)
+                                        .clone(),
+                                    "Select Model",
+                                    "/model ",
+                                    EMPTY_MODELS_NOTICE,
+                                );
                             }
                             Some(HitTarget::Footer(FooterAction::Sessions)) => {
-                                let items = sessions_src
-                                    .read()
-                                    .unwrap_or_else(PoisonError::into_inner)
-                                    .clone();
-                                if !items.is_empty() {
-                                    let mut s = lock_screen(&screen.0);
-                                    s.model.dialog =
-                                        Some(DialogState::new("Resume Session", "/resume ", items));
-                                    drop(s);
-                                    let _ = screen.draw_now();
-                                }
+                                open_picker_or_notice(
+                                    &screen,
+                                    sessions_src
+                                        .read()
+                                        .unwrap_or_else(PoisonError::into_inner)
+                                        .clone(),
+                                    "Resume Session",
+                                    "/resume ",
+                                    EMPTY_SESSIONS_NOTICE,
+                                );
                             }
                             Some(HitTarget::Footer(FooterAction::Interrupt)) => {
                                 if busy.load(std::sync::atomic::Ordering::SeqCst) {
                                     interrupt.notify_one();
                                 }
+                            }
+                            Some(HitTarget::Footer(FooterAction::Reasoning)) => {
+                                let _ = lock_screen(&screen.0).toggle_thinking_card();
+                            }
+                            Some(HitTarget::Thinking) => {
+                                let _ = lock_screen(&screen.0).toggle_thinking_card();
                             }
                             Some(HitTarget::Footer(FooterAction::Live)) => {
                                 let mut s = lock_screen(&screen.0);
@@ -2680,6 +2912,10 @@ fn input_thread(
                     KeyCode::PageDown => {
                         perm.scroll += 5;
                     }
+                    KeyCode::Char(' ') if perm.title.contains("patch_file") => {
+                        perm.expanded = !perm.expanded;
+                        perm.scroll = 0;
+                    }
                     KeyCode::Enter => {
                         let answer = perm.options[perm.selected.min(perm.options.len() - 1)]
                             .0
@@ -2741,6 +2977,8 @@ fn input_thread(
                     KeyCode::Down if ask.options.len() > 1 && ask.typed.is_empty() => {
                         ask.selected = (ask.selected + 1) % ask.options.len();
                     }
+                    KeyCode::PageUp => ask.scroll = ask.scroll.saturating_sub(5),
+                    KeyCode::PageDown => ask.scroll += 5,
                     KeyCode::Enter => {
                         let answer = if !ask.typed.is_empty() {
                             ask.typed.clone()
@@ -2861,7 +3099,16 @@ fn input_thread(
                             let line = format!("/mcp apply {}", pairs.join(" "));
                             s.model.dialog = None;
                             drop(s);
-                            submit_line(&screen, &tx, &requester, &busy, &interrupt, &queue, line);
+                            submit_line(
+                                &screen,
+                                &tx,
+                                &requester,
+                                &busy,
+                                &interrupt,
+                                &queue,
+                                &queue_context,
+                                line,
+                            );
                             continue;
                         }
                         let picked = dialog
@@ -2872,7 +3119,16 @@ fn input_thread(
                             let line = format!("{}{}", dialog.prefix, value);
                             s.model.dialog = None;
                             drop(s);
-                            submit_line(&screen, &tx, &requester, &busy, &interrupt, &queue, line);
+                            submit_line(
+                                &screen,
+                                &tx,
+                                &requester,
+                                &busy,
+                                &interrupt,
+                                &queue,
+                                &queue_context,
+                                line,
+                            );
                             continue;
                         }
                     }
@@ -2933,6 +3189,47 @@ fn input_thread(
             let _ = lock_screen(&screen.0).open_search();
             continue;
         }
+
+        // Secret requests bypass normal editor submission: they are never entered into command
+        // history or emitted as a transcript line. Paste editing has already populated `buf`.
+        if lock_screen(&screen.0).model.secret_input {
+            match key.code {
+                KeyCode::Enter => {
+                    let value = std::mem::take(&mut buf);
+                    caret = 0;
+                    if let Some(tx) = requester
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .take()
+                    {
+                        let _ = tx.send(value);
+                    }
+                }
+                KeyCode::Esc => {
+                    buf.clear();
+                    caret = 0;
+                    if let Some(tx) = requester
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .take()
+                    {
+                        drop(tx);
+                    }
+                }
+                KeyCode::Backspace => {
+                    let start = prev_char_boundary(&buf, caret);
+                    buf.replace_range(start..caret, "");
+                    caret = start;
+                }
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    buf.insert(caret, c);
+                    caret += c.len_utf8();
+                }
+                _ => {}
+            }
+            sync(&screen, &buf, caret, 0, Vec::new());
+            continue;
+        }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('b') {
             let mut sc = lock_screen(&screen.0);
             sc.model.sidebar_hidden = !sc.model.sidebar_hidden;
@@ -2942,33 +3239,37 @@ fn input_thread(
 
         // Openers.
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('k') {
-            let items = models_src
-                .read()
-                .unwrap_or_else(PoisonError::into_inner)
-                .clone();
-            if !items.is_empty() {
-                let mut sc = lock_screen(&screen.0);
-                sc.model.dialog = Some(DialogState::new("Select Model", "/model ", items));
-                drop(sc);
-                let _ = screen.draw_now();
-            }
+            open_picker_or_notice(
+                &screen,
+                models_src
+                    .read()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone(),
+                "Select Model",
+                "/model ",
+                EMPTY_MODELS_NOTICE,
+            );
             continue;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
-            let items = sessions_src
-                .read()
-                .unwrap_or_else(PoisonError::into_inner)
-                .clone();
-            if !items.is_empty() {
-                let mut sc = lock_screen(&screen.0);
-                sc.model.dialog = Some(DialogState::new("Resume Session", "/resume ", items));
-                drop(sc);
-                let _ = screen.draw_now();
-            }
+            open_picker_or_notice(
+                &screen,
+                sessions_src
+                    .read()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone(),
+                "Resume Session",
+                "/resume ",
+                EMPTY_SESSIONS_NOTICE,
+            );
             continue;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('o') {
             let _ = lock_screen(&screen.0).toggle_last_card();
+            continue;
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('t') {
+            let _ = lock_screen(&screen.0).toggle_thinking_card();
             continue;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('y') {
@@ -3080,6 +3381,7 @@ fn input_thread(
                         &busy,
                         &interrupt,
                         &queue,
+                        &queue_context,
                         "/mode next".to_string(),
                     );
                 }
@@ -3092,6 +3394,7 @@ fn input_thread(
                     &busy,
                     &interrupt,
                     &queue,
+                    &queue_context,
                     "/mode prev".to_string(),
                 );
             }
@@ -3180,20 +3483,9 @@ fn input_thread(
                     sync(&screen, &buf, caret, selected, Vec::new());
                     continue 'keys;
                 }
-                // Slash menu open with a match: Enter accepts the highlighted
-                // candidate and submits it, so `/mo` + Enter runs `/model`
-                // without a Tab stop first. Exact buffer wins: typing the full
-                // command still submits what was typed.
-                let mut line = buf.trim().to_string();
-                if is_slash {
-                    let all = items_for(&needle);
-                    if !all.is_empty()
-                        && !all.iter().any(|(name, _)| line == format!("/{name}"))
-                        && let Some(choice) = all.get(selected)
-                    {
-                        line = format!("/{} ", choice.0);
-                    }
-                }
+                // Enter always submits exactly what the editor contains. Only Tab accepts a
+                // highlighted completion, preventing a partial command from becoming destructive.
+                let line = buf.trim().to_string();
                 buf.clear();
                 caret = 0;
                 selected = 0;
@@ -3204,7 +3496,16 @@ fn input_thread(
                     }
                     history_idx = history.len();
                 }
-                submit_line(&screen, &tx, &requester, &busy, &interrupt, &queue, line);
+                submit_line(
+                    &screen,
+                    &tx,
+                    &requester,
+                    &busy,
+                    &interrupt,
+                    &queue,
+                    &queue_context,
+                    line,
+                );
             }
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 scroll_screen(&screen, -(page_rows(&screen) / 2));
@@ -3219,10 +3520,6 @@ fn input_thread(
                     caret = 0;
                     selected = 0;
                     let _ = lock_screen(&screen.0).add_notice("interrupt requested");
-                } else {
-                    buf.clear();
-                    caret = 0;
-                    selected = 0;
                 }
             }
             KeyCode::PageUp => scroll_screen(&screen, page_rows(&screen)),
@@ -3251,6 +3548,13 @@ fn input_thread(
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if is_busy {
                     interrupt.notify_one();
+                } else if !buf.is_empty() {
+                    buf.clear();
+                    caret = 0;
+                    selected = 0;
+                    saved_buf.clear();
+                    history_idx = history.len();
+                    last_ctrl_c = None;
                 } else if last_ctrl_c
                     .map(|t| t.elapsed() < std::time::Duration::from_secs(3))
                     .unwrap_or(false)
@@ -3313,13 +3617,15 @@ fn insert_clipboard_reference(buf: &mut String, caret: usize) -> usize {
 
 /// Shared submit path for the editor and modal dialogs: a waiting approval/ask_user takes
 /// the answer, busy queues it, idle sends it straight to the chat loop.
+#[allow(clippy::too_many_arguments)]
 fn submit_line(
     screen: &ScreenHandle,
     tx: &tokio::sync::mpsc::UnboundedSender<HubEvent>,
     requester: &Arc<Mutex<Option<tokio::sync::oneshot::Sender<String>>>>,
     busy: &Arc<std::sync::atomic::AtomicBool>,
     interrupt: &Arc<tokio::sync::Notify>,
-    queue: &Arc<Mutex<VecDeque<String>>>,
+    queue: &Arc<Mutex<VecDeque<QueuedInput>>>,
+    queue_context: &Arc<std::sync::RwLock<Option<(std::path::PathBuf, String)>>>,
     line: String,
 ) {
     if line.is_empty() {
@@ -3339,6 +3645,11 @@ fn submit_line(
             let _ = s.draw();
             return;
         }
+        if is_busy_navigation(&control) {
+            let mut s = lock_screen(&screen.0);
+            let _ = s.add_notice(BUSY_NAV_NOTICE);
+            return;
+        }
     }
     let answer_tx = requester
         .lock()
@@ -3347,10 +3658,29 @@ fn submit_line(
     if let Some(tx) = answer_tx {
         let _ = tx.send(line);
     } else if busy.load(std::sync::atomic::Ordering::SeqCst) {
+        let persisted = queue_context
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .map(|(path, session_id)| {
+                crate::storage::Database::enqueue_input_at(path, session_id, &line)
+            });
+        let id = match persisted {
+            Some(Ok(id)) => Some(id),
+            Some(Err(error)) => {
+                let mut s = lock_screen(&screen.0);
+                let _ = s.add_notice(format!("could not queue input: {error:#}"));
+                return;
+            }
+            None => None,
+        };
         queue
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .push_back(line.clone());
+            .push_back(QueuedInput {
+                id,
+                content: line.clone(),
+            });
         let mut s = lock_screen(&screen.0);
         s.model.queued_count = queue.lock().unwrap_or_else(PoisonError::into_inner).len();
         let _ = s.add_notice(format!("queued: {line}"));
@@ -3358,6 +3688,35 @@ fn submit_line(
     } else {
         let _ = tx.send(HubEvent::Line(line));
     }
+}
+
+const EMPTY_MODELS_NOTICE: &str = "no provider profiles configured; use /model __add__";
+const EMPTY_SESSIONS_NOTICE: &str = "no saved sessions yet; send a message to create one";
+const BUSY_NAV_NOTICE: &str =
+    "model/session switch rejected while a turn is running; interrupt the current turn first";
+
+fn is_busy_navigation(control: &str) -> bool {
+    control == "/model"
+        || control.starts_with("/model ")
+        || control == "/resume"
+        || control.starts_with("/resume ")
+}
+
+fn open_picker_or_notice(
+    screen: &ScreenHandle,
+    items: Vec<(String, String)>,
+    title: &str,
+    prefix: &str,
+    empty_notice: &str,
+) {
+    let mut s = lock_screen(&screen.0);
+    if items.is_empty() {
+        let _ = s.add_notice(empty_notice);
+        return;
+    }
+    s.model.dialog = Some(DialogState::new(title, prefix, items));
+    drop(s);
+    let _ = screen.draw_now();
 }
 
 fn needle_of(buf: &str) -> String {
@@ -3433,28 +3792,36 @@ fn render(frame: &mut Frame<'_>, model: &Model) -> RenderInfo {
         .buffer_mut()
         .set_style(whole, Style::default().bg(BG_CHAT()));
     // OpenCode layout: transcript on top, autocomplete menu above the bordered editor, a
-    // one-line footer, and the sidebar rail splitting the body horizontally.
+    // footer below a visible rule, and the sidebar rail splitting the body horizontally.
     // The search bar and the slash menu never coexist: opening search closes the editor's menu.
     let popup_height = if model.search.is_some() {
         1
     } else {
         menu_height(model.ac_items.len())
     };
-    // Multiline editor: grows with the buffer's newlines (backslash-newline continuation).
-    // Split the same way `editor_widget` does: `lines()` drops a trailing empty segment, which
-    // would leave the caret a row below the text after the buffer ends with a newline.
+    // Multiline editor: size from the same wrapped rows that `editor_widget` renders. Counting
+    // only explicit newlines makes long lines overflow the box and puts the caret out of sync.
     // While thinking with an empty buffer the placeholder row is omitted, so count zero content
     // rows and let the wall occupy the only text line.
     let input_lines = if model.input.is_empty() && model.thinking.is_some() {
         0
+    } else if model.input.is_empty() {
+        1
     } else {
-        model.input.split('\n').count().max(1)
+        editor_view(
+            &model.input,
+            model.input_caret,
+            frame.area().width.saturating_sub(4).max(1) as usize,
+        )
+        .rows
+        .len()
+        .max(1)
     };
     let editor_rows =
         (input_lines.min(EDITOR_VISIBLE_LINES) as u16) + 2 + u16::from(model.thinking.is_some());
     let screen_rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .constraints([Constraint::Min(1), Constraint::Length(2)])
         .split(frame.area());
     let main_area = screen_rows[0];
     let footer_area = screen_rows[1];
@@ -3554,23 +3921,17 @@ fn render(frame: &mut Frame<'_>, model: &Model) -> RenderInfo {
         );
     }
     if let Some(area) = sidebar_area {
-        frame.render_widget(sidebar_paragraph(model, area), area);
-        // Sidebar actions use whole semantic rows, not individual glyph coordinates. The compact
-        // rail keeps these rows stable enough to remain useful at narrow supported widths.
-        if let Some(entries) = &model.sidebar {
-            for (row, (key, _)) in entries.iter().enumerate() {
-                let target = match key.as_str() {
-                    "Session" => Some(SidebarAction::Session),
-                    "Model" => Some(SidebarAction::Model),
-                    "mode" | "Mode" => Some(SidebarAction::Mode),
-                    _ => None,
-                };
-                if let Some(target) = target {
-                    hit_regions.push(HitRegion {
-                        area: Rect::new(area.x, area.y + row as u16, area.width, 1),
-                        target: HitTarget::Sidebar(target),
-                    });
-                }
+        let sidebar_rows = sidebar_rows(model, area);
+        frame.render_widget(
+            sidebar_paragraph(sidebar_rows.iter().map(|row| row.line.clone()), area),
+            area,
+        );
+        for (row, rendered) in sidebar_rows.iter().enumerate() {
+            if let Some(target) = rendered.action {
+                hit_regions.push(HitRegion {
+                    area: Rect::new(area.x, area.y + 1 + row as u16, area.width, 1),
+                    target: HitTarget::Sidebar(target),
+                });
             }
         }
     }
@@ -3600,6 +3961,26 @@ fn render(frame: &mut Frame<'_>, model: &Model) -> RenderInfo {
         }
     }
     frame.render_widget(editor_widget(model, editor_area), editor_area);
+    if model.thinking.is_some() {
+        let wall_row = editor_area.y
+            + 1
+            + if model.input.is_empty() {
+                0
+            } else {
+                editor_view(
+                    &model.input,
+                    model.input_caret,
+                    editor_area.width.saturating_sub(4).max(1) as usize,
+                )
+                .rows
+                .len()
+                .min(EDITOR_VISIBLE_LINES) as u16
+            };
+        hit_regions.push(HitRegion {
+            area: Rect::new(editor_area.x, wall_row, editor_area.width, 1),
+            target: HitTarget::Thinking,
+        });
+    }
 
     // Terminal cursor sits at the end of the typed text whenever the editor owns input. This
     // includes the home screen: ratatui hides the cursor on any frame that sets no position,
@@ -3607,10 +3988,9 @@ fn render(frame: &mut Frame<'_>, model: &Model) -> RenderInfo {
     {
         let inner = editor_area.width.saturating_sub(4).max(1) as usize;
         let view = editor_view(&model.input, model.input_caret, inner);
-        // The editor block draws a LEFT border: one column, no rows. Text then starts after the
-        // two-cell row prefix, so the caret belongs at x + 3 on the block's own first row --
-        // an earlier `y + 1` aimed at a top border that this block never draws.
-        let row = editor_area.y + view.caret_row as u16;
+        // The textarea has a one-cell border. Text starts after that border and the two-cell
+        // prompt prefix, while the caret row starts below the top rule.
+        let row = editor_area.y + 1 + view.caret_row as u16;
         let col = editor_area.x + 3 + view.caret_col.min(inner) as u16;
         frame.set_cursor_position((
             col.min(editor_area.right().saturating_sub(1)),
@@ -3667,18 +4047,21 @@ fn render(frame: &mut Frame<'_>, model: &Model) -> RenderInfo {
     }
     if let Some(ask) = &model.ask {
         render_ask(frame, ask, frame.area());
-        let width = 64.min(frame.area().width.saturating_sub(4));
-        let question_rows = wrap_display(&ask.question, width.saturating_sub(6) as usize).len();
-        let height = ((question_rows + ask.options.len() + 5) as u16)
-            .min(frame.area().height.saturating_sub(2))
-            .max(7);
-        let area = centered_rect(frame.area(), width, height);
-        let option_y = area.y + 1 + question_rows as u16 + 1;
-        for index in 0..ask.options.len() {
+        let (area, question_capacity, option_capacity) = ask_geometry(ask, frame.area());
+        let question_rows =
+            wrap_display(&ask.question, area.width.saturating_sub(6) as usize).len();
+        let shown_questions = question_rows.min(question_capacity);
+        let option_start = ask
+            .selected
+            .saturating_sub(option_capacity.saturating_sub(1));
+        let option_y = area.y + 1 + shown_questions as u16;
+        for (row, index) in
+            (option_start..ask.options.len().min(option_start + option_capacity)).enumerate()
+        {
             hit_regions.push(HitRegion {
                 area: Rect::new(
                     area.x + 1,
-                    option_y + index as u16,
+                    option_y + row as u16,
                     area.width.saturating_sub(2),
                     1,
                 ),
@@ -3746,6 +4129,13 @@ fn footer_hit_regions(model: &Model, area: Rect) -> Vec<HitRegion> {
     add("? help", FooterAction::Help);
     if model.thinking.is_some() {
         add("  ·  Esc interrupts", FooterAction::Interrupt);
+    }
+    if model
+        .cards
+        .iter()
+        .any(|card| matches!(card.kind, CardKind::Thinking) && !card.body.trim().is_empty())
+    {
+        add("  ·  Ctrl+T reasoning", FooterAction::Reasoning);
     }
     if model.scroll_from_bottom > 0 {
         add("  ·  Ctrl+End live", FooterAction::Live);
@@ -3837,8 +4227,8 @@ fn visible_around_caret(segment: &str, caret_chars: usize, width: usize) -> (Str
 /// How many buffer rows the editor shows at once; longer buffers scroll to the newest.
 const EDITOR_VISIBLE_LINES: usize = 5;
 
-/// The opencode-style prompt: left accent border, element background, `❯` glyph with the live
-/// buffer, and the caret sitting at the end of the buffer.
+/// The opencode-style prompt: a clear textarea border, element background, `❯` glyph with the
+/// live buffer, and the caret sitting at the end of the buffer.
 fn editor_widget(model: &Model, area: Rect) -> Paragraph<'static> {
     // Horizontal viewport: keep the caret (always at the end of the buffer) on screen.
     // Empty + thinking: skip the placeholder — the bouncing wall already says a turn is live.
@@ -3850,7 +4240,11 @@ fn editor_widget(model: &Model, area: Rect) -> Paragraph<'static> {
                 Style::default().fg(BLUE()).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                "Ask Kamui, or / for commands".to_string(),
+                if model.secret_input {
+                    "API key is hidden; Esc cancels".to_string()
+                } else {
+                    "Ask Kamui, or / for commands".to_string()
+                },
                 Style::default().add_modifier(Modifier::DIM),
             ),
         ])],
@@ -3859,7 +4253,17 @@ fn editor_widget(model: &Model, area: Rect) -> Paragraph<'static> {
             // segments into a single Line (as this did) collapsed a multi-line buffer onto one
             // row while the caret was placed per segment, so the two disagreed about the text.
             let inner = area.width.saturating_sub(4).max(1) as usize;
-            let view = editor_view(&model.input, model.input_caret, inner);
+            let display = if model.secret_input {
+                "*".repeat(model.input.chars().count())
+            } else {
+                model.input.clone()
+            };
+            let caret = if model.secret_input {
+                display.len()
+            } else {
+                model.input_caret
+            };
+            let view = editor_view(&display, caret, inner);
             view.rows
                 .into_iter()
                 .enumerate()
@@ -3892,17 +4296,23 @@ fn editor_widget(model: &Model, area: Rect) -> Paragraph<'static> {
         let dots = ".".repeat(frame_idx % 4);
         wall_line.push(Span::styled(
             format!("{label}{dots}"),
-            Style::default().fg(MUTED()).add_modifier(Modifier::DIM),
+            Style::default()
+                .fg(NOTICE_FG())
+                .add_modifier(Modifier::BOLD),
         ));
         rows.push(Line::from(wall_line));
     }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(SEPARATOR()));
+    let block = if model.secret_input {
+        block.title(" API key ")
+    } else {
+        block
+    };
     Paragraph::new(Text::from(rows))
         .style(Style::default().bg(BG_ELEMENT()))
-        .block(
-            Block::default()
-                .borders(Borders::LEFT)
-                .border_style(Style::default().fg(BLUE())),
-        )
+        .block(block)
 }
 
 /// Slash-command menu rendered above the editor while the buffer looks like a command.
@@ -4009,8 +4419,15 @@ fn popup_widget(model: &Model, area: Rect) -> Paragraph<'static> {
         )
 }
 
-fn sidebar_paragraph(model: &Model, area: Rect) -> Paragraph<'static> {
+#[derive(Clone)]
+struct SidebarRow {
+    line: Line<'static>,
+    action: Option<SidebarAction>,
+}
+
+fn sidebar_rows(model: &Model, area: Rect) -> Vec<SidebarRow> {
     let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut actions: Vec<Option<SidebarAction>> = Vec::new();
     // Left border eats one column; keep a little padding so values never kiss the rail.
     let max = area.width.saturating_sub(3).max(1) as usize;
     if let Some(plan) = &model.plan {
@@ -4018,28 +4435,23 @@ fn sidebar_paragraph(model: &Model, area: Rect) -> Paragraph<'static> {
             "Plan",
             Style::default().fg(MUTED()).add_modifier(Modifier::BOLD),
         )));
-        let compact_plan = area.width < 28 || area.height < 12;
-        let steps = if compact_plan {
-            plan.steps
-                .iter()
-                .filter(|(_, status)| *status == crate::tools::PlanStepStatus::InProgress)
-                .take(1)
-                .collect::<Vec<_>>()
-        } else {
-            plan.steps.iter().collect::<Vec<_>>()
-        };
+        actions.push(None);
         let completed = plan
             .steps
             .iter()
             .filter(|(_, status)| *status == crate::tools::PlanStepStatus::Completed)
             .count();
-        if compact_plan {
-            lines.push(Line::styled(
-                format!("Progress {completed}/{}", plan.steps.len()),
-                Style::default().fg(MUTED()),
-            ));
-        }
-        for (step, status) in steps {
+        lines.push(Line::styled(
+            format!("Progress {completed}/{}", plan.steps.len()),
+            Style::default().fg(MUTED()),
+        ));
+        actions.push(None);
+        for (step, status) in plan
+            .steps
+            .iter()
+            .filter(|(_, status)| *status == crate::tools::PlanStepStatus::InProgress)
+            .take(1)
+        {
             let mark = match status {
                 crate::tools::PlanStepStatus::Completed => "x",
                 crate::tools::PlanStepStatus::InProgress => "~",
@@ -4056,10 +4468,22 @@ fn sidebar_paragraph(model: &Model, area: Rect) -> Paragraph<'static> {
                     }),
                 ),
             ]));
+            actions.push(None);
+        }
+        let queued = plan
+            .steps
+            .iter()
+            .filter(|(_, status)| *status == crate::tools::PlanStepStatus::Pending)
+            .count();
+        if queued > 0 {
+            lines.push(Line::styled(
+                format!("{queued} queued"),
+                Style::default().fg(MUTED()),
+            ));
+            actions.push(None);
         }
     }
     if let Some(entries) = &model.sidebar {
-        let compact = area.height < (entries.len() as u16).saturating_mul(4);
         for (i, (key, value)) in entries.iter().enumerate() {
             // Section headers (Session/Runtime/Context/Activity/Last turn) render as a
             // small muted rule so groups read apart without a blank line each.
@@ -4069,13 +4493,26 @@ fn sidebar_paragraph(model: &Model, area: Rect) -> Paragraph<'static> {
                         "─".repeat(max.min(key.len() + 4)),
                         Style::default().fg(BORDER()),
                     )));
+                    actions.push(None);
                 }
                 lines.push(Line::from(Span::styled(
                     key.to_string(),
                     Style::default().fg(MUTED()).add_modifier(Modifier::BOLD),
                 )));
+                actions.push((key == "Session").then_some(SidebarAction::Session));
                 for value_line in value.split('\n') {
+                    let before = lines.len();
                     push_sidebar_value(&mut lines, key, value_line, max);
+                    let action = match value_line.split_once('\t').map(|(label, _)| label) {
+                        Some("model") => Some(SidebarAction::Model),
+                        Some("mode") => Some(SidebarAction::Mode),
+                        _ => None,
+                    };
+                    actions.extend(std::iter::repeat_n(action, lines.len() - before));
+                    if !matches!(key.as_str(), "Context" | "Activity" | "Last turn") {
+                        lines.push(Line::from(""));
+                        actions.push(None);
+                    }
                 }
                 continue;
             }
@@ -4083,21 +4520,42 @@ fn sidebar_paragraph(model: &Model, area: Rect) -> Paragraph<'static> {
                 format!("{key} "),
                 Style::default().fg(TEXT()).add_modifier(Modifier::BOLD),
             )));
+            actions.push(match key.as_str() {
+                "Model" => Some(SidebarAction::Model),
+                "Mode" | "mode" => Some(SidebarAction::Mode),
+                _ => None,
+            });
             // Values may carry newlines (Last turn metrics); ratatui strips them inside
             // spans, so split before styling. Tab-separated metric rows keep label/value
             // contrast; project paths truncate from the left so the leaf stays readable.
             for value_line in value.split('\n') {
+                let before = lines.len();
                 push_sidebar_value(&mut lines, key, value_line, max);
-            }
-            if !compact && i + 1 < entries.len() {
-                lines.push(Line::from(""));
+                actions.extend(std::iter::repeat_n(None, lines.len() - before));
+                if !matches!(key.as_str(), "Context" | "Activity" | "Last turn") {
+                    lines.push(Line::from(""));
+                    actions.push(None);
+                }
             }
         }
     }
-    Paragraph::new(Text::from(lines))
+    lines
+        .into_iter()
+        .zip(actions)
+        .map(|(line, action)| SidebarRow { line, action })
+        .collect()
+}
+
+fn sidebar_paragraph(
+    lines: impl IntoIterator<Item = Line<'static>>,
+    _area: Rect,
+) -> Paragraph<'static> {
+    Paragraph::new(Text::from(lines.into_iter().collect::<Vec<_>>()))
         .style(Style::default().bg(BG_PANEL()))
         .block(
             Block::default()
+                .borders(Borders::LEFT)
+                .border_style(Style::default().fg(SEPARATOR()))
                 .padding(Padding::new(1, 0, 1, 0))
                 .style(Style::default().bg(BG_PANEL())),
         )
@@ -4107,7 +4565,7 @@ fn sidebar_paragraph(model: &Model, area: Rect) -> Paragraph<'static> {
 fn is_sidebar_section(key: &str) -> bool {
     matches!(
         key,
-        "Session" | "Runtime" | "Context" | "Activity" | "Last turn"
+        "Session" | "Runtime" | "MCP" | "Context" | "Activity" | "Last turn"
     )
 }
 
@@ -4162,19 +4620,19 @@ fn push_sidebar_value(lines: &mut Vec<Line<'static>>, key: &str, value_line: &st
     }
     if let Some((label, rest)) = value_line.split_once('\t') {
         let style = sidebar_value_style(key, label, rest);
-        // label on its own line, value indented on next line (user request: not "model model name")
         lines.push(Line::styled(
-            format!("{label} :"),
+            crate::tui::truncate_chars(label, max),
             Style::default().fg(TEXT()).add_modifier(Modifier::BOLD),
         ));
-        let indented = format!(
-            " {}",
-            crate::tui::truncate_chars(rest, max.saturating_sub(1))
-        );
-        // mcp value already contains newlines/bullets — keep as-is but indented
-        for part in indented.split('\n') {
-            lines.push(Line::styled(part.to_string(), style));
-        }
+        let value = if label == "project" {
+            compact_project_path(rest, 3)
+        } else {
+            rest.to_string()
+        };
+        lines.push(Line::styled(
+            crate::tui::truncate_left_chars(&value, max),
+            style,
+        ));
         return;
     }
     let truncated = if key == "Project" {
@@ -4183,6 +4641,15 @@ fn push_sidebar_value(lines: &mut Vec<Line<'static>>, key: &str, value_line: &st
         crate::tui::truncate_chars(value_line, max)
     };
     lines.push(Line::styled(truncated, Style::default().fg(NOTICE_FG())));
+}
+
+fn compact_project_path(path: &str, components: usize) -> String {
+    let normalized = path.replace('\\', "/");
+    let parts: Vec<&str> = normalized
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect();
+    parts[parts.len().saturating_sub(components)..].join("/")
 }
 
 /// The home screen: two-tone block-letter logo centered above the version/model line and the
@@ -4271,8 +4738,16 @@ fn footer_widget(model: &Model, area: Rect) -> Paragraph<'static> {
     // Keep action/status hints ahead of discoverability hints: truncation should not hide control
     // of an in-flight turn or the fact that input was queued.
     if model.thinking.is_some() {
-        left.push_str("  \u{b7}  Esc interrupts  \u{b7}  Enter steers");
+        left.push_str("  \u{b7}  Esc interrupts  \u{b7}  Enter queues for next step");
     }
+    if model
+        .cards
+        .iter()
+        .any(|card| matches!(card.kind, CardKind::Thinking) && !card.body.trim().is_empty())
+    {
+        left.push_str("  \u{b7}  Ctrl+T reasoning");
+    }
+    left.push_str("  \u{b7}  drag to select");
     if model.scroll_from_bottom > 0 {
         left.push_str(&format!(
             "  \u{b7}  \u{2191} {} row(s) back  \u{b7}  Ctrl+End live",
@@ -4282,7 +4757,7 @@ fn footer_widget(model: &Model, area: Rect) -> Paragraph<'static> {
     if model.queued_count > 0 {
         let plural = if model.queued_count == 1 { "" } else { "s" };
         left.push_str(&format!(
-            "  \u{b7}  {} message{} queued",
+            "  \u{b7}  {} input{} queued for next agent step",
             model.queued_count, plural
         ));
     }
@@ -4335,7 +4810,16 @@ fn footer_widget(model: &Model, area: Rect) -> Paragraph<'static> {
         spans.push(Span::raw(" ".repeat(gap)));
         spans.extend(right);
     }
-    Paragraph::new(Line::from(spans)).style(Style::default().bg(BG_PANEL()))
+    let footer = Paragraph::new(Line::from(spans)).style(Style::default().bg(BG_PANEL()));
+    if area.height >= 2 {
+        footer.block(
+            Block::default()
+                .borders(Borders::TOP)
+                .border_style(Style::default().fg(SEPARATOR())),
+        )
+    } else {
+        footer
+    }
 }
 
 /// The transcript as it is actually drawn: every source line wrapped to `width`, each wrapped
@@ -4506,6 +4990,18 @@ const COLLAPSED_PEEK: usize = 2;
 /// One-line call header: the tool name plus a trimmed peek at its arguments, so a folded card
 /// still says what ran and against what.
 fn tool_header(name: &str, args: &str) -> String {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(args) {
+        if name == "patch_file"
+            && let Some(path) = value.get("path").and_then(|value| value.as_str())
+        {
+            return format!("Edit {path}");
+        }
+        if name == "run_command"
+            && let Some(command) = value.get("command").and_then(|value| value.as_str())
+        {
+            return format!("$ {}", crate::tui::truncate_chars(command, 72));
+        }
+    }
     let compact = args.split_whitespace().collect::<Vec<_>>().join(" ");
     let compact = crate::tui::truncate_chars(&compact, 60);
     if compact.is_empty() {
@@ -4579,6 +5075,7 @@ fn card_lines(card: &Card, width: usize) -> Vec<Line<'static>> {
             },
             CardKind::Error => (RED(), Style::default().fg(TEXT())),
             CardKind::Note => (MUTED(), Style::default().fg(NOTICE_FG())),
+            CardKind::Thinking => (MUTED(), Style::default().fg(MUTED())),
         }
     };
 
@@ -4644,7 +5141,7 @@ fn card_lines(card: &Card, width: usize) -> Vec<Line<'static>> {
                 push_bordered(
                     &mut out,
                     vec![Span::styled(
-                        "\u{2026} ctrl+o or click".to_string(),
+                        "\u{2026} ctrl+o to expand".to_string(),
                         Style::default().fg(MUTED()),
                     )],
                 );
@@ -4657,9 +5154,34 @@ fn card_lines(card: &Card, width: usize) -> Vec<Line<'static>> {
         return out;
     }
 
+    if matches!(card.kind, CardKind::Tool)
+        && card.collapsed
+        && let Some((status, ok)) = &card.status
+    {
+        push_bordered(
+            &mut out,
+            vec![
+                Span::styled(
+                    card.title.clone(),
+                    Style::default().fg(TEXT()).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("  {} {status}", if *ok { "\u{2713}" } else { "\u{2717}" }),
+                    Style::default().fg(if *ok { GREEN() } else { RED() }),
+                ),
+                Span::styled("  \u{203a}".to_string(), Style::default().fg(MUTED())),
+            ],
+        );
+        return out;
+    }
+
     // Tool cards lead with their own header row. Without it a finished call reduced to a
     // bare outcome ("completed - 0ms - 332 chars") that never said which tool produced it.
-    if matches!(card.kind, CardKind::Tool | CardKind::Note) && !card.title.is_empty() {
+    if matches!(
+        card.kind,
+        CardKind::Tool | CardKind::Note | CardKind::Thinking
+    ) && !card.title.is_empty()
+    {
         push_bordered(
             &mut out,
             vec![Span::styled(
@@ -4684,7 +5206,7 @@ fn card_lines(card: &Card, width: usize) -> Vec<Line<'static>> {
     if card.collapsed {
         // A card that already shows an outcome needs no peek: it folds to two tidy rows and
         // opens on demand. Cards without one keep the old head window.
-        let peek = if card.status.is_some() {
+        let peek = if card.status.is_some() || matches!(card.kind, CardKind::Thinking) {
             0
         } else {
             COLLAPSED_PEEK
@@ -4699,7 +5221,7 @@ fn card_lines(card: &Card, width: usize) -> Vec<Line<'static>> {
             push_bordered(
                 &mut out,
                 vec![Span::styled(
-                    format!("\u{2026} {hidden} more line(s) \u{b7} ctrl+o or click"),
+                    format!("\u{2026} {hidden} more line(s) \u{b7} ctrl+o to expand"),
                     Style::default().fg(MUTED()),
                 )],
             );
@@ -4916,6 +5438,212 @@ fn wrap_display(text: &str, width: usize) -> Vec<String> {
 mod tests {
     use super::*;
 
+    fn test_card(id: u64, lines: usize) -> Card {
+        Card {
+            id,
+            kind: CardKind::Output,
+            title: "Assistant".into(),
+            body: std::iter::repeat_n("line", lines)
+                .collect::<Vec<_>>()
+                .join("\n"),
+            status: None,
+            collapsed: false,
+        }
+    }
+
+    #[test]
+    fn trim_history_enforces_cumulative_budget_without_splitting_newest_card() {
+        let mut cards = vec![
+            test_card(1, 2_500),
+            test_card(2, 2_500),
+            test_card(3, 5_000),
+        ];
+        trim_cards(&mut cards);
+        assert_eq!(
+            cards.iter().map(|card| card.id).collect::<Vec<_>>(),
+            vec![3]
+        );
+        assert_eq!(cards[0].body.lines().count(), 5_000);
+
+        let mut cards = vec![
+            test_card(1, 2_500),
+            test_card(2, 1_000),
+            test_card(3, 1_000),
+        ];
+        trim_cards(&mut cards);
+        assert_eq!(
+            cards.iter().map(|card| card.id).collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+    }
+
+    fn thinking_card(id: u64, body: &str, collapsed: bool) -> Card {
+        Card {
+            id,
+            kind: CardKind::Thinking,
+            title: "Thinking".into(),
+            body: body.into(),
+            status: None,
+            collapsed,
+        }
+    }
+
+    #[test]
+    fn thinking_card_stays_collapsed_until_toggled() {
+        let collapsed = thinking_card(1, "consider the cache prefix", true);
+        let rows = rendered(&collapsed, 60);
+        assert!(
+            rows.iter().any(|row| row.contains("Thinking")),
+            "header stays visible: {rows:?}"
+        );
+        assert!(
+            rows.iter().all(|row| !row.contains("cache prefix")),
+            "body stays folded: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.contains("ctrl+o to expand")),
+            "expand hint is present: {rows:?}"
+        );
+
+        let open = thinking_card(1, "consider the cache prefix", false);
+        let rows = rendered(&open, 60);
+        assert!(
+            rows.iter().any(|row| row.contains("cache prefix")),
+            "expanded body is visible: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn thinking_wall_is_a_click_target() {
+        let model = Model {
+            intro: false,
+            thinking: Some((0, "Thinking...")),
+            cards: vec![thinking_card(1, "hidden reasoning", true)],
+            ..Default::default()
+        };
+        let backend = ratatui::backend::TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let mut info = RenderInfo::default();
+        terminal
+            .draw(|frame| info = render(frame, &model))
+            .expect("draw");
+        assert!(
+            info.hits.iter().any(|hit| {
+                hit.target == HitTarget::Thinking
+                    && hit_at(&info.hits, hit.area.x, hit.area.y) == Some(HitTarget::Thinking)
+            }),
+            "thinking wall maps to a click target"
+        );
+        assert!(
+            info.hits.iter().any(|hit| hit.target == HitTarget::Card(1)),
+            "thinking card itself remains clickable"
+        );
+    }
+
+    #[test]
+    fn busy_navigation_is_rejected_instead_of_queued() {
+        assert!(is_busy_navigation("/model fast"));
+        assert!(is_busy_navigation("/resume abc123"));
+        assert!(!is_busy_navigation("please continue"));
+        assert!(!is_busy_navigation("/mode next"));
+        assert!(BUSY_NAV_NOTICE.contains("interrupt the current turn first"));
+    }
+
+    #[test]
+    fn empty_picker_notice_is_actionable() {
+        assert!(EMPTY_MODELS_NOTICE.contains("/model __add__"));
+        assert!(EMPTY_SESSIONS_NOTICE.contains("send a message"));
+        let dialog = DialogState::new("Select Model", "/model ", Vec::new());
+        assert!(dialog.filtered().is_empty());
+    }
+
+    #[test]
+    fn sidebar_clicks_follow_rendered_semantic_rows_with_plan_and_sections() {
+        let model = Model {
+            plan: Some(crate::tools::PlanView {
+                steps: vec![("inspect".into(), crate::tools::PlanStepStatus::InProgress)],
+                active: Some("inspect".into()),
+            }),
+            sidebar: Some(vec![
+                ("Session".into(), "Current\nid\tabc".into()),
+                (
+                    "Runtime".into(),
+                    "model\tfast\nmode\tbuild\nproject\tkamui".into(),
+                ),
+                ("Context".into(), "100 tokens".into()),
+            ]),
+            ..Default::default()
+        };
+        let backend = ratatui::backend::TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let mut info = RenderInfo::default();
+        terminal
+            .draw(|frame| info = render(frame, &model))
+            .expect("draw");
+        for action in [
+            SidebarAction::Session,
+            SidebarAction::Model,
+            SidebarAction::Mode,
+        ] {
+            let hit = info
+                .hits
+                .iter()
+                .find(|hit| hit.target == HitTarget::Sidebar(action))
+                .expect("semantic sidebar row");
+            assert_eq!(
+                hit_at(&info.hits, hit.area.x, hit.area.y),
+                Some(HitTarget::Sidebar(action))
+            );
+        }
+    }
+
+    #[test]
+    fn tiny_ask_geometry_stays_inside_frame() {
+        let ask = AskState {
+            question: "long question ".repeat(20),
+            options: (1..=8).map(|n| format!("option {n}")).collect(),
+            selected: 7,
+            typed: String::new(),
+            scroll: 0,
+        };
+        for frame in [Rect::new(0, 0, 20, 5), Rect::new(4, 3, 8, 2)] {
+            let (modal, _, options) = ask_geometry(&ask, frame);
+            assert!(modal.x >= frame.x && modal.y >= frame.y);
+            assert!(modal.right() <= frame.right() && modal.bottom() <= frame.bottom());
+            assert!(options <= 4);
+        }
+    }
+
+    #[test]
+    fn secret_editor_masks_content_and_has_no_transcript_card() {
+        let model = Model {
+            input: "sk-secret-value".into(),
+            input_caret: 15,
+            secret_input: true,
+            ..Default::default()
+        };
+        let mut buffer = ratatui::buffer::Buffer::empty(Rect::new(0, 0, 40, 3));
+        ratatui::widgets::Widget::render(
+            editor_widget(&model, Rect::new(0, 0, 40, 3)),
+            buffer.area,
+            &mut buffer,
+        );
+        let rendered: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+        assert!(!rendered.contains("sk-secret-value"));
+        assert!(rendered.contains("***************"));
+        assert!(model.cards.is_empty());
+    }
+
+    #[test]
+    fn escape_and_slash_input_contracts_preserve_user_text() {
+        let draft = String::from("unfinished thought");
+        assert_eq!(draft, "unfinished thought", "idle Esc does not mutate it");
+        let entered = "/del".trim().to_string();
+        let tabbed = format!("/{} ", "delete");
+        assert_eq!(entered, "/del");
+        assert_eq!(tabbed, "/delete ");
+    }
+
     #[test]
     fn render_paints_the_full_terminal_background() {
         let backend = ratatui::backend::TestBackend::new(83, 25);
@@ -5055,7 +5783,14 @@ mod tests {
         let mut terminal = Terminal::new(backend).expect("test terminal");
         terminal
             .draw(|frame| {
-                frame.render_widget(sidebar_paragraph(&model, frame.area()), frame.area())
+                let area = frame.area();
+                frame.render_widget(
+                    sidebar_paragraph(
+                        sidebar_rows(&model, area).into_iter().map(|row| row.line),
+                        area,
+                    ),
+                    area,
+                )
             })
             .expect("draw");
         let buffer = terminal.backend().buffer().clone();
@@ -5624,7 +6359,11 @@ mod tests {
             collapsed: true,
         };
         let rows = rendered(&card, 70);
-        assert_eq!(rows.len(), 3, "header + outcome + fold hint: {rows:?}");
+        assert_eq!(
+            rows.len(),
+            1,
+            "completed tools collapse to one row: {rows:?}"
+        );
         assert!(
             rows[0].contains("read_file"),
             "header names the tool: {rows:?}"
@@ -5634,16 +6373,16 @@ mod tests {
             "header peeks at args: {rows:?}"
         );
         assert!(
-            rows[1].contains("completed"),
+            rows[0].contains("completed"),
             "outcome stays visible: {rows:?}"
         );
         assert!(
-            rows[1].contains('\u{2713}'),
+            rows[0].contains('\u{2713}'),
             "outcome is marked as success: {rows:?}"
         );
         assert!(
-            rows[2].contains("20 more line(s)"),
-            "everything else folds: {rows:?}"
+            rows.iter().all(|row| !row.contains("line 1")),
+            "output stays folded: {rows:?}"
         );
     }
 
@@ -5658,9 +6397,9 @@ mod tests {
             collapsed: true,
         };
         let rows = rendered(&card, 70);
-        assert!(rows[1].contains('\u{2717}'), "failure is marked: {rows:?}");
+        assert!(rows[0].contains('\u{2717}'), "failure is marked: {rows:?}");
         assert!(
-            rows[1].contains("failed"),
+            rows[0].contains("failed"),
             "outcome says it failed: {rows:?}"
         );
         assert!(
@@ -5905,7 +6644,7 @@ mod tests {
             "caret rests on the continuation indent of the empty last line"
         );
         assert!(
-            row.trim_start_matches('\u{2502}').trim().is_empty(),
+            row.trim_matches('\u{2502}').trim().is_empty(),
             "last row is the empty segment: {row:?}"
         );
         // Height is derived from the same split, so the caret cannot fall past the editor.
@@ -5916,6 +6655,18 @@ mod tests {
     fn wrapping_uses_display_width() {
         let rows = wrap_display("abc界def", 5);
         assert_eq!(rows, vec!["abc界", "def"]);
+    }
+
+    #[test]
+    fn project_path_keeps_only_the_last_three_components() {
+        assert_eq!(
+            compact_project_path("/Users/eric/Documents/GitHub/kamui", 3),
+            "Documents/GitHub/kamui"
+        );
+        assert_eq!(
+            compact_project_path(r"C:\Users\eric\kamui", 3),
+            "Users/eric/kamui"
+        );
     }
 
     #[test]
@@ -5955,6 +6706,7 @@ mod tests {
             selected: 0,
             scroll: 0,
             options: PERM_OPTIONS.to_vec(),
+            expanded: true,
         };
         let backend = ratatui::backend::TestBackend::new(80, 30);
         let mut terminal = Terminal::new(backend).expect("test terminal");

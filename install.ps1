@@ -1,7 +1,7 @@
 $ErrorActionPreference = "Stop"
 
-$Repository = "algonacci/kamui"
 $InstallDir = Join-Path $env:LOCALAPPDATA "Programs\kamui\bin"
+$ReleaseUrl = if ($env:KAMUI_RELEASE_URL) { $env:KAMUI_RELEASE_URL.TrimEnd("/") } else { "https://is3.cloudhost.id/orvix/kamui-releases/latest" }
 
 if (-not [Environment]::Is64BitOperatingSystem) {
     throw "Kamui currently requires 64-bit Windows."
@@ -9,7 +9,6 @@ if (-not [Environment]::Is64BitOperatingSystem) {
 
 $Target = "x86_64-pc-windows-msvc"
 $Archive = "kamui-$Target.zip"
-$ReleaseUrl = "https://github.com/$Repository/releases/latest/download"
 $TempDir = Join-Path ([IO.Path]::GetTempPath()) "kamui-install-$([Guid]::NewGuid())"
 
 try {

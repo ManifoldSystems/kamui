@@ -252,6 +252,8 @@ median, the share of turns at or above 90%/95%, and how many turns were warm-ups
 and compaction use derived sticky ids (`{session}:title` / `{session}:compact`) so side requests
 cannot evict the conversation's warm prefix. The fullscreen Context rail and token badge surface
 per-turn cache (including warm-up zeros on pinned profiles) plus the session median when measured.
+Streaming and non-streaming calls share the same bounded pre-output retry policy, and an identical
+tool batch requested for three consecutive rounds is stopped before its third execution.
 
 ## Phase 6: Terminal Experience
 
@@ -306,6 +308,8 @@ colour without removing the structured event feed.
 `kamui benchmark <suite.json>` runs repeatable prompt cases against a chosen profile, supports
 multiple runs, checks optional case-insensitive expected substrings, reports latency and token
 totals, and exits non-zero on failed expectations.
+For Orvix Coding profiles, repeated runs are append-only turns in one stable session per case and
+the final report includes median/aggregate cache rates plus the shares at or above 90% and 95%.
 
 Cost tracking needed no migration either, and no new writes: `usage_records` has carried
 `input_tokens`, `output_tokens`, and the `model` that produced them since `user_version = 5`. The
@@ -508,6 +512,15 @@ polish: users hit these before they ever need a design system or batch-approval 
 - [x] Modal click-through prevention and bounded transcript click targets
 - [x] Semantic mouse targets for sidebar/footer actions with overlay precedence and hover feedback
 
+### Reliability and recovery
+
+- [x] Durable FIFO input queue with crash recovery and atomic completion alongside turn persistence
+- [x] Mutating-tool execution journal with interrupted recovery and bounded `/audit` viewer
+- [x] Durable read-only child-agent lifecycle records with bounded `/agents` viewer
+- [x] Multi-level session-scoped `/undo` and `/redo`, including migration from one-level snapshots
+- [x] Exact command/canonical path session grants instead of tool-wide `always` permissions
+- [x] Unique line-trimmed patch fallback while preserving strict ambiguity rejection
+
 ## OpenCode-inspired TUI direction
 
 Kamui's fullscreen TUI is deliberately inspired by OpenCode (boxy rails, live editor, sidebar).
@@ -547,14 +560,14 @@ Do not start this phase until the Near-term dogfooding items above are in a usab
 permission modal already exists; the next step is reducing friction when one turn produces several
 independent commands or file edits without weakening reviewability.
 
-- [ ] Group pending tool calls into a single reviewable batch
-- [ ] Show a grouped command/diff preview with tool, path, risk, and affected files
-- [ ] Approve all, reject all, or approve/reject individual items in a batch
+- [x] Group pending approval-gated tool calls into a single reviewable batch
+- [x] Show a grouped command/diff preview with tool and target details
+- [x] Approve all, reject all, or fall back to individual review
 - [ ] Keep approval scope explicit: once, tool-for-session, or reviewed-batch only
-- [ ] Preserve path validation, command allowlists, and capability checks for every item
+- [x] Preserve path validation, command allowlists, and capability checks for every item
 - [ ] Support stop-on-first-error versus continue-independent-items behavior
 - [ ] Add batch progress and per-item status in the TUI
-- [ ] Add atomic batch rollback while preserving the existing per-turn `/undo`
+- [ ] Add atomic batch rollback while preserving the existing durable multi-level `/undo`/`/redo`
 - [ ] Persist an audit record for every requested, approved, rejected, failed, and reverted call
 
 ## Phase 9: Context and Agent UX
@@ -617,5 +630,3 @@ Kamui should feel intentional and polished rather than like a chat log wrapped i
 - [ ] Add snapshot/golden tests for important screens, dialogs, wrapping, and theme variants
 - [ ] Run usability tests for first-time approval, batch review, context inspection, and recovery from errors
 - [ ] Establish measurable UX budgets for keypresses, modal depth, visual jitter, and time-to-understand
-
-

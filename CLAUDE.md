@@ -56,7 +56,7 @@ effort or operational risk is disproportionate to their immediate value.
   prompt shuts down gracefully. Windows stdin uses a reader thread and Tokio channel so the async
   runtime does not block on terminal input.
 - Supported chat commands are `/help`, `/new`, `/sessions`, `/resume <id>`, `/model [name]`,
-  `/rename <id> <title>`, `/search <text>`, `/compact`, `/undo`, `/jobs`, `/index`, `/commands`,
+  `/rename <id> <title>`, `/search <text>`, `/compact`, `/undo`, `/redo`, `/audit`, `/agents`, `/context`, `/timeline`, `/jobs`, `/index`, `/commands`,
   `/delete <id>`, `/stats`, `/usage`, `/status`, `/memory`, `/forget <text>` (or `/forget all`),
   and `/exit`. Plain `exit` also quits.
 - Users define their own slash commands as markdown files (`src/commands.rs`): global ones in
@@ -93,13 +93,15 @@ effort or operational risk is disproportionate to their immediate value.
 - Long sessions are compacted automatically: when the un-summarized recent history exceeds a byte
   threshold (about half the profile's `context_window`, or a default), older messages are folded
   into a rolling summary and the request sends the summary plus recent messages. `/compact` forces
-  it. Full history stays in storage; the summary is in-memory and regenerated after a resume.
+  it. Full history stays in storage; the summary and summarized boundary are persisted per session
+  and restored on resume, so a restart does not generate a different cache epoch unnecessarily.
 - `/model` lists the configured provider profiles and marks the active one; `/model <name>` switches
   the active provider and model, rebuilding the provider and persisting the choice in the SQLite
   `settings` table so it survives restarts. The banner shows the active model and profile. In
   fullscreen TUI mode bare `/model` opens the picker dialog, whose "+ Add provider / model" entry
-  reuses onboarding (base URL + API key -> live list_models -> pick) to append a new profile to
-  the global kamui.toml via `config::append_profile` and switch immediately.
+  reuses onboarding (base URL + API key -> live list_models -> pick). Orvix Coding adds every
+  returned model under one shared provider credential and switches to the selected default; generic
+  providers append only the selected profile.
 - After each streamed response the usage line reports time-to-first-token and total response time.
   These latency figures are displayed only, not persisted.
 - Chat requests offer the model read-only `read_file`, `list_directory`, `grep`, `glob`, and
@@ -113,8 +115,8 @@ effort or operational risk is disproportionate to their immediate value.
   `[y/N/a]`; `y`/`yes` approves once, declining feeds a refusal back to the model. Three ways to
   skip the prompt: `a`/`always` — ported from the sibling Kumo project's "Always allow" button,
   adapted from Telegram inline buttons to a plain third answer — both approves that call and grants
-  the *tool* (not that specific command) a standing pass in `start_chat`'s `always_allowed:
-  HashSet<String>` for the rest of the active session, cleared on `/new` or deleting the active
+  its exact normalized command or canonical patch target a standing pass in `start_chat`'s
+  `always_allowed: HashSet<String>` for the rest of the active session, cleared on `/new` or deleting the active
   session (`handle_command` takes `&mut HashSet<String>` for this); a global-only `[permissions]
   allow_commands = [...]` exact-match allowlist (`Tool::requires_confirmation_for`, checked instead
   of the no-arg `requires_confirmation` at dispatch time), configured ahead of time rather than
@@ -148,7 +150,9 @@ effort or operational risk is disproportionate to their immediate value.
   transport and the tools capability are supported.
 - `patch_file` edits one file per call by exact-match replacement and shows a +/- preview before
   the same `y`/`yes` approval. `old_text` must match exactly once or the patch is rejected with
-  recovery guidance; empty `old_text` creates a new file that must not exist. Matching is
+  recovery guidance; empty `old_text` creates a new file that must not exist. If exact matching
+  finds nothing, one line-trimmed block match may recover indentation-only drift; ambiguity remains
+  an error and no edit-distance fuzzy replacement is allowed. Matching is
   line-ending-agnostic (CRLF files are compared in LF space and rewritten with their original
   endings), so LF `old_text` still matches a CRLF file. Writes are atomic (temp file plus rename)
   and paths pass the same containment checks as reads.
@@ -156,9 +160,28 @@ effort or operational risk is disproportionate to their immediate value.
   the first time it is touched in a turn (`chat::snapshot_patch_target`). If the turn is cancelled
   with `Ctrl+C` before it finishes, every file it already changed is reverted automatically
   (`chat::revert_on_cancel`/`revert_snapshot`) so a multi-file edit can never be left half-applied
-  with no trace in session history. `/undo` performs the same revert for the most recently
-  *completed* turn — one level, in-memory only (not persisted to SQLite), cleared after use or when
-  a new turn starts.
+  with no trace in session history. `/undo` and `/redo` use durable multi-level edit stacks,
+  persisted atomically with completed turns and restored on resume. A new edit clears the redo
+  branch; a partial revert does not advance either stack.
+- Mutating tool calls are written to the SQLite execution journal before dispatch. Completed and
+  failed outcomes close the row; any row still running when the database reopens becomes
+  `interrupted`, is reported on resume, and is never retried automatically because its side effects
+  are unknown.
+- Multiple approval-gated calls in one response receive a grouped one-time review before execution.
+  Allow-all does not create permission grants; individual review retains exact command/path grants,
+  and every call still dispatches sequentially through validation, journaling, and edit snapshots.
+- Primary coding turns track repository-inspection calls and returned bytes. Sustained read-only
+  exploration without a successful `patch_file` warns after four calls or 64 KiB and hard-caps
+  inspection after six calls or 128 KiB. It injects up to two private system reminders to
+  narrow the search and implement or report a blocker. After the second threshold, primary turns
+  reject further inspection calls. The first successful `patch_file` raises the turn-wide allowance
+  to eight calls or 192 KiB; no patch resets or extends it. `run_command` rejects shell readers and
+  filesystem-reading interpreter snippets so they cannot bypass this budget. Editing and
+  verification stay open.
+  The reminders are not persisted and the guard is intentionally disabled for read-only child agents.
+- Fullscreen input submitted while a turn is busy is persisted in `queued_inputs` before the UI
+  acknowledges it. A stable queue id follows steering/next-turn promotion and is deleted in the
+  same transaction that saves the completed turn; claimed rows return to queued on resume.
 - Session IDs may be resolved from an unambiguous prefix. The UI normally displays the first eight
   characters.
 - Resume displays the six most recent messages and reports how many earlier messages were omitted.
@@ -231,7 +254,8 @@ effort or operational risk is disproportionate to their immediate value.
   exits non-zero if any required check fails, so it is usable as a pre-flight script.
 - `kamui benchmark <suite.json> [--profile <name>] [--runs <n>]` runs repeatable prompt cases,
   validates optional case-insensitive expected substrings, reports latency/token totals, and exits
-  non-zero when a case fails.
+  non-zero when a case fails. For Orvix Coding profiles, runs are append-only turns under one stable
+  session ID per case and include steady-state cache metrics with each case's first turn excluded.
 - `kamui jobs` manages a SQLite-backed scheduled command queue (`src/jobs.rs`, schema v9). One-shot
   and interval jobs persist across restarts; a foreground worker atomically claims due work, stores
   capped output/exit status, coalesces missed intervals, and can run once under an OS scheduler.
@@ -257,7 +281,7 @@ The process working directory is the project root.
   so `.gitignore`, global excludes, and hidden files are honoured (`require_git(false)`, so rules
   apply outside a repository too). Attachment stops at the shared context budget or 50 files;
   leftovers are reported in a trailing note rather than failing the prompt.
-- Each file is limited to 64 KiB and all attached context is limited to 128 KiB per request.
+- Each file is limited to 1 MiB and all attached context is limited to 2 MiB per request.
 - Absolute paths, directories, binary/non-UTF-8 files, and paths or symlinks outside the project root
   are rejected.
 - Duplicate references are attached once.
@@ -406,7 +430,8 @@ Every request is assembled as:
   the likely cause (`miss`, `miss (model switch)`, `miss (prefix rebuilt)`); it is silent on hits
   and first turns. The usage line shows whichever applies, falling back to `Cached: 0 (warm-up)` on
   a pinned profile so a zero is never mistaken for a provider that reports nothing. `/stats` then
-  reports the session: `median X% over N turns | >=90%: A% | >=95%: B% | warm-up: C`. Turn one is
+  reports the session: `median X% over N turns | >=90%: A% | >=95%: B% | warm-up: C`, plus the
+  current observed epoch when a cold turn follows an already-warm cache. Turn one is
   excluded from the ratios - it cannot hit a cache that does not exist - while a later warm-up turn
   stays in the denominator, because a prefix that churned mid-session is exactly the failure worth
   seeing. `storage::cache_samples` feeds it from `kind = 'chat'` rows only.
@@ -443,6 +468,17 @@ after title generation while later turns are fine.
 - `user_version = 10` adds `indexed_files.embedding_model`, `code_chunks.lsh_bucket`, and the FTS5
   mirror. `replace_file_index` swaps a fully prepared file index transactionally. Search uses full
   cosine scoring below 2,000 chunks and bounded FTS/LSH candidate scoring above it.
+- `user_version = 14` adds `tool_executions`. Running mutating calls are recovered as interrupted,
+  not retried; this table is durable audit data and cascades with its session.
+- `user_version = 15` adds session-scoped `queued_inputs`. FIFO rows survive restarts, claimed rows
+  are recovered on resume, and completion is atomic with turn persistence.
+- `user_version = 16` adds `edit_snapshots`, migrating the previous one-level session snapshot into
+  the undo stack. New rows carry before/after states for durable multi-level undo and redo.
+- `user_version = 17` adds `child_agent_runs`. Existing read-only sub-agents persist their task,
+  status, and final result; running rows become interrupted after a crash and are never auto-retried.
+- `user_version = 18` adds append-only `tool_decisions` events for requested, approved, and rejected
+  approval-gated calls. Exact-resource `always` grants record their scope; `/audit` shows decisions
+  separately from execution lifecycle rows.
 
 ## Configuration
 
@@ -493,9 +529,11 @@ Fields:
   the same way `base_url`/`api_key`/`tools` do. `None` (the default) leaves semantic search
   unavailable — `search_code` is then not offered to the model at all, rather than erroring.
 
-On first run, when no global `kamui.toml` exists, Kamui scaffolds the global config directory with a
-commented template and exits, asking the user to fill in the key. `KAMUI_DATA_DIR` remains an
-environment override for the database location only (a container/ops concern, not provider config).
+On first run, when no global `kamui.toml` exists, Kamui scaffolds the global config directory and
+starts onboarding. Orvix Coding discovery stores every returned model as a profile backed by one
+shared provider credential; the picker chooses only `default_profile`. Generic OpenAI-compatible
+onboarding stores only the selected model. `KAMUI_DATA_DIR` remains an environment override for the
+database location only (a container/ops concern, not provider config).
 
 Never commit API keys, credentials, provider responses containing secrets, or local database files.
 A project `kamui.toml` is safe to commit because it cannot contain a key. If a key appears in logs,
@@ -615,8 +653,8 @@ release build when changing dependencies, platform behavior, installers, or rele
 
 Current tests cover persistence, cascade deletion, session summaries, hidden empty sessions, SSE
 parsing, project instruction precedence, file-reference expansion, duplicate references, unchanged
-plain prompts, and staged Git diff expansion. Add focused tests for new parsing, storage, safety, and
-cross-platform path behavior.
+plain prompts, staged Git diff expansion, and the OpenAI-compatible mixed text/image/tool/cache wire
+contract. Add focused tests for new parsing, storage, safety, and cross-platform path behavior.
 
 ## Git and Releases
 

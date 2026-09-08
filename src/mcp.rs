@@ -7,7 +7,7 @@ use crate::provider::ToolDefinition;
 use crate::tools::Tool;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use rmcp::model::CallToolRequestParam;
+use rmcp::model::CallToolRequestParams;
 use rmcp::service::{RoleClient, RunningService, ServiceExt};
 use rmcp::transport::TokioChildProcess;
 use serde_json::Value;
@@ -169,12 +169,13 @@ impl Tool for McpTool {
     async fn run(&self, arguments: &str) -> Result<String> {
         let value: Value =
             serde_json::from_str(arguments).context("tool arguments were not valid JSON")?;
+        let mut request = CallToolRequestParams::new(self.remote_name.clone());
+        if let Some(arguments) = value.as_object().cloned() {
+            request = request.with_arguments(arguments);
+        }
         let result = self
             .service
-            .call_tool(CallToolRequestParam {
-                name: self.remote_name.clone().into(),
-                arguments: value.as_object().cloned(),
-            })
+            .call_tool(request)
             .await
             .with_context(|| format!("MCP tool '{}' failed", self.qualified_name))?;
         Ok(render_result(&result))

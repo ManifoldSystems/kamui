@@ -14,15 +14,25 @@ pub async fn run(path: &Path) -> Result<()> {
     println!("Kamui onboarding");
     println!("================");
     println!();
-    println!("Connect an OpenAI-compatible model provider.");
+    println!("Connect Orvix Coding or another OpenAI-compatible provider.");
 
     loop {
-        let base_url = Input::<String>::with_theme(&theme)
-            .with_prompt("Provider base URL")
-            .default(DEFAULT_BASE_URL.to_owned())
-            .interact_text()?
-            .trim_end_matches('/')
-            .to_owned();
+        let provider = FuzzySelect::with_theme(&theme)
+            .with_prompt("Provider profile")
+            .items(["Orvix Coding", "Other OpenAI-compatible"])
+            .default(0)
+            .interact()?;
+        let orvix_coding = provider == 0;
+        let base_url = if orvix_coding {
+            config::ORVIX_BASE_URL.to_owned()
+        } else {
+            Input::<String>::with_theme(&theme)
+                .with_prompt("Provider base URL")
+                .default(DEFAULT_BASE_URL.to_owned())
+                .interact_text()?
+                .trim_end_matches('/')
+                .to_owned()
+        };
         let api_key = Password::with_theme(&theme)
             .with_prompt("API key")
             .interact()?
@@ -30,7 +40,8 @@ pub async fn run(path: &Path) -> Result<()> {
             .to_owned();
 
         println!("Checking available models...");
-        match OpenAIProvider::list_models(&api_key, &base_url).await {
+        let models_path = orvix_coding.then_some(config::ORVIX_MODELS_PATH);
+        match OpenAIProvider::list_models(&api_key, &base_url, models_path).await {
             // A provider can answer successfully with an empty list -- a key with no model
             // entitlements, or a base URL pointing at something that is not a model API.
             // `FuzzySelect` over no items has nothing to return, and indexing the empty list
@@ -53,7 +64,18 @@ pub async fn run(path: &Path) -> Result<()> {
                     .items(&models)
                     .default(0)
                     .interact()?;
-                config::save_onboarding(path, &base_url, &api_key, &models[selected])?;
+                if orvix_coding {
+                    config::save_orvix_onboarding(
+                        path,
+                        &base_url,
+                        &api_key,
+                        &models,
+                        &models[selected],
+                        true,
+                    )?;
+                } else {
+                    config::save_onboarding(path, &base_url, &api_key, &models[selected], false)?;
+                }
                 println!("Connected. Found {} models.", models.len());
                 println!("Configuration saved to {}", path.display());
                 println!();

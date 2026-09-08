@@ -9,6 +9,11 @@ pub const BUILTINS: &[(&str, &str)] = &[
     ("search", "Search saved messages"),
     ("compact", "Summarize older messages"),
     ("undo", "Revert the last turn's file edits"),
+    ("redo", "Reapply the last undone file edits"),
+    ("audit", "Show recent mutating tool executions"),
+    ("agents", "Show recent child-agent runs"),
+    ("context", "Inspect current reusable context"),
+    ("timeline", "Show session activity timeline"),
     ("jobs", "List session and scheduled jobs"),
     ("index", "Rebuild the semantic-search index"),
     ("commands", "List your own prompt commands"),
@@ -51,7 +56,13 @@ pub(crate) struct Candidate {
 
 pub fn is_interactive() -> bool {
     let ui = crate::terminal::Ui::stdio();
-    ui.interactive() && std::env::var_os("NO_COLOR").is_none()
+    fullscreen_policy(ui.interactive())
+}
+
+/// Fullscreen is a terminal-capability decision. `NO_COLOR` changes the palette, not whether
+/// interactive terminal features are available; print and piped modes remain plain.
+pub(crate) fn fullscreen_policy(interactive_tty: bool) -> bool {
+    interactive_tty
 }
 
 pub(crate) fn slash_candidates(
@@ -212,5 +223,11 @@ mod tests {
         assert_eq!(short.chars().count(), 18);
         assert_eq!(truncate_left_chars("short", 18), "short");
         assert_eq!(truncate_left_chars("abcdef", 1), "\u{2026}");
+    }
+
+    #[test]
+    fn no_color_does_not_disable_fullscreen_policy() {
+        assert!(fullscreen_policy(true));
+        assert!(!fullscreen_policy(false));
     }
 }

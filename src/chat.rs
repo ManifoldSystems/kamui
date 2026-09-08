@@ -14,7 +14,7 @@ use crate::storage::{Database, Session};
 use crate::terminal::{Style, Ui};
 use crate::tools;
 use crate::tools::ToolRegistry;
-use crate::ui::{self, ChatUi, HubEvent, InputHub};
+use crate::ui::{self, ChatUi, HubEvent, InputHub, QueuedInput};
 use anyhow::{Context, Result};
 use chrono::{Local, TimeZone};
 use dialoguer::console::Term;
@@ -35,6 +35,141 @@ const RESUME_REPLAY_MESSAGES: usize = 10;
 /// Upper bound on model/tool round-trips within a single user turn, to stop runaway tool loops.
 /// Generous enough for multi-file edits while still bounding a stuck loop.
 const MAX_TOOL_ROUNDS: usize = 25;
+const EXPLORATION_WARNING_CALLS: usize = 4;
+const EXPLORATION_WARNING_BYTES: usize = 64 * 1024;
+const EXPLORATION_FINAL_CALLS: usize = 6;
+const EXPLORATION_FINAL_BYTES: usize = 128 * 1024;
+const EXPLORATION_POST_PATCH_CALLS: usize = 8;
+const EXPLORATION_POST_PATCH_BYTES: usize = 192 * 1024;
+
+#[derive(Default)]
+struct ExplorationGuard {
+    calls: usize,
+    bytes: usize,
+    warnings: usize,
+    patched: bool,
+}
+
+impl ExplorationGuard {
+    fn observe(&mut self, tool: &str, output: &str) {
+        if is_inspection_tool(tool) {
+            self.calls += 1;
+            self.bytes = self.bytes.saturating_add(output.len());
+        } else if is_successful_mutation(tool, output) && !self.patched {
+            self.patched = true;
+            self.warnings = self.warnings.min(1);
+        }
+    }
+
+    fn warning(&mut self) -> Option<&'static str> {
+        let (final_calls, final_bytes) = if self.patched {
+            (EXPLORATION_POST_PATCH_CALLS, EXPLORATION_POST_PATCH_BYTES)
+        } else {
+            (EXPLORATION_FINAL_CALLS, EXPLORATION_FINAL_BYTES)
+        };
+        let final_pressure = self.calls >= final_calls || self.bytes >= final_bytes;
+        if final_pressure && self.warnings < 2 {
+            self.warnings = 2;
+            return Some(
+                "Exploration budget is exhausted. Stop broad reconnaissance and do not reread \
+                 resources already inspected. Make the smallest concrete edit now, or return a \
+                 precise blocker if editing would be unsafe.",
+            );
+        }
+        let initial_pressure =
+            self.calls >= EXPLORATION_WARNING_CALLS || self.bytes >= EXPLORATION_WARNING_BYTES;
+        if initial_pressure && self.warnings == 0 {
+            self.warnings = 1;
+            return Some(
+                "You have spent substantial context exploring without making implementation \
+                 progress. Narrow the investigation and make the smallest correct edit now, or \
+                 state the exact blocker. Do not reread resources already inspected.",
+            );
+        }
+        None
+    }
+
+    fn blocks(&self, tool: &str) -> bool {
+        self.warnings >= 2 && is_inspection_tool(tool)
+    }
+}
+
+const EXPLORATION_BLOCKED: &str = "Error: exploration budget exhausted. Repository inspection is \
+temporarily blocked for this turn. Use patch_file now with the evidence already collected, or \
+return a precise blocker. The turn-wide inspection budget does not reset after edits.";
+const SHELL_INSPECTION_BLOCKED: &str = "Error: do not inspect repository files through \
+run_command. Use read_file, list_directory, grep, or glob so the turn-wide exploration budget \
+remains enforceable. run_command remains available for tests, lint, builds, and git status/diff.";
+
+fn is_inspection_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "read_file" | "read_image" | "list_directory" | "grep" | "glob" | "search_code"
+    )
+}
+
+fn is_shell_inspection(name: &str, arguments: &str) -> bool {
+    if name != "run_command" {
+        return false;
+    }
+    let Ok(arguments) = serde_json::from_str::<serde_json::Value>(arguments) else {
+        return false;
+    };
+    let Some(command) = arguments.get("command").and_then(|value| value.as_str()) else {
+        return false;
+    };
+    let command = command.to_ascii_lowercase();
+    let first = command
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .rsplit('/')
+        .next()
+        .unwrap_or_default();
+    if matches!(first, "cat" | "sed" | "awk" | "grep" | "rg" | "find" | "ls") {
+        return true;
+    }
+    matches!(first, "python" | "python3" | "perl" | "ruby" | "node")
+        && [
+            "read_text",
+            "read_to_string",
+            "path(",
+            "open(",
+            "os.walk",
+            "rglob(",
+            "glob(",
+            "readdir",
+            "readfile",
+        ]
+        .iter()
+        .any(|marker| command.contains(marker))
+}
+
+fn is_successful_mutation(name: &str, output: &str) -> bool {
+    name == "patch_file" && !output.starts_with("Error: ")
+}
+const REPEATED_TOOL_BATCH_LIMIT: usize = 3;
+
+fn tool_batch_signature(calls: &[ToolCall]) -> Vec<(String, String)> {
+    calls
+        .iter()
+        .map(|call| {
+            let arguments = serde_json::from_str::<serde_json::Value>(&call.arguments)
+                .and_then(|value| serde_json::to_string(&value))
+                .unwrap_or_else(|_| call.arguments.trim().to_owned());
+            (call.name.clone(), arguments)
+        })
+        .collect()
+}
+
+fn repeated_tool_batch(recent: &mut Vec<Vec<(String, String)>>, calls: &[ToolCall]) -> bool {
+    let signature = tool_batch_signature(calls);
+    recent.push(signature);
+    if recent.len() > REPEATED_TOOL_BATCH_LIMIT {
+        recent.remove(0);
+    }
+    recent.len() == REPEATED_TOOL_BATCH_LIMIT && recent.windows(2).all(|pair| pair[0] == pair[1])
+}
 const MAX_CONCURRENT_SUB_AGENTS: usize = 4;
 const EMBEDDING_BATCH_SIZE: usize = 64;
 /// Settings key for the persisted active provider profile.
@@ -63,17 +198,21 @@ where
         .find(&active_name)
         .cloned()
         .unwrap_or_else(|| config.default().clone());
-    if let Some(th) = database
-        .get_setting("active_theme")?
-        .and_then(|s| s.parse::<crate::theme::Theme>().ok())
-    {
-        config.theme = th;
+    let saved_theme = database.get_setting("active_theme")?;
+    let mut startup_warnings = Vec::new();
+    if let Some(name) = saved_theme {
+        match name.parse::<crate::theme::Theme>() {
+            Ok(th) => config.theme = th,
+            Err(error) => startup_warnings.push(format!("theme: saved theme '{name}': {error}")),
+        }
     }
     let mut provider = build_provider(&active);
     let mut context_window = active.context_window;
     let job_registry = tools.jobs();
     let command_library = commands::CommandLibrary::load(project.root());
     let mut skill_library = crate::skills::SkillLibrary::load(project.root());
+    let settings_report = crate::settings::load_disabled_skills_report(project.root());
+    startup_warnings.extend(settings_report.warnings.iter().cloned());
     // Warnings captured when `/warnings fix` was invoked, so the turn that repairs them can
     // be compared against a fresh load and reported instead of ending silently.
     let mut pending_skill_fix: Option<Vec<String>> = None;
@@ -93,7 +232,7 @@ where
     let mut hub = chat_ui.screen_handle().map(InputHub::spawn);
     let interrupt = hub.as_ref().map(|h| h.interrupt.clone());
     if let Some(hub) = hub.as_ref() {
-        refresh_model_source(&config, hub);
+        refresh_model_source(&config, &active.name, hub);
         refresh_session_source(database, hub);
         if let Ok(candidates) = project.at_path_candidates() {
             hub.set_path_candidates(candidates);
@@ -115,20 +254,22 @@ where
     // One tidy startup line instead of a wall of per-skill warnings; /skills still lists every
     // individual reason.
     let skill_warning_count = skill_library.warnings().len();
-    if skill_warning_count > 0 {
+    let mut warning_details = startup_warnings.clone();
+    warning_details.extend(skill_library.warnings().iter().cloned());
+    if !warning_details.is_empty() {
         if use_tui {
             chat_ui.warning(&format!(
-                "{skill_warning_count} skill folder(s) skipped (invalid name or frontmatter) — /warnings details, /warnings fix"
+                "{} startup warning(s) — /warnings details{}",
+                warning_details.len(),
+                if skill_warning_count > 0 {
+                    ", /warnings fix"
+                } else {
+                    ""
+                }
             ))?;
-            chat_ui.set_warning_details(
-                skill_library
-                    .warnings()
-                    .iter()
-                    .map(|w| w.to_string())
-                    .collect(),
-            )?;
+            chat_ui.set_warning_details(warning_details.clone())?;
         } else {
-            for warning in skill_library.warnings() {
+            for warning in &warning_details {
                 eprintln!("warning: {warning}");
             }
         }
@@ -178,10 +319,19 @@ where
                 session.title,
                 short_id(&session.id)
             ))?;
+            report_interrupted_tools(&mut chat_ui, database, &session.id)?;
             if use_tui {
                 replay_tui_history(&mut chat_ui, &messages)?;
             } else {
                 print_history_preview(&messages);
+            }
+            if let Some(hub) = hub.as_ref() {
+                for (id, content) in database.recover_queued_inputs(&session.id)? {
+                    hub.push_queued(QueuedInput {
+                        id: Some(id),
+                        content,
+                    });
+                }
             }
             (Some(session), messages)
         }
@@ -253,17 +403,22 @@ where
         chat_ui.notice(&format!("Plan Mode — pending plan\n{rendered}"))?;
     }
     let mut input_rx = if use_tui { None } else { Some(input_channel()) };
-    let mut disabled_skills = crate::settings::load_disabled_skills(project.root());
+    let mut disabled_skills = settings_report.disabled;
 
     // Prompt-cache prefix watch. Only cache-pinned profiles (Orvix Coding Plan, `send_session_id`)
     // pay attention: everywhere else a changed prefix costs nothing worth a notice.
     let mut prefix_guard = cache::PrefixGuard::new(active.send_session_id);
     // Rolling context compaction: `summary` folds in messages before `summarized_upto`; the rest of
     // `messages` is sent verbatim. Both reset whenever a command replaces the loaded history.
-    let mut summary: Option<String> = None;
-    let mut summarized_upto: usize = 0;
-    // The most recently completed turn's pre-edit file snapshot, if it touched any files, so
-    // `/undo` can revert it. `None` once nothing is left to undo.
+    let mut summary = session
+        .as_ref()
+        .and_then(|session| session.compaction_summary.clone());
+    let mut summarized_upto = session
+        .as_ref()
+        .map(|session| session.summarized_upto.min(messages.len()))
+        .unwrap_or(0);
+    // Cache of the last turn's edited paths for post-save index refresh. Undo/redo state lives in
+    // SQLite's edit_snapshots stack and is not derived from this process-local value.
     let mut last_turn_snapshot: Option<HashMap<PathBuf, Option<String>>> = None;
     // Tool names granted a standing "always allow" for the rest of this session (ported from
     // Kumo's "Always allow" approval button). Session-scoped: cleared whenever a chat effectively
@@ -273,8 +428,8 @@ where
     let mut plan_requested = false;
     // `/warnings` flips this; the transcript only renders the warning rail when it is set.
     let mut show_warnings = true;
-    // In-flight "Add provider" wizard: base URL + API key awaiting a picked model id.
-    let mut pending_add: Option<(String, String)> = None;
+    // In-flight "Add provider" wizard: base URL + API key + Coding flag awaiting a model.
+    let mut pending_add: Option<(String, String, bool, Vec<String>)> = None;
     // Background jobs already reported as finished, so each is announced once.
     let mut announced_jobs: HashSet<String> = HashSet::new();
     // One fixed tool array per Session (prefix-cache stability): computed once from the
@@ -318,7 +473,7 @@ where
             &active.model,
             active.send_session_id,
         )?;
-        let input = if use_tui {
+        let (input, admitted_input) = if use_tui {
             let hub = hub.as_mut().expect("tui implies hub");
             let cmds: Vec<crate::commands::CustomCommand> = command_library.list().to_vec();
             let sks: Vec<crate::skills::Skill> = skill_library.list().to_vec();
@@ -326,10 +481,10 @@ where
             chat_ui.prompt()?;
             // Queued lines typed while the agent ran are consumed first, in order.
             if let Some(queued) = hub.pop_queue() {
-                queued
+                (queued.content, queued.id)
             } else {
                 match hub.next().await {
-                    Some(HubEvent::Line(line)) => line,
+                    Some(HubEvent::Line(line)) => (line, None),
                     Some(HubEvent::Quit) | None => {
                         shutdown(
                             &mut chat_ui,
@@ -376,7 +531,7 @@ where
                     break;
                 }
             };
-            line
+            (line, None)
         };
         let input = input.trim();
 
@@ -411,6 +566,9 @@ where
             let (outcome, ok) = crate::terminal::tool_outcome_parts(&output, started.elapsed());
             chat_ui.tool_call("shell", direct)?;
             chat_ui.tool_finished(&outcome, ok, tool_body(&output))?;
+            if let Some(id) = admitted_input.as_ref() {
+                database.complete_queued_inputs(std::slice::from_ref(id))?;
+            }
             continue;
         }
         // Slash commands are UI operations, not conversation turns — opencode hides them
@@ -458,28 +616,48 @@ where
             if command == "/model" && use_tui {
                 let hub_ref = hub.as_mut().expect("tui implies hub");
                 if argument == "__add__" {
-                    chat_ui
-                        .notice("Add provider — Base URL (Enter = https://api.openai.com/v1):")?;
-                    let base = hub_ref.request_line().await.unwrap_or_default();
-                    let base = base.trim().trim_end_matches('/');
-                    let base = if base.is_empty() {
-                        "https://api.openai.com/v1"
+                    hub_ref.open_dialog(
+                        "Provider Type",
+                        "/model __provider__ ",
+                        vec![
+                            ("orvix".into(), "Orvix Coding".into()),
+                            ("generic".into(), "Other OpenAI-compatible".into()),
+                        ],
+                    );
+                    continue;
+                }
+                if let Some(kind) = argument.strip_prefix("__provider__ ") {
+                    let orvix_coding = kind == "orvix";
+                    let base = if orvix_coding {
+                        crate::config::ORVIX_BASE_URL.to_string()
                     } else {
-                        base
-                    }
-                    .to_string();
-                    chat_ui.notice("API key (input is echoed):")?;
-                    let key = hub_ref.request_line().await.unwrap_or_default();
+                        chat_ui.notice("Base URL (Enter = https://api.openai.com/v1):")?;
+                        let entered = hub_ref.request_line().await.unwrap_or_default();
+                        let entered = entered.trim().trim_end_matches('/');
+                        if entered.is_empty() {
+                            "https://api.openai.com/v1".to_string()
+                        } else {
+                            entered.to_string()
+                        }
+                    };
+                    let key = hub_ref.request_secret().await.unwrap_or_default();
                     let key = key.trim().to_string();
                     if key.is_empty() {
                         chat_ui.notice("Cancelled—empty API key.")?;
                         continue;
                     }
                     chat_ui.notice("Fetching models…")?;
-                    match crate::provider::openai::OpenAIProvider::list_models(&key, &base).await {
+                    let models_path = orvix_coding.then_some(crate::config::ORVIX_MODELS_PATH);
+                    match crate::provider::openai::OpenAIProvider::list_models(
+                        &key,
+                        &base,
+                        models_path,
+                    )
+                    .await
+                    {
                         Ok(models) if !models.is_empty() => {
                             chat_ui.notice(&format!("{} models found— pick one.", models.len()))?;
-                            pending_add = Some((base, key));
+                            pending_add = Some((base, key, orvix_coding, models.clone()));
                             hub_ref.open_dialog(
                                 "Pick Model",
                                 "/model __picked__ ",
@@ -494,30 +672,42 @@ where
                     continue;
                 }
                 if let Some(rest) = argument.strip_prefix("__picked__ ") {
-                    let Some((base, key)) = pending_add.as_ref() else {
+                    let Some((base, key, orvix_coding, models)) = pending_add.as_ref() else {
                         chat_ui.error("No pending provider registration.")?;
                         continue;
                     };
                     let path = crate::config::global_config_path()?;
-                    let name = crate::config::append_profile(&path, base, key, rest)?;
-                    let profile = crate::config::Profile {
-                        name: name.clone(),
-                        model: rest.to_string(),
-                        base_url: base.clone(),
-                        api_key: key.clone(),
-                        context_window: None,
-                        tools: true,
-                        embedding_model: None,
-                        completions_path: None,
-                        send_session_id: false,
+                    let name = if *orvix_coding {
+                        crate::config::save_orvix_onboarding(
+                            path.as_path(),
+                            base,
+                            key,
+                            models,
+                            rest,
+                            false,
+                        )?
+                    } else {
+                        crate::config::append_profile(path.as_path(), base, key, rest, false)?
                     };
+                    let loaded = crate::config::Config::load()?;
+                    let crate::config::Loaded::Ready(reloaded) = loaded else {
+                        anyhow::bail!("configuration became incomplete after adding models");
+                    };
+                    config = reloaded;
+                    let profile = config
+                        .find(&name)
+                        .cloned()
+                        .context("selected profile was missing after adding models")?;
                     active = profile.clone();
                     provider = build_provider(&active);
                     context_window = None;
                     database.set_setting(ACTIVE_PROFILE_KEY, &name)?;
-                    config.profiles.push(profile);
                     pending_add = None;
-                    refresh_model_source(&config, hub_ref);
+                    session_tools = None;
+                    head_messages = None;
+                    memory_dirty = true;
+                    prefix_guard = cache::PrefixGuard::new(active.send_session_id);
+                    refresh_model_source(&config, &active.name, hub_ref);
                     update_sidebar(
                         &mut chat_ui,
                         session.as_ref(),
@@ -616,13 +806,9 @@ where
                     }
                     "details" | "expand" => {
                         show_warnings = true;
-                        chat_ui.set_warning_details(
-                            skill_library
-                                .warnings()
-                                .iter()
-                                .map(|w| w.to_string())
-                                .collect(),
-                        )?;
+                        let mut details = startup_warnings.clone();
+                        details.extend(skill_library.warnings().iter().cloned());
+                        chat_ui.set_warning_details(details)?;
                         chat_ui.set_warnings_expanded(true)?;
                         chat_ui.set_warnings_visible(true)?;
                         chat_ui.notice("Warning details expanded.")?;
@@ -685,8 +871,10 @@ where
                                 now_disabled,
                             ) {
                                 Ok(()) => {
-                                    disabled_skills =
-                                        crate::settings::load_disabled_skills(project.root());
+                                    let report = crate::settings::load_disabled_skills_report(
+                                        project.root(),
+                                    );
+                                    disabled_skills = report.disabled;
                                     // Skill block is part of the frozen head: refresh next turn.
                                     head_messages = None;
                                     head_rebuilt_this_turn = true;
@@ -813,6 +1001,10 @@ where
                 session_tools = None;
                 head_messages = None;
                 memory_dirty = true;
+                prefix_guard = cache::PrefixGuard::new(active.send_session_id);
+                if let Some(hub) = hub.as_ref() {
+                    refresh_model_source(&config, &active.name, hub);
+                }
                 continue;
             }
             if command == "/status" {
@@ -936,6 +1128,13 @@ where
                 };
                 match outcome {
                     Ok(Some((new_summary, new_upto, count))) => {
+                        if let Some(session) = session.as_ref() {
+                            database.set_compaction_checkpoint(
+                                &session.id,
+                                &new_summary,
+                                new_upto,
+                            )?;
+                        }
                         summary = Some(new_summary);
                         summarized_upto = new_upto;
                         chat_ui.notice(&format!(
@@ -1039,13 +1238,117 @@ where
                 chat_ui.notice("Plan Mode requested — next turn will require a plan.")?;
                 continue;
             }
-            if command == "/undo" {
-                match last_turn_snapshot.take() {
-                    Some(snapshot) => {
-                        chat_ui
-                            .notice(&revert_snapshot(&snapshot).summary("from the last turn"))?;
+            if command == "/undo" || command == "/redo" {
+                let Some(active) = session.as_ref() else {
+                    chat_ui.notice(if command == "/undo" {
+                        "Nothing to undo."
+                    } else {
+                        "Nothing to redo."
+                    })?;
+                    continue;
+                };
+                let state = if command == "/undo" { "undo" } else { "redo" };
+                match database.next_edit_snapshot(&active.id, state)? {
+                    Some((id, before, after)) => {
+                        let encoded = if state == "undo" {
+                            Some(before.as_str())
+                        } else {
+                            after.as_deref()
+                        };
+                        let Some(encoded) = encoded else {
+                            chat_ui.notice("This legacy snapshot cannot be redone.")?;
+                            continue;
+                        };
+                        let snapshot = decode_undo_snapshot(Some(encoded))?.unwrap_or_default();
+                        let outcome = revert_snapshot(&snapshot);
+                        if outcome.failed.is_empty() {
+                            database.move_edit_snapshot(
+                                id,
+                                if state == "undo" { "redo" } else { "undo" },
+                            )?;
+                        }
+                        chat_ui.notice(&outcome.summary(if state == "undo" {
+                            "from the previous edit"
+                        } else {
+                            "from the redone edit"
+                        }))?;
                     }
-                    None => chat_ui.notice("Nothing to undo.")?,
+                    None => chat_ui.notice(if state == "undo" {
+                        "Nothing to undo."
+                    } else {
+                        "Nothing to redo."
+                    })?,
+                }
+                continue;
+            }
+            if command == "/audit" {
+                match session.as_ref() {
+                    Some(active) => {
+                        let rows = database.tool_executions(&active.id, 20)?;
+                        let decisions = database.tool_decisions(&active.id, 40)?;
+                        chat_ui.notice(&format_tool_audit(&decisions, &rows))?;
+                    }
+                    None => chat_ui.notice("No active session.")?,
+                }
+                continue;
+            }
+            if command == "/agents" {
+                match session.as_ref() {
+                    Some(active) => chat_ui.notice(&format_child_agents(
+                        &database.child_agent_runs(&active.id, 20)?,
+                    ))?,
+                    None => chat_ui.notice("No active session.")?,
+                }
+                continue;
+            }
+            if command == "/context" {
+                let message_bytes: usize =
+                    messages.iter().map(|message| message.content.len()).sum();
+                let memory_bytes = database.total_memory_bytes()?;
+                let index_chunks = database.chunk_count(&project.key())?;
+                let tools_count = session_tools.as_ref().map(Vec::len).unwrap_or(0);
+                let last_input = session
+                    .as_ref()
+                    .and_then(|active| database.session_stats(&active.id).ok())
+                    .and_then(|stats| stats.last_input_tokens);
+                let pressure = match (last_input, context_window) {
+                    (Some(input), Some(window)) => {
+                        format!(
+                            "{input}/{window} ({:.1}%)",
+                            input as f64 / window as f64 * 100.0
+                        )
+                    }
+                    _ => "unavailable".to_string(),
+                };
+                let cache_epoch = session
+                    .as_ref()
+                    .and_then(|active| database.cache_samples(&active.id).ok())
+                    .map(|samples| cache::epochs(&samples).len().max(1))
+                    .unwrap_or(1);
+                chat_ui.notice(&format!(
+                    "Current context:\nProject: {}\nInstructions: {}\nMessages: {} ({} bytes)\nCompacted through: {} message(s)\nSummary: {} bytes\nMemory: {} bytes\nTools: {}\nSemantic index: {} chunk(s)\nLast context pressure: {}\nCache epoch: {}\nAttachments: request-local, not persisted",
+                    display_path(project.root()),
+                    project.instruction_name().unwrap_or("none"),
+                    messages.len(),
+                    message_bytes,
+                    summarized_upto,
+                    summary.as_deref().map(str::len).unwrap_or(0),
+                    memory_bytes,
+                    tools_count,
+                    index_chunks,
+                    pressure,
+                    cache_epoch,
+                ))?;
+                continue;
+            }
+            if command == "/timeline" {
+                match session.as_ref() {
+                    Some(active) => chat_ui.notice(&format_timeline(
+                        &database.tool_decisions(&active.id, 40)?,
+                        &database.tool_executions(&active.id, 20)?,
+                        &database.child_agent_runs(&active.id, 20)?,
+                    ))?,
+                    None => chat_ui.notice("No active session.")?,
                 }
                 continue;
             }
@@ -1092,7 +1395,7 @@ where
                 chat_ui.leave_intro()?;
             }
             let tui_sink = if use_tui { Some(&mut chat_ui) } else { None };
-            if let Err(error) = handle_command(
+            let command_result = handle_command(
                 &canonical_input,
                 provider.as_ref(),
                 context_window,
@@ -1103,7 +1406,8 @@ where
                 &mut last_turn_snapshot,
                 &config.prices,
                 tui_sink,
-            ) {
+            );
+            if let Err(error) = &command_result {
                 if chat_ui.is_fullscreen() {
                     chat_ui.error(&format!("Command failed: {error:#}"))?;
                 } else {
@@ -1112,6 +1416,11 @@ where
                         ui.style(&format!("Command failed: {error:#}\n"), &[Style::Red])
                     );
                 }
+            }
+            if command_result.is_ok()
+                && let Some(id) = admitted_input.as_ref()
+            {
+                database.complete_queued_inputs(std::slice::from_ref(id))?;
             }
             // Sidebar follows /new //resume: session title, id, and context reset.
             if use_tui {
@@ -1137,6 +1446,26 @@ where
             // Sync Plan Mode with session changes from /new /resume /delete.
             let new_session_id = session.as_ref().map(|s| s.id.clone());
             if prev_session_id != new_session_id {
+                if let Some(hub) = hub.as_ref() {
+                    hub.clear_queue();
+                    match session.as_ref() {
+                        Some(active_session) => {
+                            hub.set_queue_context(
+                                database.path().to_path_buf(),
+                                active_session.id.clone(),
+                            );
+                            for (id, content) in
+                                database.recover_queued_inputs(&active_session.id)?
+                            {
+                                hub.push_queued(QueuedInput {
+                                    id: Some(id),
+                                    content,
+                                });
+                            }
+                        }
+                        None => hub.clear_queue_context(),
+                    }
+                }
                 if let Some(id) = new_session_id {
                     plan_mode = database
                         .get_plan(&id)
@@ -1192,10 +1521,16 @@ where
                     plan_requested = false;
                 }
             }
-            // Compaction state is tied to the current history; reset it if a command replaced it.
+            // Compaction state belongs to the selected session. A resume restores its durable
+            // checkpoint; /new has no selected session and therefore starts empty.
             if messages.len() != messages_before {
-                summary = None;
-                summarized_upto = 0;
+                summary = session
+                    .as_ref()
+                    .and_then(|session| session.compaction_summary.clone());
+                summarized_upto = session
+                    .as_ref()
+                    .map(|session| session.summarized_upto.min(messages.len()))
+                    .unwrap_or(0);
                 // A different conversation gets a different prefix by design, so the first turn
                 // after it is a warm-up, not drift worth reporting.
                 prefix_guard.reset();
@@ -1311,6 +1646,9 @@ where
             };
             match outcome {
                 Ok(Some((new_summary, new_upto, count))) => {
+                    if let Some(session) = session.as_ref() {
+                        database.set_compaction_checkpoint(&session.id, &new_summary, new_upto)?;
+                    }
                     summary = Some(new_summary);
                     summarized_upto = new_upto;
                     chat_ui.notice(&format!(
@@ -1383,6 +1721,23 @@ where
             Message::user_with_images(expanded.text, expanded.images),
         );
 
+        let is_first_exchange = session.is_none();
+        if session.is_none() {
+            session = Some(database.create_session(provider.name(), &active.model)?);
+        }
+        let active_session_id = session
+            .as_ref()
+            .expect("session was created above")
+            .id
+            .clone();
+        if let Some(hub) = hub.as_ref() {
+            hub.set_queue_context(database.path().to_path_buf(), active_session_id.clone());
+        }
+        let mut admitted_inputs: Vec<String> = admitted_input.into_iter().collect();
+        if let Some(id) = admitted_inputs.first() {
+            database.claim_queued_input(id)?;
+        }
+
         // Agent loop: stream a turn, run any tools it requests, and repeat until a plain answer.
         // `tool_trail` collects this turn's intermediate tool-request and tool-result messages so
         // they can be persisted alongside the prompt and final answer.
@@ -1391,6 +1746,8 @@ where
         let mut last_content = String::new();
         let mut tool_trail: Vec<Message> = Vec::new();
         let mut total_tool_calls: usize = 0;
+        let mut recent_tool_batches = Vec::new();
+        let mut exploration_guard = ExplorationGuard::default();
         // Pre-edit snapshot of every file an approved patch_file call touches this turn, so an
         // interrupted multi-file edit can be reverted instead of left half-applied (see
         // `snapshot_patch_target`/`revert_on_cancel`).
@@ -1415,7 +1772,7 @@ where
                     if plan_mode
                         .as_ref()
                         .is_some_and(|state| state.status == PlanStatus::Pending)
-                        && is_plan_approval(&line)
+                        && is_plan_approval(&line.content)
                     {
                         if let Some(state) = plan_mode.as_mut() {
                             state.status = PlanStatus::Approved;
@@ -1446,14 +1803,21 @@ where
                             None,
                             None,
                         );
+                        if let Some(id) = line.id.as_ref() {
+                            database.complete_queued_inputs(std::slice::from_ref(id))?;
+                        }
                         continue;
                     }
-                    if line.trim_start().starts_with('/') {
-                        hub.push_prompt(line);
+                    if line.content.trim_start().starts_with('/') {
+                        hub.push_queued(line);
                         continue;
                     }
-                    chat_ui.user_steering(&line)?;
-                    let message = Message::user(&line);
+                    if let Some(id) = line.id.as_ref() {
+                        database.claim_queued_input(id)?;
+                        admitted_inputs.push(id.clone());
+                    }
+                    chat_ui.user_steering(&line.content)?;
+                    let message = Message::user(&line.content);
                     turn_messages.push(message.clone());
                     tool_trail.push(message);
                 }
@@ -1508,6 +1872,7 @@ where
             };
 
             let mut content = String::new();
+            let mut reasoning = String::new();
             let mut ttft: Option<Duration> = None;
             // Styles the streamed text a line at a time. `content` keeps the raw markdown, since
             // that is what gets persisted and re-sent to the model.
@@ -1541,6 +1906,10 @@ where
                     }
                 };
                 match event {
+                    Some(Ok(StreamEvent::Reasoning(delta))) => {
+                        reasoning.push_str(&delta);
+                        chat_ui.thinking_update(&reasoning)?;
+                    }
                     Some(Ok(StreamEvent::Delta(delta))) => {
                         stop_spinner(&mut spinner, &mut chat_ui).await;
                         if ttft.is_none() {
@@ -1709,6 +2078,17 @@ where
                 break 'agent Message::assistant(content);
             }
 
+            if repeated_tool_batch(&mut recent_tool_batches, &tool_calls) {
+                chat_ui.notice(
+                    "Stopped before repeating the same tool batch a third time. Review the tool error or change the approach.",
+                )?;
+                break 'agent Message::assistant(if content.is_empty() {
+                    "(stopped: repeated the same tool calls three times)".to_string()
+                } else {
+                    content
+                });
+            }
+
             // The model requested tools. Record the request, run each tool, feed the results back.
             let request_message = Message::tool_request(content, tool_calls.clone());
             turn_messages.push(request_message.clone());
@@ -1731,6 +2111,7 @@ where
                         project,
                         &spawn_calls,
                         coding_session_id.clone(),
+                        Some((database, active_session_id.as_str())),
                     ) => output,
                     signal = tokio::signal::ctrl_c() => {
                         signal.context("failed to listen for Ctrl+C")?;
@@ -1739,6 +2120,43 @@ where
                         continue 'chat;
                     }
                 }
+            };
+            let approval_calls: Vec<&ToolCall> = tool_calls
+                .iter()
+                .filter(|call| {
+                    tools.requires_confirmation_for(&call.name, &call.arguments)
+                        && !auto_approve
+                        && !session_permission_matches(&always_allowed, project.root(), call)
+                })
+                .collect();
+            for call in &approval_calls {
+                database.record_tool_decision(
+                    &active_session_id,
+                    &call.id,
+                    &call.name,
+                    "requested",
+                    None,
+                )?;
+            }
+            let batch_decision = if approval_calls.len() > 1 {
+                let body = format_batch_approval(&tools, &approval_calls);
+                let answer = tokio::select! {
+                    answer = read_batch_approval_line(&mut input_rx, use_tui, hub.as_mut(), body) => answer,
+                    () = wait_interrupt(&interrupt) => None,
+                    signal = tokio::signal::ctrl_c() => {
+                        signal.context("failed to listen for Ctrl+C")?;
+                        revert_on_cancel(&mut chat_ui, &turn_snapshot);
+                        chat_ui.notice("interrupted — back to prompt")?;
+                        continue 'chat;
+                    }
+                };
+                match answer.as_deref().map(str::trim) {
+                    Some("y" | "Y" | "yes" | "Yes" | "all") => BatchDecision::ApproveAll,
+                    Some("i" | "I" | "individual") => BatchDecision::Individual,
+                    _ => BatchDecision::RejectAll,
+                }
+            } else {
+                BatchDecision::Individual
             };
             // Plan Mode: auto-enter on first update_plan with ≥3 steps (Q1=B).
             if plan_mode.is_none() {
@@ -1873,7 +2291,11 @@ where
                     .as_ref()
                     .is_some_and(|s| s.status == PlanStatus::Pending)
                     && is_mutating_tool(&call.name);
-                let output = if is_mutating_held {
+                let output = if is_shell_inspection(&call.name, &call.arguments) {
+                    SHELL_INSPECTION_BLOCKED.to_string()
+                } else if exploration_guard.blocks(&call.name) {
+                    EXPLORATION_BLOCKED.to_string()
+                } else if is_mutating_held {
                     "Plan Mode is active — propose a plan with update_plan and wait for approval before mutating tools.".to_string()
                 } else if call.name == tools::ASK_USER_TOOL {
                     tokio::select! {
@@ -1927,39 +2349,27 @@ where
                     dispatch_memory_tool(database, &call.name, &call.arguments)
                 } else if tools.requires_confirmation_for(&call.name, &call.arguments)
                     && !auto_approve
-                    && !always_allowed.contains(&call.name)
+                    && !session_permission_matches(&always_allowed, project.root(), call)
                 {
-                    let preview = tools.preview(call);
-                    if !use_tui {
-                        if let Some(preview) = &preview {
-                            chat_ui.notice(preview)?;
-                        }
-                        chat_ui.notice("approve? [y/N/a]")?;
-                    }
-                    let modal_title = format!("Allow {}?", call.name);
-                    let modal_body =
-                        preview.unwrap_or_else(|| format!("{} {}", call.name, call.arguments));
-                    let answer = tokio::select! {
-                        answer = read_approval_line(&mut input_rx, use_tui, hub.as_mut(), &modal_title, modal_body) => answer,
-                        () = wait_interrupt(&interrupt) => None,
-                        signal = tokio::signal::ctrl_c() => {
-                            signal.context("failed to listen for Ctrl+C")?;
-                            revert_on_cancel(&mut chat_ui, &turn_snapshot);
-                            chat_ui.notice("interrupted — back to prompt")?;
-                            continue 'chat;
-                        }
-                    };
-                    let trimmed = answer.as_deref().map(str::trim);
-                    let always = matches!(trimmed, Some("a" | "A" | "always" | "Always"));
-                    let approved = always || matches!(trimmed, Some("y" | "Y" | "yes" | "Yes"));
-                    if always {
-                        always_allowed.insert(call.name.clone());
-                        chat_ui.notice(&format!(
-                            "always allowing {} for the rest of this session — /new clears this",
-                            call.name
-                        ))?;
-                    }
-                    if approved {
+                    if batch_decision == BatchDecision::RejectAll {
+                        database.record_tool_decision(
+                            &active_session_id,
+                            &call.id,
+                            &call.name,
+                            "rejected",
+                            None,
+                        )?;
+                        chat_ui.notice("skipped by batch decision")?;
+                        "The user declined this tool call as part of the reviewed batch."
+                            .to_string()
+                    } else if batch_decision == BatchDecision::ApproveAll {
+                        database.record_tool_decision(
+                            &active_session_id,
+                            &call.id,
+                            &call.name,
+                            "approved",
+                            None,
+                        )?;
                         if call.name == tools::PATCH_FILE_TOOL {
                             snapshot_patch_target(
                                 project.root(),
@@ -1967,18 +2377,92 @@ where
                                 &mut turn_snapshot,
                             );
                         }
-                        tokio::select! {
-                            output = tools.dispatch(call) => output,
+                        dispatch_with_journal(
+                            &tools,
+                            call,
+                            database,
+                            &mut session,
+                            provider.name(),
+                            &active.model,
+                        )
+                        .await?
+                    } else {
+                        let preview = tools.preview(call);
+                        if !use_tui {
+                            if let Some(preview) = &preview {
+                                chat_ui.notice(preview)?;
+                            }
+                            chat_ui.notice("approve? [y/N/a]")?;
+                        }
+                        let modal_title = format!("Allow {}?", call.name);
+                        let modal_body =
+                            preview.unwrap_or_else(|| format!("{} {}", call.name, call.arguments));
+                        let answer = tokio::select! {
+                            answer = read_approval_line(&mut input_rx, use_tui, hub.as_mut(), &modal_title, modal_body) => answer,
+                            () = wait_interrupt(&interrupt) => None,
                             signal = tokio::signal::ctrl_c() => {
                                 signal.context("failed to listen for Ctrl+C")?;
                                 revert_on_cancel(&mut chat_ui, &turn_snapshot);
                                 chat_ui.notice("interrupted — back to prompt")?;
                                 continue 'chat;
                             }
+                        };
+                        let trimmed = answer.as_deref().map(str::trim);
+                        let always = matches!(trimmed, Some("a" | "A" | "always" | "Always"));
+                        let approved = always || matches!(trimmed, Some("y" | "Y" | "yes" | "Yes"));
+                        if always {
+                            let scope = session_permission_scope(project.root(), call);
+                            always_allowed.insert(scope.clone());
+                            database.record_tool_decision(
+                                &active_session_id,
+                                &call.id,
+                                &call.name,
+                                "approved",
+                                Some(&scope),
+                            )?;
+                            chat_ui.notice(&format!(
+                            "always allowing {scope} for the rest of this session — /new clears this"
+                        ))?;
                         }
-                    } else {
-                        chat_ui.notice("skipped")?;
-                        "The user declined to run this command.".to_string()
+                        if approved {
+                            if !always {
+                                database.record_tool_decision(
+                                    &active_session_id,
+                                    &call.id,
+                                    &call.name,
+                                    "approved",
+                                    None,
+                                )?;
+                            }
+                            if call.name == tools::PATCH_FILE_TOOL {
+                                snapshot_patch_target(
+                                    project.root(),
+                                    &call.arguments,
+                                    &mut turn_snapshot,
+                                );
+                            }
+                            tokio::select! {
+                                output = dispatch_with_journal(
+                                    &tools, call, database, &mut session, provider.name(), &active.model,
+                                ) => output?,
+                                signal = tokio::signal::ctrl_c() => {
+                                    signal.context("failed to listen for Ctrl+C")?;
+                                    revert_on_cancel(&mut chat_ui, &turn_snapshot);
+                                    chat_ui.notice("interrupted — back to prompt")?;
+                                    continue 'chat;
+                                }
+                            }
+                        } else {
+                            database.record_tool_decision(
+                                &active_session_id,
+                                &call.id,
+                                &call.name,
+                                "rejected",
+                                None,
+                            )?;
+                            chat_ui.notice("skipped")?;
+                            "The user declined to run this command.".to_string()
+                        }
                     }
                 } else {
                     // Reached because the tool never needs confirmation, --auto-approve overrode
@@ -1989,7 +2473,9 @@ where
                         snapshot_patch_target(project.root(), &call.arguments, &mut turn_snapshot);
                     }
                     tokio::select! {
-                        output = tools.dispatch(call) => output,
+                        output = dispatch_with_journal(
+                            &tools, call, database, &mut session, provider.name(), &active.model,
+                        ) => output?,
                         signal = tokio::signal::ctrl_c() => {
                             signal.context("failed to listen for Ctrl+C")?;
                             revert_on_cancel(&mut chat_ui, &turn_snapshot);
@@ -2012,6 +2498,7 @@ where
                 let result_message = Message::tool_result(&call.id, output.clone());
                 turn_messages.push(result_message.clone());
                 tool_trail.push(result_message);
+                exploration_guard.observe(&call.name, &output);
                 // Defer vision attachments until every tool result in this batch is
                 // on the wire. A `user` message mid-batch breaks OpenAI's rule that
                 // every tool_call_id must be answered contiguously after the
@@ -2033,6 +2520,12 @@ where
                 turn_messages.push(visual.clone());
                 tool_trail.push(visual);
             }
+            if let Some(warning) = exploration_guard.warning() {
+                chat_ui.notice(
+                    "exploration drift detected; steering the agent toward implementation",
+                )?;
+                turn_messages.push(Message::system(warning));
+            }
         };
 
         // The turn completed normally (not cancelled): keep its file snapshot around for /undo.
@@ -2045,18 +2538,30 @@ where
         turn_record.append(&mut tool_trail);
         turn_record.push(assistant_message);
 
-        let is_first_exchange = session.is_none();
         let active_session = match session.as_mut() {
             Some(session) => session,
             None => session.insert(database.create_session(provider.name(), &active.model)?),
         };
-        database.save_turn(
+        let undo_snapshot = encode_undo_snapshot(last_turn_snapshot.as_ref())?;
+        let redo_snapshot = last_turn_snapshot
+            .as_ref()
+            .map(snapshot_current_files)
+            .transpose()?
+            .as_ref()
+            .map(|snapshot| encode_undo_snapshot(Some(snapshot)))
+            .transpose()?
+            .flatten();
+        database.save_turn_with_undo(
             &active_session.id,
             &turn_record,
             &final_usage,
             &active.model,
             &final_finish,
+            undo_snapshot.as_deref(),
+            redo_snapshot.as_deref(),
+            &admitted_inputs,
         )?;
+        chat_ui.copy_answer(&final_answer)?;
         // Persist plan state after save (session now exists). Approved clears pending.
         if let Some(state) = plan_mode.as_ref() {
             match state.status {
@@ -2201,7 +2706,7 @@ where
         .cloned()
         .unwrap_or_else(|| config.default().clone());
     let provider = build_provider(&active);
-    let session = if active.send_session_id {
+    let mut session = if active.send_session_id {
         Some(database.create_session(provider.name(), &active.model)?)
     } else {
         None
@@ -2214,7 +2719,11 @@ where
     for warning in skill_library.warnings() {
         eprintln!("warning: {warning}");
     }
-    let disabled_skills = crate::settings::load_disabled_skills(project.root());
+    let settings_report = crate::settings::load_disabled_skills_report(project.root());
+    for warning in &settings_report.warnings {
+        eprintln!("warning: {warning}");
+    }
+    let disabled_skills = settings_report.disabled;
     let expanded_command = command_library.expand(prompt);
     let expanded_skill = if expanded_command.is_none() {
         skill_library.expand_filtered(prompt, &disabled_skills)
@@ -2256,6 +2765,8 @@ where
 
     let user_message = Message::user(prompt);
     let mut tool_trail: Vec<Message> = Vec::new();
+    let mut recent_tool_batches = Vec::new();
+    let mut exploration_guard = ExplorationGuard::default();
     // Files `patch_file` targeted this turn, so the code index can be refreshed once at the end.
     // Interactive chat reads the same set out of its revert snapshot, which `-p` has no use for.
     let mut edited: Vec<PathBuf> = Vec::new();
@@ -2284,6 +2795,18 @@ where
             );
         }
 
+        if repeated_tool_batch(&mut recent_tool_batches, &response.tool_calls) {
+            break (
+                Message::assistant(if response.content.is_empty() {
+                    "(stopped: repeated the same tool calls three times)".to_string()
+                } else {
+                    response.content
+                }),
+                response.usage,
+                "repeated_tool_calls".to_string(),
+            );
+        }
+
         let request_message = Message::tool_request(response.content, response.tool_calls.clone());
         turn_messages.push(request_message.clone());
         tool_trail.push(request_message);
@@ -2292,12 +2815,18 @@ where
             .iter()
             .filter(|call| call.name == tools::SPAWN_AGENT_TOOL)
             .collect();
+        if !spawn_calls.is_empty() && session.is_none() {
+            session = Some(database.create_session(provider.name(), &active.model)?);
+        }
         let spawned_outputs = dispatch_spawn_agents(
             provider.as_ref(),
             &active.model,
             project,
             &spawn_calls,
             coding_session_id.clone(),
+            session
+                .as_ref()
+                .map(|parent| (database, parent.id.as_str())),
         )
         .await;
         let mut pending_visuals = Vec::new();
@@ -2317,7 +2846,11 @@ where
                     render::render_tool_call(&call.name, &call.arguments, ui)
                 );
             }
-            let output = if call.name == tools::ASK_USER_TOOL {
+            let output = if is_shell_inspection(&call.name, &call.arguments) {
+                SHELL_INSPECTION_BLOCKED.to_string()
+            } else if exploration_guard.blocks(&call.name) {
+                EXPLORATION_BLOCKED.to_string()
+            } else if call.name == tools::ASK_USER_TOOL {
                 println!("    skipped: ask_user is not available in non-interactive mode");
                 "There is no user to ask in non-interactive mode. Proceed using your best \
                  judgment, or state your assumption in the final answer."
@@ -2374,6 +2907,7 @@ where
             let result_message = Message::tool_result(&call.id, output.clone());
             turn_messages.push(result_message.clone());
             tool_trail.push(result_message);
+            exploration_guard.observe(&call.name, &output);
             // Defer vision attachments until every tool result in this batch is
             // on the wire. A `user` message mid-batch breaks OpenAI's rule that
             // every tool_call_id must be answered contiguously after the
@@ -2394,6 +2928,10 @@ where
         for visual in pending_visuals {
             turn_messages.push(visual.clone());
             tool_trail.push(visual);
+        }
+        if let Some(warning) = exploration_guard.warning() {
+            eprintln!("(exploration drift detected; steering the agent toward implementation)");
+            turn_messages.push(Message::system(warning));
         }
     };
 
@@ -2635,7 +3173,16 @@ fn handle_command(
                 );
             }
             *messages = database.load_messages(&resumed.id)?;
+            *last_turn_snapshot = None;
             out!("Resumed: {} ({})\n", resumed.title, short_id(&resumed.id));
+            let interrupted = database.interrupted_tool_executions(&resumed.id)?;
+            if !interrupted.is_empty() {
+                out!(
+                    "Warning: {} tool execution(s) were interrupted: {}. Their side effects are unknown; Kamui will not retry them automatically.\n",
+                    interrupted.len(),
+                    interrupted.join(", ")
+                );
+            }
             // Note: Plan Mode restore is handled by the main loop's plan_mode state;
             // /resume via handle_command is not the startup resume path, so we don't
             // rehydrate here — the caller would need &mut plan_mode.
@@ -2912,7 +3459,7 @@ fn print_stats(
     // them for good -- so this counts turns, and it only appears for a provider that actually
     // returns cached tokens.
     let samples = database.cache_samples(&session.id)?;
-    if samples.iter().any(|(_, cached)| *cached > 0)
+    if samples.len() > 1
         && let Some(cache) = cache::report(&samples)
     {
         let _ = writeln!(
@@ -2920,6 +3467,23 @@ fn print_stats(
             "Prompt cache:  median {:.0}% over {} turns | \u{2265}90%: {:.0}% | \u{2265}95%: {:.0}% | warm-up: {}",
             cache.median, cache.measured, cache.pct_ge_90, cache.pct_ge_95, cache.warmup
         );
+    }
+    let epochs = cache::epochs(&samples);
+    if epochs.len() > 1 {
+        let current = epochs.last().expect("non-empty epoch list");
+        let _ = write!(
+            out,
+            "Cache epochs:  {} observed | current #{}: {} turn(s)",
+            epochs.len(),
+            epochs.len(),
+            current.len()
+        );
+        if let Some(report) = cache::report(current) {
+            let _ = write!(out, " | median {:.0}%", report.median);
+        } else {
+            let _ = write!(out, " | warming");
+        }
+        let _ = writeln!(out);
     }
     if let (Some(last_input), Some(window)) = (stats.last_input_tokens, context_window) {
         // Buffered like every other line. `print!` here sent the report's most useful line to
@@ -3227,6 +3791,227 @@ fn snapshot_patch_target(
     }
 }
 
+fn session_permission_scope(root: &Path, call: &crate::provider::ToolCall) -> String {
+    if call.name == "run_command"
+        && let Ok(value) = serde_json::from_str::<serde_json::Value>(&call.arguments)
+        && let Some(command) = value.get("command").and_then(|value| value.as_str())
+    {
+        return format!("run_command:{}", command.trim());
+    }
+    if call.name == tools::PATCH_FILE_TOOL
+        && let Some(path) = tools::patch_target(root, &call.arguments)
+    {
+        return format!("patch_file:{}", path.display());
+    }
+    format!("tool:{}", call.name)
+}
+
+fn session_permission_matches(
+    grants: &HashSet<String>,
+    root: &Path,
+    call: &crate::provider::ToolCall,
+) -> bool {
+    grants.contains(&session_permission_scope(root, call))
+}
+
+fn report_interrupted_tools(
+    chat_ui: &mut ChatUi,
+    database: &Database,
+    session_id: &str,
+) -> Result<()> {
+    let interrupted = database.interrupted_tool_executions(session_id)?;
+    if !interrupted.is_empty() {
+        chat_ui.warning(&format!(
+            "{} tool execution(s) were interrupted: {}. Their side effects are unknown; Kamui will not retry them automatically.",
+            interrupted.len(),
+            interrupted.join(", ")
+        ))?;
+    }
+    Ok(())
+}
+
+fn format_tool_audit(
+    decisions: &[storage::ToolDecision],
+    rows: &[storage::ToolExecution],
+) -> String {
+    if rows.is_empty() && decisions.is_empty() {
+        return "No mutating tool executions recorded for this session.".to_string();
+    }
+    let mut output = String::new();
+    if !decisions.is_empty() {
+        output.push_str("Recent approval decisions:\n");
+        for decision in decisions {
+            let scope = decision
+                .scope
+                .as_deref()
+                .map(|scope| format!(" | scope: {}", audit_preview(scope, 120)))
+                .unwrap_or_default();
+            let _ = writeln!(
+                output,
+                "{} | {} | {}{}",
+                decision.created_at, decision.decision, decision.tool_name, scope
+            );
+        }
+    }
+    if !rows.is_empty() {
+        if !output.is_empty() {
+            output.push('\n');
+        }
+        output.push_str("Recent mutating tool executions:\n");
+    }
+    for row in rows {
+        let arguments = audit_preview(&row.arguments, 120);
+        let result = row
+            .output
+            .as_deref()
+            .map(|value| audit_preview(value, 120))
+            .unwrap_or_else(|| "-".to_string());
+        let _ = writeln!(
+            output,
+            "{} | {} | {} | args: {} | result: {}",
+            row.started_at, row.status, row.tool_name, arguments, result
+        );
+    }
+    output.trim_end().to_string()
+}
+
+fn audit_preview(value: &str, limit: usize) -> String {
+    let single_line = value.replace('\n', " ");
+    let mut preview: String = single_line.chars().take(limit).collect();
+    if single_line.chars().count() > limit {
+        preview.push_str("...");
+    }
+    preview
+}
+
+fn format_child_agents(rows: &[storage::ChildAgentRun]) -> String {
+    if rows.is_empty() {
+        return "No child-agent runs recorded for this session.".to_string();
+    }
+    let mut output = String::from("Recent child-agent runs:\n");
+    for row in rows {
+        let result = row
+            .result
+            .as_deref()
+            .map(|value| audit_preview(value, 120))
+            .unwrap_or_else(|| "-".to_string());
+        let _ = writeln!(
+            output,
+            "{} | {} | task: {} | result: {}",
+            &row.id[..8.min(row.id.len())],
+            row.status,
+            audit_preview(&row.prompt, 120),
+            result
+        );
+    }
+    output.trim_end().to_string()
+}
+
+fn format_timeline(
+    decisions: &[storage::ToolDecision],
+    executions: &[storage::ToolExecution],
+    agents: &[storage::ChildAgentRun],
+) -> String {
+    let mut events: Vec<(i64, String)> = decisions
+        .iter()
+        .map(|event| {
+            (
+                event.created_at,
+                format!("decision | {} {}", event.decision, event.tool_name),
+            )
+        })
+        .chain(executions.iter().map(|event| {
+            (
+                event.started_at,
+                format!("tool | {} {}", event.status, event.tool_name),
+            )
+        }))
+        .chain(agents.iter().map(|event| {
+            (
+                event.created_at,
+                format!(
+                    "agent | {} {}",
+                    event.status,
+                    audit_preview(&event.prompt, 100)
+                ),
+            )
+        }))
+        .collect();
+    events.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    events.truncate(40);
+    if events.is_empty() {
+        return "No timeline events recorded for this session.".to_string();
+    }
+    let mut output = String::from("Recent session activity:\n");
+    for (timestamp, event) in events {
+        let _ = writeln!(output, "{timestamp} | {event}");
+    }
+    output.trim_end().to_string()
+}
+
+async fn dispatch_with_journal(
+    tools: &ToolRegistry,
+    call: &crate::provider::ToolCall,
+    database: &Database,
+    session: &mut Option<Session>,
+    provider: &str,
+    model: &str,
+) -> Result<String> {
+    let journal = call.name == "run_command"
+        || call.name == tools::PATCH_FILE_TOOL
+        || tools.requires_confirmation_for(&call.name, &call.arguments);
+    if !journal {
+        return Ok(tools.dispatch(call).await);
+    }
+    let active = match session.as_ref() {
+        Some(active) => active,
+        None => session.insert(database.create_session(provider, model)?),
+    };
+    let execution =
+        database.start_tool_execution(&active.id, &call.id, &call.name, &call.arguments)?;
+    let output = tools.dispatch(call).await;
+    database.finish_tool_execution(&execution, &output)?;
+    Ok(output)
+}
+
+fn encode_undo_snapshot(
+    snapshot: Option<&HashMap<PathBuf, Option<String>>>,
+) -> Result<Option<String>> {
+    snapshot
+        .filter(|snapshot| !snapshot.is_empty())
+        .map(|snapshot| {
+            let entries: Vec<(&PathBuf, &Option<String>)> = snapshot.iter().collect();
+            serde_json::to_string(&entries).context("failed to serialize undo snapshot")
+        })
+        .transpose()
+}
+
+fn decode_undo_snapshot(value: Option<&str>) -> Result<Option<HashMap<PathBuf, Option<String>>>> {
+    value
+        .map(|value| {
+            serde_json::from_str::<Vec<(PathBuf, Option<String>)>>(value)
+                .map(|entries| entries.into_iter().collect())
+                .context("failed to parse stored undo snapshot")
+        })
+        .transpose()
+}
+
+fn snapshot_current_files(
+    before: &HashMap<PathBuf, Option<String>>,
+) -> Result<HashMap<PathBuf, Option<String>>> {
+    before
+        .keys()
+        .map(|path| {
+            let content = match std::fs::read_to_string(path) {
+                Ok(content) => Some(content),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error.into()),
+            };
+            Ok((path.clone(), content))
+        })
+        .collect()
+}
+
 /// Revert every file in a turn's patch snapshot back to its pre-turn state: restore the original
 /// content, or delete a file that did not exist before the turn. Best-effort — a failure on one
 /// file is reported but does not stop the rest from being reverted. Returns how many files were
@@ -3367,14 +4152,34 @@ fn print_history_preview(messages: &[Message]) {
 /// figure tracks the live conversation.
 /// Model-picker entries: every configured profile plus the registry entry that opens the
 /// add-provider wizard (onboarding reused as an in-TUI model registry).
-fn model_dialog_items(config: &Config) -> Vec<(String, String)> {
+fn model_dialog_items(config: &Config, active_name: &str) -> Vec<(String, String)> {
     let mut items: Vec<(String, String)> = config
         .profiles
         .iter()
         .map(|profile| {
+            let mut capabilities = Vec::new();
+            if !profile.tools {
+                capabilities.push("tools off".to_string());
+            }
+            if profile.send_session_id {
+                capabilities.push("Coding/sticky".to_string());
+            }
+            if let Some(window) = profile.context_window {
+                capabilities.push(format!("{}k context", window / 1_000));
+            }
+            let active = if profile.name == active_name {
+                "● "
+            } else {
+                "  "
+            };
+            let metadata = if capabilities.is_empty() {
+                String::new()
+            } else {
+                format!(" · {}", capabilities.join(" · "))
+            };
             (
                 profile.name.clone(),
-                format!("{} · {}", profile.name, profile.model),
+                format!("{active}{} · {}{metadata}", profile.name, profile.model),
             )
         })
         .collect();
@@ -3386,8 +4191,8 @@ fn model_dialog_items(config: &Config) -> Vec<(String, String)> {
 }
 
 /// Refreshes the picker source from the live config (after adds/switches).
-fn refresh_model_source(config: &Config, hub: &InputHub) {
-    hub.set_models(model_dialog_items(config));
+fn refresh_model_source(config: &Config, active_name: &str, hub: &InputHub) {
+    hub.set_models(model_dialog_items(config, active_name));
 }
 /// Pushes recent sessions into the Ctrl+S switcher (id -> title labels).
 fn refresh_session_source(database: &Database, hub: &InputHub) {
@@ -3396,7 +4201,20 @@ fn refresh_session_source(database: &Database, hub: &InputHub) {
             sessions
                 .into_iter()
                 .take(15)
-                .map(|session| (session.id.clone(), session.title))
+                .map(|session| {
+                    let tokens = if session.total_tokens >= 1_000 {
+                        format!("{:.1}k tok", session.total_tokens as f64 / 1_000.0)
+                    } else {
+                        format!("{} tok", session.total_tokens)
+                    };
+                    (
+                        session.id.clone(),
+                        format!(
+                            "{} · {} msgs · {tokens}",
+                            session.title, session.message_count
+                        ),
+                    )
+                })
                 .collect(),
         );
     }
@@ -3484,14 +4302,52 @@ fn tools_disabled_note(active: &Profile) -> Option<String> {
 }
 
 fn mcp_sidebar_value(statuses: &[ConnectionStatus]) -> String {
-    statuses
+    if statuses.is_empty() {
+        return String::new();
+    }
+    let connected = statuses
         .iter()
-        .map(|server| match &server.error {
-            Some(_) => format!("- {}\n  unavailable", server.name),
-            None => format!("- {}\n  {} tool(s)", server.name, server.tool_count),
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+        .filter(|server| server.error.is_none() && !server.disabled)
+        .count();
+    let tools: usize = statuses.iter().map(|server| server.tool_count).sum();
+    let mut lines = vec![
+        format!("status\t{connected}/{} connected", statuses.len()),
+        format!("tools\t{} available", compact_count(tools as u64)),
+    ];
+    lines.extend(statuses.iter().map(|server| {
+        if server.disabled {
+            return format!("{}\tdisabled", server.name);
+        }
+        match &server.error {
+            Some(_) => format!("{}\tunavailable", server.name),
+            None => format!(
+                "{}\t{} tools{}",
+                server.name,
+                server.tool_count,
+                if server.trusted { " · trusted" } else { "" }
+            ),
+        }
+    }));
+    lines.join("\n")
+}
+
+fn compact_count(value: u64) -> String {
+    let (divisor, suffix) = if value >= 1_000_000_000 {
+        (1_000_000_000.0, "B")
+    } else if value >= 1_000_000 {
+        (1_000_000.0, "M")
+    } else if value >= 1_000 {
+        (1_000.0, "K")
+    } else {
+        return value.to_string();
+    };
+    let scaled = value as f64 / divisor;
+    if scaled >= 100.0 {
+        format!("{scaled:.0}{suffix}")
+    } else {
+        let rounded = (scaled * 10.0 + f64::EPSILON).round() / 10.0;
+        format!("{rounded:.1}{suffix}")
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3538,18 +4394,20 @@ fn update_sidebar(
         runtime.push_str(&format!("\ngit\t{}{dirty}", git.branch));
     }
     runtime.push_str(&format!("\nproject\t{}", display_path(project.root())));
-    if !mcp.is_empty() {
-        runtime.push_str(&format!("\nmcp\t{mcp}"));
-    }
     entries_push(&mut entries, "Runtime", runtime);
+    if !mcp.is_empty() {
+        entries_push(&mut entries, "MCP", mcp.to_string());
+    }
     let mut context_line = match (last_input_tokens, context_window) {
         (Some(tokens), Some(window)) => {
             format!(
-                "{tokens} tokens ({:.1}% of {window})",
-                tokens as f64 / window as f64 * 100.0
+                "{} tokens ({:.1}% of {})",
+                compact_count(tokens),
+                tokens as f64 / window as f64 * 100.0,
+                compact_count(window)
             )
         }
-        (Some(tokens), None) => format!("{tokens} tokens"),
+        (Some(tokens), None) => format!("{} tokens", compact_count(tokens)),
         (None, _) => "\u{2014}".to_string(),
     };
     if let (Some(tokens), Some(window)) = (last_input_tokens, context_window)
@@ -3561,7 +4419,7 @@ fn update_sidebar(
     match (last_input_tokens, last_cached_tokens) {
         (Some(tokens), Some(cached)) if cached > 0 && tokens > 0 => {
             let hit = (cached as f64 / tokens as f64 * 100.0).min(100.0);
-            context_line.push_str(&format!("\ncache\t{cached} ({hit:.0}%)"));
+            context_line.push_str(&format!("\ncache\t{} · {hit:.0}%", compact_count(cached)));
         }
         (Some(_), Some(0)) if cache_pinned => {
             context_line.push_str("\ncache\t0 (warm-up)");
@@ -3609,9 +4467,16 @@ fn update_sidebar(
 /// Session median cache line for the Context rail, or `None` until there are measured turns.
 fn session_cache_line(database: &Database, session_id: &str) -> Option<String> {
     let samples = database.cache_samples(session_id).ok()?;
-    let report = cache::report(&samples)?;
+    let epochs = cache::epochs(&samples);
+    let current = epochs.last().copied().unwrap_or(&samples);
+    let report = cache::report(current)?;
+    let epoch = if epochs.len() > 1 {
+        format!("e{} · ", epochs.len())
+    } else {
+        String::new()
+    };
     Some(format!(
-        "median {:.0}% · {} turns · \u{2265}90% {:.0}%",
+        "{epoch}median {:.0}% · {} turns · \u{2265}90% {:.0}%",
         report.median, report.measured, report.pct_ge_90
     ))
 }
@@ -3900,6 +4765,53 @@ async fn read_approval_line(
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BatchDecision {
+    ApproveAll,
+    RejectAll,
+    Individual,
+}
+
+fn format_batch_approval(tools: &ToolRegistry, calls: &[&ToolCall]) -> String {
+    calls
+        .iter()
+        .enumerate()
+        .map(|(index, call)| {
+            let detail = tools
+                .preview(call)
+                .unwrap_or_else(|| audit_preview(&call.arguments, 100));
+            format!("{}. {}\n{}", index + 1, call.name, detail)
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+async fn read_batch_approval_line(
+    input_rx: &mut Option<mpsc::UnboundedReceiver<String>>,
+    use_tui: bool,
+    hub: Option<&mut InputHub>,
+    body: String,
+) -> Option<String> {
+    if use_tui {
+        let hub = hub.expect("tui implies hub");
+        hub.open_permission_modal_with_options(
+            "Review tool batch",
+            body,
+            vec![
+                ("y", "Allow all"),
+                ("i", "Review individually"),
+                ("n", "Reject all"),
+            ],
+        );
+        let answer = hub.request_line().await;
+        hub.close_permission_modal();
+        answer
+    } else {
+        println!("{body}\napprove all? [y/N/i]");
+        input_rx.as_mut().unwrap().recv().await
+    }
+}
+
 async fn read_plan_approval_line(
     input_rx: &mut Option<mpsc::UnboundedReceiver<String>>,
     use_tui: bool,
@@ -3993,21 +4905,29 @@ async fn dispatch_spawn_agents(
     project: &ProjectContext,
     calls: &[&ToolCall],
     session_id: Option<String>,
+    persistence: Option<(&Database, &str)>,
 ) -> HashMap<String, (String, Duration)> {
     let mut outputs = HashMap::with_capacity(calls.len());
     for batch in calls.chunks(MAX_CONCURRENT_SUB_AGENTS) {
         let futures = batch.iter().map(|call| {
             let session_id = cache::sub_agent_session_id(session_id.as_deref(), &call.id);
+            let child_id = persistence.and_then(|(database, parent_id)| {
+                let prompt = serde_json::from_str::<SpawnAgentArguments>(&call.arguments)
+                    .ok()?
+                    .prompt;
+                database
+                    .start_child_agent(parent_id, &call.id, &prompt)
+                    .ok()
+            });
             async move {
                 let started = Instant::now();
-                (
-                    call.id.clone(),
-                    (
-                        dispatch_spawn_agent(provider, model, project, &call.arguments, session_id)
-                            .await,
-                        started.elapsed(),
-                    ),
-                )
+                let output =
+                    dispatch_spawn_agent(provider, model, project, &call.arguments, session_id)
+                        .await;
+                if let (Some((database, _)), Some(child_id)) = (persistence, child_id.as_deref()) {
+                    let _ = database.finish_child_agent(child_id, &output);
+                }
+                (call.id.clone(), (output, started.elapsed()))
             }
         });
         outputs.extend(join_all(futures).await);
@@ -4746,6 +5666,14 @@ pub(crate) fn print_help(out: &mut String) {
         out,
         "/undo             Revert the files patched by the last turn"
     );
+    let _ = writeln!(out, "/redo             Reapply the last undone file edits");
+    let _ = writeln!(
+        out,
+        "/audit            Show recent mutating tool executions"
+    );
+    let _ = writeln!(out, "/agents           Show recent child-agent runs");
+    let _ = writeln!(out, "/context          Inspect current reusable context");
+    let _ = writeln!(out, "/timeline         Show session activity timeline");
     let _ = writeln!(
         out,
         "/jobs             List session and persistent scheduled jobs"
@@ -5142,6 +6070,143 @@ fn git_status(root: &Path) -> Option<GitStatus> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repeated_tool_batches_ignore_ids_and_normalize_json() {
+        let batch = |id: &str, arguments: &str| {
+            vec![ToolCall {
+                id: id.to_string(),
+                name: "read_file".to_string(),
+                arguments: arguments.to_string(),
+            }]
+        };
+        let mut recent = Vec::new();
+        assert!(!repeated_tool_batch(
+            &mut recent,
+            &batch("one", r#"{"path":"src/main.rs"}"#)
+        ));
+        assert!(!repeated_tool_batch(
+            &mut recent,
+            &batch("two", r#"{ "path": "src/main.rs" }"#)
+        ));
+        assert!(repeated_tool_batch(
+            &mut recent,
+            &batch("three", r#"{"path":"src/main.rs"}"#)
+        ));
+    }
+
+    #[test]
+    fn changing_a_tool_batch_resets_the_repeat_guard() {
+        let call = |path: &str| {
+            vec![ToolCall {
+                id: path.to_string(),
+                name: "read_file".to_string(),
+                arguments: format!(r#"{{"path":"{path}"}}"#),
+            }]
+        };
+        let mut recent = Vec::new();
+        assert!(!repeated_tool_batch(&mut recent, &call("a")));
+        assert!(!repeated_tool_batch(&mut recent, &call("a")));
+        assert!(!repeated_tool_batch(&mut recent, &call("b")));
+        assert!(!repeated_tool_batch(&mut recent, &call("b")));
+        assert!(repeated_tool_batch(&mut recent, &call("b")));
+    }
+
+    #[test]
+    fn exploration_guard_warns_once_then_escalates() {
+        let mut guard = ExplorationGuard::default();
+        for _ in 0..EXPLORATION_WARNING_CALLS {
+            guard.observe("read_file", "small");
+        }
+        assert!(guard.warning().unwrap().contains("substantial context"));
+        assert!(guard.warning().is_none());
+
+        for _ in EXPLORATION_WARNING_CALLS..EXPLORATION_FINAL_CALLS {
+            guard.observe("grep", "small");
+        }
+        assert!(guard.warning().unwrap().contains("budget is exhausted"));
+        assert!(guard.warning().is_none());
+    }
+
+    #[test]
+    fn exploration_guard_counts_bytes_and_ignores_non_inspection_tools() {
+        let mut guard = ExplorationGuard::default();
+        guard.observe("update_plan", &"x".repeat(EXPLORATION_WARNING_BYTES));
+        assert!(guard.warning().is_none());
+        guard.observe("read_file", &"x".repeat(EXPLORATION_WARNING_BYTES));
+        assert!(guard.warning().is_some());
+    }
+
+    #[test]
+    fn first_successful_patch_grants_only_two_more_reads() {
+        let mut guard = ExplorationGuard::default();
+        for _ in 0..EXPLORATION_WARNING_CALLS {
+            guard.observe("glob", "result");
+        }
+        guard.observe("patch_file", "Error: no exact match");
+        assert!(guard.warning().is_some());
+
+        guard.observe("patch_file", "patched src/main.rs");
+        assert!(!guard.blocks("read_file"));
+        assert_eq!(guard.calls, EXPLORATION_WARNING_CALLS);
+        assert!(guard.patched);
+        for _ in EXPLORATION_WARNING_CALLS..EXPLORATION_POST_PATCH_CALLS {
+            guard.observe("read_file", "result");
+        }
+        assert!(guard.warning().unwrap().contains("budget is exhausted"));
+        assert!(guard.blocks("read_file"));
+
+        guard.observe("patch_file", "patched another file");
+        assert!(guard.blocks("read_file"));
+    }
+
+    #[test]
+    fn exploration_guard_hard_blocks_reads_until_a_patch_succeeds() {
+        let mut guard = ExplorationGuard::default();
+        for _ in 0..EXPLORATION_FINAL_CALLS {
+            guard.observe("read_file", "result");
+        }
+        assert!(guard.warning().unwrap().contains("budget is exhausted"));
+        assert!(guard.blocks("read_file"));
+        assert!(guard.blocks("grep"));
+        assert!(!guard.blocks("patch_file"));
+        assert!(!guard.blocks("run_command"));
+
+        guard.observe("patch_file", "patched file");
+        assert!(!guard.blocks("read_file"));
+        guard.observe("read_file", "result");
+        guard.observe("read_file", "result");
+        assert!(guard.warning().is_some());
+        assert!(guard.blocks("read_file"));
+    }
+
+    #[test]
+    fn shell_repository_inspection_is_blocked_without_blocking_verification() {
+        assert!(is_shell_inspection(
+            "run_command",
+            r#"{"command":"python3 - <<'PY'\nfrom pathlib import Path\nprint(Path('src/main.rs').read_text())\nPY"}"#
+        ));
+        assert!(is_shell_inspection(
+            "run_command",
+            r#"{"command":"rg 'handler' src"}"#
+        ));
+        assert!(is_shell_inspection(
+            "run_command",
+            r#"{"command":"cat src/main.rs"}"#
+        ));
+        assert!(!is_shell_inspection(
+            "run_command",
+            r#"{"command":"npm test -- leads.test.js"}"#
+        ));
+        assert!(!is_shell_inspection(
+            "run_command",
+            r#"{"command":"git status --short && git diff --check"}"#
+        ));
+        assert!(!is_shell_inspection(
+            "read_file",
+            r#"{"path":"src/main.rs"}"#
+        ));
+    }
     use crate::pricing::ModelPrice;
     use std::fs;
     use uuid::Uuid;
@@ -5450,6 +6515,29 @@ mod tests {
     }
 
     #[test]
+    fn model_picker_labels_profile_model_active_state_and_capabilities() {
+        let mut coding = profile("coding", "coder-v2", true);
+        coding.send_session_id = true;
+        coding.context_window = Some(128_000);
+        let config = Config {
+            profiles: vec![coding, profile("chat", "small", false)],
+            default_profile: "coding".into(),
+            mcp_servers: Vec::new(),
+            allow_commands: Vec::new(),
+            command_timeout_secs: 30,
+            background_max_secs: 1800,
+            prices: Default::default(),
+            theme: Default::default(),
+        };
+        let items = model_dialog_items(&config, "coding");
+        assert!(items[0].1.contains("● coding · coder-v2"));
+        assert!(items[0].1.contains("Coding/sticky"));
+        assert!(items[0].1.contains("128k context"));
+        assert!(items[1].1.contains("chat · small · tools off"));
+        assert_eq!(items.last().unwrap().0, "__add__");
+    }
+
+    #[test]
     fn tab_cycles_forward_through_every_mode_and_back() {
         let mut mode = Mode::Build;
         let mut seen = Vec::new();
@@ -5538,9 +6626,28 @@ mod tests {
             status("filesystem", 11, true, None),
         ]);
         let rows: Vec<&str> = value.split('\n').collect();
-        assert_eq!(rows.len(), 4, "two rows per server: {rows:?}");
-        assert!(rows[0].contains("mcptools"), "{rows:?}");
-        assert!(rows[1].contains("79 tool(s)"), "{rows:?}");
+        assert_eq!(rows.len(), 4, "summary plus one row per server: {rows:?}");
+        assert!(
+            rows[0].contains("2/2 connected") && rows[1].contains("90 available"),
+            "{rows:?}"
+        );
+        assert!(
+            rows[2].contains("mcptools") && rows[2].contains("79 tools"),
+            "{rows:?}"
+        );
+        assert!(
+            rows[3].contains("trusted"),
+            "trusted servers say so: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn sidebar_counts_are_compact_and_human_readable() {
+        assert_eq!(compact_count(999), "999");
+        assert_eq!(compact_count(1_000), "1.0K");
+        assert_eq!(compact_count(151_159), "151K");
+        assert_eq!(compact_count(1_250_000), "1.3M");
+        assert_eq!(compact_count(2_000_000_000), "2.0B");
     }
 
     #[test]
@@ -6239,6 +7346,133 @@ mod tests {
     }
 
     #[test]
+    fn undo_snapshot_round_trips_paths_and_missing_files() {
+        let snapshot = HashMap::from([
+            (
+                PathBuf::from("/tmp/edited.txt"),
+                Some("original".to_string()),
+            ),
+            (PathBuf::from("/tmp/created.txt"), None),
+        ]);
+
+        let encoded = encode_undo_snapshot(Some(&snapshot)).unwrap().unwrap();
+        assert_eq!(
+            decode_undo_snapshot(Some(&encoded)).unwrap(),
+            Some(snapshot)
+        );
+        assert_eq!(encode_undo_snapshot(None).unwrap(), None);
+    }
+
+    #[test]
+    fn current_snapshot_captures_redo_content_and_deleted_files() {
+        let root = temporary_directory();
+        let edited = root.join("edited.txt");
+        let deleted = root.join("deleted.txt");
+        fs::write(&edited, "after").unwrap();
+        let before = HashMap::from([
+            (edited.clone(), Some("before".to_string())),
+            (deleted.clone(), Some("was here".to_string())),
+        ]);
+
+        let after = snapshot_current_files(&before).unwrap();
+        assert_eq!(after.get(&edited).unwrap().as_deref(), Some("after"));
+        assert_eq!(after.get(&deleted), Some(&None));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn session_command_grants_match_only_the_exact_normalized_command() {
+        let root = temporary_directory();
+        let call = crate::provider::ToolCall {
+            id: "1".into(),
+            name: "run_command".into(),
+            arguments: r#"{"command":" cargo test "}"#.into(),
+        };
+        let grants = HashSet::from([session_permission_scope(&root, &call)]);
+        assert!(session_permission_matches(&grants, &root, &call));
+        let different = crate::provider::ToolCall {
+            arguments: r#"{"command":"cargo test --all"}"#.into(),
+            ..call
+        };
+        assert!(!session_permission_matches(&grants, &root, &different));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn session_patch_grants_match_only_the_canonical_target() {
+        let root = temporary_directory().canonicalize().unwrap();
+        let call = crate::provider::ToolCall {
+            id: "1".into(),
+            name: tools::PATCH_FILE_TOOL.into(),
+            arguments: r#"{"path":"a.txt","old_text":"","new_text":"a"}"#.into(),
+        };
+        let grants = HashSet::from([session_permission_scope(&root, &call)]);
+        assert!(session_permission_matches(&grants, &root, &call));
+        let different = crate::provider::ToolCall {
+            arguments: r#"{"path":"b.txt","old_text":"","new_text":"b"}"#.into(),
+            ..call
+        };
+        assert!(!session_permission_matches(&grants, &root, &different));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn batch_approval_summary_keeps_every_call_visible() {
+        let root = temporary_directory();
+        let registry = ToolRegistry::with_defaults(
+            root.clone(),
+            Vec::new(),
+            Vec::new(),
+            crate::tools::CommandLimits::default(),
+        );
+        let command = ToolCall {
+            id: "1".into(),
+            name: "run_command".into(),
+            arguments: r#"{"command":"cargo test"}"#.into(),
+        };
+        let patch = ToolCall {
+            id: "2".into(),
+            name: tools::PATCH_FILE_TOOL.into(),
+            arguments: r#"{"path":"a.txt","old_text":"a","new_text":"b"}"#.into(),
+        };
+        let summary = format_batch_approval(&registry, &[&command, &patch]);
+        assert!(summary.contains("1. run_command"));
+        assert!(summary.contains("cargo test"));
+        assert!(summary.contains("2. patch_file"));
+        assert!(summary.contains("a.txt"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn timeline_merges_activity_newest_first() {
+        let decisions = [storage::ToolDecision {
+            tool_name: "run_command".into(),
+            decision: "approved".into(),
+            scope: None,
+            created_at: 2,
+        }];
+        let executions = [storage::ToolExecution {
+            tool_name: "patch_file".into(),
+            status: "completed".into(),
+            arguments: "{}".into(),
+            output: Some("ok".into()),
+            started_at: 3,
+        }];
+        let agents = [storage::ChildAgentRun {
+            id: "agent".into(),
+            status: "completed".into(),
+            prompt: "inspect".into(),
+            result: Some("done".into()),
+            created_at: 1,
+        }];
+        let timeline = format_timeline(&decisions, &executions, &agents);
+        let tool = timeline.find("tool | completed patch_file").unwrap();
+        let decision = timeline.find("decision | approved run_command").unwrap();
+        let agent = timeline.find("agent | completed inspect").unwrap();
+        assert!(tool < decision && decision < agent);
+    }
+
+    #[test]
     fn revert_snapshot_restores_edited_files_and_deletes_created_ones() {
         let root = temporary_directory();
         fs::write(root.join("edited.txt"), "changed").unwrap();
@@ -6576,6 +7810,7 @@ mod tests {
             &project,
             &references,
             Some("parent".to_string()),
+            None,
         )
         .await;
 

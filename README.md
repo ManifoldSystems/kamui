@@ -16,6 +16,9 @@ Kamui is configured with a `kamui.toml` file. On first run, Kamui starts an inte
 flow that asks for an OpenAI-compatible base URL and API key, discovers the available models, and
 lets you choose the default model. It then saves the configuration and starts the chat immediately:
 
+Orvix Coding saves every discovered model as a switchable profile backed by one shared credential;
+the picker selects only the default. Other OpenAI-compatible providers save only the selected model.
+
 | Platform | Global config file |
 | --- | --- |
 | Windows | `%APPDATA%\\kamui\\kamui.toml` |
@@ -43,10 +46,16 @@ Any service implementing the OpenAI Chat Completions API can be used by changing
 model, and API key. Chat responses use the API's SSE streaming mode and are rendered as deltas
 arrive.
 
-**Orvix Coding Plan (internal):** point a shared provider at `https://api.orvix.id/v1`, set
-`completions_path = "/coding/completions"` and `send_session_id = true`, and use a key with
+**Orvix Coding:** choose the native Orvix Coding option during first-run setup or from the TUI's
+"+ Add provider / model" flow. Kamui derives `https://api.orvix.id/v1`,
+`completions_path = "/coding/completions"`, and `send_session_id = true`; models are listed from
+`GET /coding/models` (the Coding allowlist), not `/v1/models`. The API key is entered in
+a masked field and the resulting profiles share that credential rather than duplicating it. The config
+is atomically written with owner-only permissions. Use a key with
 `coding:invoke`. Kamui sends its session UUID as top-level `session_id` so Orvix can stick the
 upstream route for cache. Switch with `/model orvix-coding-flash`. Keep `/v1` profiles for A/B.
+Coding requests also identify the client and Kamui version in observability-only headers; Orvix
+does not use those claims for entitlement, routing, quota, or billing decisions.
 
 On these profiles Kamui also keeps the request prefix byte-stable so that cache can hold: the system
 prompt, your project instructions, the skill list and the tool definitions are built once and stay
@@ -60,10 +69,22 @@ the session is landing:
 
 ```text
 Prompt cache:  median 96% over 12 turns | ≥90%: 92% | ≥95%: 75% | warm-up: 1
+Cache epochs:  2 observed | current #2: 5 turn(s) | median 97%
 ```
 
 The first turn of a session is excluded from those ratios — there is nothing cached to hit yet — but
-a later warm-up turn is counted, because that is a prefix that churned mid-session.
+a later warm-up turn is counted, because that is a prefix that churned mid-session. Once a cache
+has warmed, a later cold turn starts a new observed epoch; `/stats` reports the current epoch
+separately so an old prefix does not hide the health of the active one.
+
+Coding entitlement, quota, concurrency, request-id conflict, authentication, rate-limit, and
+temporary server errors are rendered as bounded, actionable messages. Requests have connect and
+first-response deadlines; streams have an idle deadline. Before any output is visible, transient
+transport errors and HTTP 408/429/502/503/504 are retried up to three attempts using the same body
+and session id, respecting a capped `Retry-After`. A stream is never retried after output starts.
+The same pre-output retry policy covers non-streaming title, compaction, and sub-agent calls. If a
+model asks for an identical batch of tools three rounds in a row, Kamui stops before executing the
+third batch rather than spending the rest of the round limit repeating the same side effect.
 
 ### OpenAI-compatible providers
 
@@ -309,13 +330,13 @@ same way for a single scripted turn.
 Windows PowerShell:
 
 ```powershell
-irm https://raw.githubusercontent.com/algonacci/kamui/main/install.ps1 | iex
+irm https://is3.cloudhost.id/orvix/kamui-releases/install.ps1 | iex
 ```
 
 Linux and macOS:
 
 ```sh
-curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/algonacci/kamui/main/install.sh | sh
+curl --proto '=https' --tlsv1.2 -fsSL https://is3.cloudhost.id/orvix/kamui-releases/install.sh | sh
 ```
 
 Then open a new terminal and run:
@@ -412,6 +433,7 @@ Create a JSON suite and run it repeatedly against the default or a named profile
     {
       "name": "rust-basics",
       "prompt": "Name Rust's ownership rules in one paragraph.",
+      "follow_up_prompt": "Repeat the answer in one sentence.",
       "expect_contains": ["ownership", "borrow"]
     }
   ]
@@ -424,7 +446,12 @@ kamui benchmark suite.json --profile sol --runs 3
 
 Each run reports pass/fail, latency, and tokens; the command exits non-zero when an expectation is
 missing, making the same suite usable locally and in CI. Expectations are optional and matched
-case-insensitively.
+case-insensitively. On an Orvix Coding profile, repeated runs of each case form one append-only
+session with a stable session ID. The result also reports median and aggregate cache hit rates,
+shares at or above 90% and 95%, measured turns, and warm-ups; the first run of each case is excluded
+from the steady-state ratios. Optional `follow_up_prompt` replaces `prompt` after the first run,
+which lets a long initial context measure steady-state prefix caching with short incremental turns.
+When omitted, the initial prompt repeats on every run for compatibility with existing suites.
 
 ### Scheduled jobs
 
@@ -535,7 +562,8 @@ Highlights:
 - **Unknown commands name themselves** and suggest the nearest built-in (`/sesions` → "Did you
   mean /sessions?").
 
-`-p`, pipes, redirects, and `NO_COLOR` retain the script-friendly line-oriented output path.
+`-p`, pipes, and redirects retain the script-friendly line-oriented output path. On an interactive
+TTY, `NO_COLOR` keeps the fullscreen TUI but removes its semantic foreground/background colours.
 
 ### Session commands
 
@@ -549,6 +577,11 @@ Highlights:
 | `/search <text>` | Search saved messages across all sessions |
 | `/compact` | Summarize older messages to free up context |
 | `/undo` | Revert the files patched by the last turn |
+| `/redo` | Reapply the last undone file edits |
+| `/audit` | Show recent mutating tool executions for this session |
+| `/agents` | Show recent child-agent runs for this session |
+| `/context` | Inspect current reusable context without a network call |
+| `/timeline` | Show recent approvals, tool executions, and child-agent activity |
 | `/jobs` | List temporary session jobs and persistent scheduled jobs |
 | `/index` | Rebuild the semantic-search index (needs `embedding_model`) |
 | `/commands` | List your own prompt commands |
@@ -564,6 +597,20 @@ Highlights:
 | `/warnings [on\|off\|details\|fix]` | Hide/show, expand details of, or hand skill warnings to Kamui as a repair task. After a `fix` turn Kamui reloads the skill loader and reports what actually changed — how many folders now load, how many still fail, and whether the repair broke a folder that used to work — rather than leaving the old warning banner in place |
 | `/help` | List available commands |
 | `/exit` | Save and quit |
+
+Malformed or unreadable user/project `settings.json` files are reported in the startup warning rail
+and by `/warnings details`; Kamui does not silently overwrite them. Custom theme JSON files are also
+validated before selection, and every resolved color must use exact `#RRGGBB` form. Invalid themes
+are omitted from the picker and the last valid/default theme remains active.
+
+The model picker shows the profile, model, an active marker, and short capability notes (`tools off`,
+`Coding/sticky`, context window). Empty model or session pickers say so instead of opening a blank
+dialog. While a turn is running, `/model` and `/resume` are rejected rather than queued; typed input
+is queued for the next agent step and only folded into the current turn between tool rounds.
+
+If the provider streams reasoning (`reasoning`, `reasoning_content`, or `thinking`), Kamui shows a
+collapsed Thinking card. Click the card, the bouncing wall, or the footer hint — or press `Ctrl+T` —
+to expand or hide it. Reasoning is display-only and is not sent back to the model.
 
 `Ctrl+C` or `Esc` while a turn is running — waiting on the model, streaming, at an approval
 prompt, or running a command — cancels that turn and returns you to the prompt, killing any
@@ -657,7 +704,7 @@ stay out. Files are attached until the context budget or a 50-file cap runs out;
 as omitted instead of failing the prompt.
 
 Referenced files are attached only to that request and are not copied into session history. Each
-file is limited to 64 KiB and all attached files together are limited to 128 KiB. Absolute paths,
+file is limited to 1 MiB and all attached files together are limited to 2 MiB. Absolute paths,
 binary files, and paths or symlinks outside the project are rejected. Quote references that contain
 spaces with `@"path with spaces.md"` or `@'path with spaces.md'`.
 
@@ -735,7 +782,7 @@ like any other tool call, so a resumed session shows the plan as it stood at eac
 
 If the model calls a tool, Kamui prints a short trace of each call, runs it, feeds the result back,
 and continues streaming until a final answer. The read tools reuse the same path safety as `@file`
-(project-relative only, no escaping the root, 64 KiB per file) and the loop is bounded so it cannot
+(project-relative only, no escaping the root, 1 MiB per file) and the loop is bounded so it cannot
 run away.
 
 `run_command` never runs on its own. Kamui shows you the exact command and waits for you to approve
@@ -752,7 +799,9 @@ see `[commands]` below.
 For something that legitimately runs longer than that — a dev server, a slow test suite — the model
 can pass `background: true` instead. It returns a job id immediately rather than waiting, and can
 check on it with `command_status` (omit `job_id` to list every job) or stop it early with
-`stop_command`. `/jobs` lists them directly without going through the model. Background jobs are
+`stop_command`. A check for one running job waits up to 30 seconds for completion, avoiding rapid
+model polling and repeated context input. `/jobs` lists them directly without going through the
+model. Background jobs are
 in-memory only: they are killed when Kamui exits (including a plain `-p` run) and do not survive a
 restart, and each has a `background_max_secs` (default 30 minutes) safety cap against a runaway or
 zombie process — not a limit meant to constrain a legitimately long-running command.
@@ -765,17 +814,57 @@ background_max_secs = 1800   # safety cap for a background: true job
 
 `patch_file` edits one file per call and is also gated behind your approval (the same `y`/`yes`/
 `a`/`always` prompt): Kamui shows the change as removed (`-`) and added (`+`) lines before asking. A
-patch replaces text that must match the file
-exactly once — if it does not, the patch is rejected and the model is told to re-read the file, so a
-stale edit can never overwrite unexpected content. An empty `old_text` creates a new file. Writes are
+patch first replaces text that matches the file exactly once. If exact matching finds nothing, a
+line-trimmed fallback may recover indentation-only drift, but only when the whole block still has one
+unique location; zero or multiple candidates are rejected, so a stale edit cannot overwrite
+unexpected content. An empty `old_text` creates a new file. Writes are
 atomic per file, and paths cannot escape the project root.
 
 Each file `patch_file` touches is approved individually, exactly as before, but Kamui also keeps a
 snapshot of what every touched file looked like before the turn started. If a multi-file edit is
 interrupted with `Ctrl+C` partway through, the files it already changed are automatically reverted
 so the turn never leaves the repository half-edited with no trace in session history. `/undo`
-reverts the same way for a turn that *did* complete — one level, most recent turn only; a second
-`/undo` has nothing left to do.
+reverts the same way for completed edit turns. Undo and redo are multi-level SQLite-backed stacks,
+so both survive restarting and resuming. A new edit after an undo clears the redo branch, matching a
+normal editor; a partial filesystem failure leaves the stack position unchanged for recovery.
+
+Mutating tool calls are also journaled in SQLite before execution. On a restart, calls left running
+are marked interrupted and shown when their session is resumed. Kamui never retries them
+automatically because the command or file write may already have taken effect.
+Use `/audit` to inspect the 20 most recent entries for the active session; arguments and outputs are
+shown as bounded previews so large command output cannot flood the terminal.
+The same report includes append-only requested, approved, and rejected approval decisions. An
+`always` decision records its exact command or canonical path scope instead of implying tool-wide
+permission.
+
+Read-only `spawn_agent` runs also have durable lifecycle records. `/agents` shows their task,
+status, and bounded final result for the active session. A process crash changes running children to
+`interrupted`; Kamui does not automatically repeat them and spend the provider request twice.
+
+Choosing `always` at an approval is scoped to the exact normalized command or canonical file path
+for the active session. It does not grant every future `run_command` or `patch_file` call; different
+flags and different files still require approval, and `/new` clears all session grants.
+
+When one model response requests several approval-gated tools, Kamui first shows one grouped summary:
+allow the reviewed batch, reject it, or fall back to the existing per-item approval flow. Batch
+approval is one-time only, never a session grant, and calls still execute sequentially with their
+normal path checks, journals, and undo snapshots.
+
+On coding turns, Kamui also watches for exploration drift. If repeated repository reads consume a
+large number of calls or bytes without a successful file edit, it adds a private steering reminder
+to the current model request to narrow the investigation and implement or state a precise blocker.
+The first reminder is advisory after four inspection calls or 64 KiB. After six calls or 128 KiB,
+further repository-inspection calls are rejected locally. The first successful patch raises the
+turn-wide ceiling to eight calls or 192 KiB for targeted follow-up; later patches do not reset or
+extend it. Repository inspection through `run_command` shell readers or interpreter snippets is
+rejected so it cannot bypass the budget. Editing and verification commands remain available.
+Reminders are emitted at most twice per turn, are not stored as user conversation history, and do
+not apply to deliberately read-only child agents.
+
+In the fullscreen UI, prompts submitted while the agent is busy are persisted before Kamui labels
+them queued. Their FIFO IDs follow them into steering or the next turn and are removed atomically
+with the completed turn. Restarting and resuming restores both queued and previously claimed input,
+so a crash cannot silently lose text typed while the agent was running.
 
 If the [RTK](https://github.com/rtk-ai/rtk) binary is installed, simple approved commands are
 automatically prefixed with `rtk` so their output is compressed before it reaches the model. RTK is

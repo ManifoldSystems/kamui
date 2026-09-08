@@ -4,9 +4,78 @@ use super::{
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use reqwest::Client;
+
+const KAMUI_VERSION: &str = env!("CARGO_PKG_VERSION");
+use reqwest::{StatusCode, header::RETRY_AFTER};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::mpsc;
+use tokio::time::{Duration, timeout};
+
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
+const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
+const MAX_ERROR_BODY: usize = 2048;
+const MAX_REQUEST_ATTEMPTS: u32 = 3;
+
+fn retryable_status(status: StatusCode) -> bool {
+    matches!(status.as_u16(), 408 | 429 | 502 | 503 | 504)
+}
+
+fn retry_delay(attempt: u32, retry_after: Option<Duration>) -> Duration {
+    retry_after.unwrap_or(Duration::from_millis(250 * u64::from(attempt)))
+}
+
+#[derive(Debug)]
+pub struct ProviderHttpError {
+    pub status: StatusCode,
+    pub code: Option<String>,
+    pub message: String,
+    pub retry_after: Option<Duration>,
+}
+
+impl std::fmt::Display for ProviderHttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let action = match self.code.as_deref() {
+            Some("coding_not_entitled") => "Enable Coding access for this key.",
+            Some("coding_quota_exceeded") => {
+                "Coding quota is exhausted; wait for the quota reset or upgrade the plan."
+            }
+            Some("coding_concurrency_exceeded") => {
+                "Too many Coding requests; retry after another request finishes."
+            }
+            Some("coding_request_id_conflict") => {
+                "The Coding session is already active; retry shortly."
+            }
+            Some("coding_quota_unavailable") => {
+                "Coding quota is temporarily unavailable; retry shortly."
+            }
+            _ if self.status == StatusCode::UNAUTHORIZED
+                || self.status == StatusCode::FORBIDDEN =>
+            {
+                "Check the API key and its permissions."
+            }
+            _ if self.status == StatusCode::TOO_MANY_REQUESTS => "Rate limited; retry later.",
+            _ if self.status.is_server_error() => {
+                "Provider is temporarily unavailable; retry later."
+            }
+            _ => "Check the provider configuration and request.",
+        };
+        write!(f, "provider returned {}", self.status)?;
+        if let Some(code) = &self.code {
+            write!(f, " ({code})")?;
+        }
+        if !self.message.is_empty() {
+            write!(f, ": {}", self.message)?;
+        }
+        if let Some(wait) = self.retry_after {
+            write!(f, " Retry after {}s.", wait.as_secs())?;
+        }
+        write!(f, " {action}")
+    }
+}
+
+impl std::error::Error for ProviderHttpError {}
 
 pub struct OpenAIProvider {
     client: Client,
@@ -32,7 +101,10 @@ impl OpenAIProvider {
         send_session_id: bool,
     ) -> Self {
         Self {
-            client: Client::new(),
+            client: Client::builder()
+                .connect_timeout(CONNECT_TIMEOUT)
+                .build()
+                .expect("reqwest client configuration is valid"),
             api_key,
             base_url: base_url.trim_end_matches('/').to_string(),
             completions_path,
@@ -80,18 +152,40 @@ impl OpenAIProvider {
         }
     }
 
+    fn add_coding_headers(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        if self.send_session_id {
+            builder
+                .header("x-orvix-coding-client", "kamui")
+                .header("x-orvix-coding-client-version", KAMUI_VERSION)
+        } else {
+            builder
+        }
+    }
+
     /// Discover model identifiers exposed by an OpenAI-compatible provider.
-    pub async fn list_models(api_key: &str, base_url: &str) -> Result<Vec<String>> {
-        let response = Client::new()
-            .get(format!("{}/models", base_url.trim_end_matches('/')))
+    ///
+    /// `models_path` follows the same rewrite rules as `completions_path`: an
+    /// absolute `/…` path is resolved against the origin of `base_url`. Orvix
+    /// Coding uses `/coding/models` so onboarding does not offer the `/v1`
+    /// catalogue (managed + BYOK ids that `/coding/completions` will refuse).
+    pub async fn list_models(
+        api_key: &str,
+        base_url: &str,
+        models_path: Option<&str>,
+    ) -> Result<Vec<String>> {
+        let response = Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .build()?
+            .get(models_url(base_url, models_path))
             .bearer_auth(api_key)
-            .send()
+            .send();
+        let response = timeout(RESPONSE_TIMEOUT, response)
             .await
+            .context("provider models request timed out")?
             .context("failed to call the provider models endpoint")?;
         let status = response.status();
         if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            bail!("provider returned {status}: {body}");
+            return Err(http_error(response).await.into());
         }
 
         let response: ModelsResponse = response
@@ -109,6 +203,21 @@ impl OpenAIProvider {
             bail!("provider returned no models");
         }
         Ok(models)
+    }
+}
+
+fn models_url(base_url: &str, models_path: Option<&str>) -> String {
+    let base = base_url.trim_end_matches('/');
+    match models_path.map(str::trim).filter(|path| !path.is_empty()) {
+        Some(path) if path.starts_with("http://") || path.starts_with("https://") => {
+            path.trim_end_matches('/').to_owned()
+        }
+        Some(path) if path.starts_with('/') => match origin_of(base) {
+            Some(origin) => format!("{origin}{path}"),
+            None => format!("{base}{path}"),
+        },
+        Some(path) => format!("{base}/{}", path.trim_start_matches('/')),
+        None => format!("{base}/models"),
     }
 }
 
@@ -145,6 +254,40 @@ fn clamp_prompt_cache_key(key: &str) -> Option<String> {
         return None;
     }
     Some(trimmed.chars().take(64).collect())
+}
+
+fn parse_retry_after(value: Option<&reqwest::header::HeaderValue>) -> Option<Duration> {
+    value?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(|s| Duration::from_secs(s.min(30)))
+}
+
+async fn http_error(response: reqwest::Response) -> ProviderHttpError {
+    let status = response.status();
+    let retry_after = parse_retry_after(response.headers().get(RETRY_AFTER));
+    let body = response.text().await.unwrap_or_default();
+    let body: String = body.chars().take(MAX_ERROR_BODY).collect();
+    let value: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+    let error = value.get("error").unwrap_or(&value);
+    let code = error.get("code").and_then(Value::as_str).map(str::to_owned);
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .or_else(|| value.get("message").and_then(Value::as_str))
+        .unwrap_or(&body)
+        .chars()
+        .take(512)
+        .collect();
+    ProviderHttpError {
+        status,
+        code,
+        message,
+        retry_after,
+    }
 }
 
 // Request wire types. These belong to the provider; the core stays agnostic and never
@@ -430,8 +573,20 @@ struct StreamChoice {
 #[derive(Debug, Deserialize)]
 struct StreamDelta {
     content: Option<String>,
+    #[serde(default)]
+    reasoning: Option<String>,
+    #[serde(default)]
+    reasoning_content: Option<String>,
+    #[serde(default)]
+    thinking: Option<String>,
     #[serde(default, deserialize_with = "null_as_empty_vec")]
     tool_calls: Vec<StreamToolCallDelta>,
+}
+
+fn reasoning_delta(delta: &StreamDelta) -> Option<String> {
+    [&delta.reasoning, &delta.reasoning_content, &delta.thinking]
+        .into_iter()
+        .find_map(|value| value.as_ref().filter(|text| !text.is_empty()).cloned())
 }
 
 #[derive(Debug, Deserialize)]
@@ -494,20 +649,35 @@ impl Provider for OpenAIProvider {
             session_id,
             prompt_cache_key: cache_key.as_deref(),
         };
-        let response = self
-            .client
-            .post(self.chat_url())
-            .bearer_auth(&self.api_key)
-            .json(&body)
-            .send()
-            .await
-            .context("failed to call provider")?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            bail!("provider returned {status}: {body}");
-        }
+        let mut attempts = 0;
+        let response = loop {
+            attempts += 1;
+            let sent = self
+                .add_coding_headers(self.client.post(self.chat_url()).bearer_auth(&self.api_key))
+                .json(&body)
+                .send();
+            match timeout(RESPONSE_TIMEOUT, sent).await {
+                Ok(Ok(response)) if response.status().is_success() => break response,
+                Ok(Ok(response)) => {
+                    let error = http_error(response).await;
+                    if attempts >= MAX_REQUEST_ATTEMPTS || !retryable_status(error.status) {
+                        return Err(error.into());
+                    }
+                    tokio::time::sleep(retry_delay(attempts, error.retry_after)).await;
+                }
+                Ok(Err(error))
+                    if attempts < MAX_REQUEST_ATTEMPTS
+                        && (error.is_connect() || error.is_timeout()) =>
+                {
+                    tokio::time::sleep(retry_delay(attempts, None)).await;
+                }
+                Ok(Err(error)) => return Err(error).context("failed to call provider"),
+                Err(_) if attempts < MAX_REQUEST_ATTEMPTS => {
+                    tokio::time::sleep(retry_delay(attempts, None)).await
+                }
+                Err(_) => bail!("provider request timed out"),
+            }
+        };
 
         let response: OpenAIResponse = response
             .json()
@@ -536,14 +706,35 @@ impl Provider for OpenAIProvider {
             session_id,
             prompt_cache_key: cache_key.as_deref(),
         };
-        let mut response = self
-            .client
-            .post(self.chat_url())
-            .bearer_auth(&self.api_key)
-            .json(&body)
-            .send()
-            .await
-            .context("failed to call provider")?;
+        let mut attempts = 0;
+        let mut response = loop {
+            attempts += 1;
+            let sent = self
+                .add_coding_headers(self.client.post(self.chat_url()).bearer_auth(&self.api_key))
+                .json(&body)
+                .send();
+            match timeout(RESPONSE_TIMEOUT, sent).await {
+                Ok(Ok(response)) if response.status().is_success() => break response,
+                Ok(Ok(response)) => {
+                    let error = http_error(response).await;
+                    if attempts >= MAX_REQUEST_ATTEMPTS || !retryable_status(error.status) {
+                        return Err(error.into());
+                    }
+                    tokio::time::sleep(retry_delay(attempts, error.retry_after)).await;
+                }
+                Ok(Err(error))
+                    if attempts < MAX_REQUEST_ATTEMPTS
+                        && (error.is_connect() || error.is_timeout()) =>
+                {
+                    tokio::time::sleep(retry_delay(attempts, None)).await;
+                }
+                Ok(Err(error)) => return Err(error).context("failed to call provider"),
+                Err(_) if attempts < MAX_REQUEST_ATTEMPTS => {
+                    tokio::time::sleep(retry_delay(attempts, None)).await
+                }
+                Err(_) => bail!("provider request timed out"),
+            }
+        };
 
         let status = response.status();
         if !status.is_success() {
@@ -599,9 +790,9 @@ async fn read_stream(
     let mut buffer = Vec::new();
     let mut state = StreamState::default();
 
-    while let Some(chunk) = response
-        .chunk()
+    while let Some(chunk) = timeout(STREAM_IDLE_TIMEOUT, response.chunk())
         .await
+        .context("provider stream was idle for too long")?
         .context("failed to read provider stream")?
     {
         buffer.extend_from_slice(&chunk);
@@ -631,7 +822,18 @@ async fn read_stream(
         }
     }
 
-    bail!("provider stream ended before [DONE]")
+    if !state.finish_reason.is_empty() {
+        sender
+            .send(Ok(StreamEvent::Done {
+                usage: state.usage,
+                finish_reason: state.finish_reason,
+                tool_calls: assemble_tool_calls(state.tool_calls),
+            }))
+            .map_err(|_| anyhow::anyhow!("stream consumer disconnected"))?;
+        Ok(())
+    } else {
+        bail!("provider stream ended before a terminal finish event")
+    }
 }
 
 fn find_event_end(buffer: &[u8]) -> Option<usize> {
@@ -664,9 +866,20 @@ fn parse_event(
             if let Some(reason) = choice.finish_reason {
                 state.finish_reason = reason;
             }
-            if let Some(content) = choice.delta.content.filter(|content| !content.is_empty()) {
+            if let Some(content) = choice
+                .delta
+                .content
+                .as_ref()
+                .filter(|content| !content.is_empty())
+                .cloned()
+            {
                 sender
                     .send(Ok(StreamEvent::Delta(content)))
+                    .map_err(|_| anyhow::anyhow!("stream consumer disconnected"))?;
+            }
+            if let Some(reasoning) = reasoning_delta(&choice.delta) {
+                sender
+                    .send(Ok(StreamEvent::Reasoning(reasoning)))
                     .map_err(|_| anyhow::anyhow!("stream consumer disconnected"))?;
             }
             for delta in choice.delta.tool_calls {
@@ -696,6 +909,84 @@ fn parse_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::ImageAttachment;
+
+    #[test]
+    fn compatibility_matrix_preserves_mixed_request_order_and_shape() {
+        let request = ChatRequest {
+            model: "compat-model".into(),
+            messages: vec![
+                Message::system("follow instructions"),
+                Message::user_with_images(
+                    "inspect this",
+                    vec![ImageAttachment {
+                        media_type: "image/png".into(),
+                        data: "QUJD".into(),
+                    }],
+                ),
+                Message::tool_request(
+                    String::new(),
+                    vec![ToolCall {
+                        id: "call_1".into(),
+                        name: "read_file".into(),
+                        arguments: r#"{"path":"src/main.rs"}"#.into(),
+                    }],
+                ),
+                Message::tool_result("call_1", "fn main() {}"),
+            ],
+            tools: vec![ToolDefinition {
+                name: "read_file".into(),
+                description: "Read a project file".into(),
+                parameters: serde_json::json!({"type": "object"}),
+            }],
+            session_id: Some("session-1".into()),
+        };
+        let cache_key = clamp_prompt_cache_key(request.session_id.as_deref().unwrap());
+        let body = OpenAIRequest {
+            model: &request.model,
+            messages: wire_messages(&request.messages),
+            tools: wire_tools(&request.tools),
+            session_id: request.session_id.as_deref(),
+            prompt_cache_key: cache_key.as_deref(),
+        };
+        let value = serde_json::to_value(body).unwrap();
+
+        assert_eq!(value["session_id"], "session-1");
+        assert_eq!(value["prompt_cache_key"], "session-1");
+        assert_eq!(value["messages"][0]["role"], "system");
+        assert_eq!(value["messages"][1]["content"][0]["type"], "text");
+        assert_eq!(value["messages"][1]["content"][1]["type"], "image_url");
+        assert_eq!(value["messages"][2]["tool_calls"][0]["id"], "call_1");
+        assert!(value["messages"][2]["content"].is_null());
+        assert_eq!(value["messages"][3]["tool_call_id"], "call_1");
+        assert_eq!(value["tools"][0]["function"]["name"], "read_file");
+    }
+
+    #[test]
+    fn compatibility_matrix_parses_cache_usage_and_rejects_bad_responses() {
+        let fixtures = [
+            (
+                r#"{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":100,"completion_tokens":2,"total_tokens":102,"prompt_tokens_details":{"cached_tokens":80}}}"#,
+                80,
+            ),
+            (
+                r#"{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],"usage":{"input_tokens":100,"output_tokens":2,"cache_read_input_tokens":70}}"#,
+                70,
+            ),
+        ];
+        for (json, expected_cached) in fixtures {
+            let response: OpenAIResponse = serde_json::from_str(json).unwrap();
+            assert_eq!(
+                response_into_chat(response).unwrap().usage.cached_tokens,
+                expected_cached
+            );
+        }
+
+        assert!(serde_json::from_str::<OpenAIResponse>(r#"{"choices":"wrong"}"#).is_err());
+        let unsupported: OpenAIResponse =
+            serde_json::from_str(r#"{"output":[{"type":"message","content":[]}]}"#).unwrap();
+        assert!(response_into_chat(unsupported).is_err());
+    }
 
     #[test]
     fn parses_delta_finish_and_usage_events() {
@@ -728,10 +1019,40 @@ mod tests {
 
         match receiver.try_recv().unwrap().unwrap() {
             StreamEvent::Delta(content) => assert_eq!(content, "Hello"),
-            StreamEvent::Done { .. } => panic!("expected a delta"),
+            other => panic!("expected a delta, got {other:?}"),
         }
         assert_eq!(state.usage.total_tokens, 5);
         assert_eq!(state.finish_reason, "stop");
+    }
+
+    #[test]
+    fn parses_reasoning_deltas_from_common_compat_fields() {
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let mut state = StreamState::default();
+        assert!(
+            !parse_event(
+                br#"data: {"choices":[{"delta":{"reasoning":"step one"}}]}"#,
+                &sender,
+                &mut state,
+            )
+            .unwrap()
+        );
+        assert!(
+            !parse_event(
+                br#"data: {"choices":[{"delta":{"reasoning_content":" step two"}}]}"#,
+                &sender,
+                &mut state,
+            )
+            .unwrap()
+        );
+        match receiver.try_recv().unwrap().unwrap() {
+            StreamEvent::Reasoning(text) => assert_eq!(text, "step one"),
+            other => panic!("expected reasoning, got {other:?}"),
+        }
+        match receiver.try_recv().unwrap().unwrap() {
+            StreamEvent::Reasoning(text) => assert_eq!(text, " step two"),
+            other => panic!("expected reasoning, got {other:?}"),
+        }
     }
 
     #[test]
@@ -822,7 +1143,6 @@ mod tests {
 
     #[test]
     fn serializes_images_as_content_parts() {
-        use crate::provider::ImageAttachment;
         let messages = vec![Message::user_with_images(
             "what is this?",
             vec![ImageAttachment {
@@ -953,11 +1273,62 @@ mod tests {
     }
 
     #[test]
+    fn coding_models_url_rewrites_absolute_path_against_origin() {
+        assert_eq!(
+            models_url("https://api.orvix.id/v1", Some("/coding/models")),
+            "https://api.orvix.id/coding/models"
+        );
+        assert_eq!(
+            models_url("https://api.openai.com/v1", None),
+            "https://api.openai.com/v1/models"
+        );
+    }
+
+    #[test]
     fn invalid_stream_json_is_an_error() {
         let (sender, _receiver) = mpsc::unbounded_channel();
         let mut state = StreamState::default();
 
         assert!(parse_event(b"data: {not json}", &sender, &mut state).is_err());
+    }
+
+    #[test]
+    fn parses_and_caps_retry_after() {
+        use reqwest::header::HeaderValue;
+        assert_eq!(
+            parse_retry_after(Some(&HeaderValue::from_static("12"))),
+            Some(Duration::from_secs(12))
+        );
+        assert_eq!(
+            parse_retry_after(Some(&HeaderValue::from_static("120"))),
+            Some(Duration::from_secs(30))
+        );
+    }
+
+    #[test]
+    fn retry_policy_is_shared_and_bounded() {
+        assert!(retryable_status(StatusCode::REQUEST_TIMEOUT));
+        assert!(retryable_status(StatusCode::TOO_MANY_REQUESTS));
+        assert!(retryable_status(StatusCode::BAD_GATEWAY));
+        assert!(!retryable_status(StatusCode::BAD_REQUEST));
+        assert_eq!(retry_delay(2, None), Duration::from_millis(500));
+        assert_eq!(
+            retry_delay(2, Some(Duration::from_secs(3))),
+            Duration::from_secs(3)
+        );
+    }
+
+    #[test]
+    fn coding_error_message_is_actionable_and_bounded() {
+        let error = ProviderHttpError {
+            status: StatusCode::FORBIDDEN,
+            code: Some("coding_not_entitled".into()),
+            message: "not entitled".into(),
+            retry_after: None,
+        };
+        let message = error.to_string();
+        assert!(message.contains("Enable Coding access"));
+        assert!(!message.contains("API key:"));
     }
 
     #[test]

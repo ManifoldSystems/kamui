@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const INSTRUCTION_FILES: [&str; 2] = ["KAMUI.md", "AGENTS.md"];
-const MAX_FILE_BYTES: u64 = 64 * 1024;
-const MAX_CONTEXT_BYTES: usize = 128 * 1024;
+const MAX_FILE_BYTES: u64 = 1024 * 1024;
+const MAX_CONTEXT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
 const MAX_IMAGE_PIXELS: u64 = 25_000_000;
 const MAX_IMAGE_DIMENSION: u32 = 4096;
@@ -756,7 +756,7 @@ fn read_text_file(path: &Path) -> Result<String> {
     let metadata =
         fs::metadata(path).with_context(|| format!("failed to inspect {}", path.display()))?;
     if metadata.len() > MAX_FILE_BYTES {
-        anyhow::bail!("{} exceeds the 64 KiB file limit", path.display());
+        anyhow::bail!("{} exceeds the 1 MiB file limit", path.display());
     }
     fs::read_to_string(path)
         .with_context(|| format!("{} is not a readable UTF-8 text file", path.display()))
@@ -956,11 +956,11 @@ mod tests {
     #[test]
     fn rejects_files_over_the_size_limit() {
         let root = project();
-        fs::write(root.join("big.txt"), vec![b'a'; 65 * 1024]).unwrap();
+        fs::write(root.join("big.txt"), vec![b'a'; 1024 * 1024 + 1]).unwrap();
         let context = ProjectContext::from_root(root.clone()).unwrap();
 
         let error = context.expand_file_references("Read @big.txt").unwrap_err();
-        assert!(error.to_string().contains("64 KiB"));
+        assert!(error.to_string().contains("1 MiB"));
         fs::remove_dir_all(root).unwrap();
     }
 

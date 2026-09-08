@@ -19,6 +19,8 @@ pub struct Session {
     pub title: String,
     pub provider: String,
     pub model: String,
+    pub compaction_summary: Option<String>,
+    pub summarized_upto: usize,
 }
 
 pub struct SessionSummary {
@@ -100,6 +102,29 @@ pub struct ScheduledJob {
     pub stdout: String,
     pub stderr: String,
     pub worker_id: Option<String>,
+}
+
+pub struct ToolExecution {
+    pub tool_name: String,
+    pub status: String,
+    pub arguments: String,
+    pub output: Option<String>,
+    pub started_at: i64,
+}
+
+pub struct ToolDecision {
+    pub tool_name: String,
+    pub decision: String,
+    pub scope: Option<String>,
+    pub created_at: i64,
+}
+
+pub struct ChildAgentRun {
+    pub id: String,
+    pub status: String,
+    pub prompt: String,
+    pub result: Option<String>,
+    pub created_at: i64,
 }
 
 fn scheduled_job_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScheduledJob> {
@@ -328,6 +353,107 @@ impl Database {
                  PRAGMA user_version = 11;",
             )?;
         }
+        if version < 12 {
+            connection.execute_batch(
+                "ALTER TABLE sessions ADD COLUMN compaction_summary TEXT;
+                 ALTER TABLE sessions ADD COLUMN summarized_upto INTEGER NOT NULL DEFAULT 0;
+                 PRAGMA user_version = 12;",
+            )?;
+        }
+        if version < 13 {
+            connection.execute_batch(
+                "ALTER TABLE sessions ADD COLUMN undo_snapshot TEXT;
+                 PRAGMA user_version = 13;",
+            )?;
+        }
+        if version < 14 {
+            connection.execute_batch(
+                "CREATE TABLE tool_executions (
+                     id TEXT PRIMARY KEY,
+                     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                     tool_call_id TEXT NOT NULL,
+                     tool_name TEXT NOT NULL,
+                     arguments TEXT NOT NULL,
+                     status TEXT NOT NULL CHECK (status IN ('running', 'completed', 'error', 'interrupted')),
+                     output TEXT,
+                     started_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                     finished_at INTEGER
+                 );
+                 CREATE INDEX tool_executions_session_id ON tool_executions(session_id, started_at);
+                 PRAGMA user_version = 14;",
+            )?;
+        }
+        if version < 15 {
+            connection.execute_batch(
+                "CREATE TABLE queued_inputs (
+                     id TEXT PRIMARY KEY,
+                     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                     content TEXT NOT NULL,
+                     status TEXT NOT NULL DEFAULT 'queued' CHECK (status IN ('queued', 'claimed')),
+                     created_at INTEGER NOT NULL DEFAULT (unixepoch())
+                 );
+                 CREATE INDEX queued_inputs_session_id ON queued_inputs(session_id, created_at);
+                 PRAGMA user_version = 15;",
+            )?;
+        }
+        if version < 16 {
+            connection.execute_batch(
+                "CREATE TABLE edit_snapshots (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                     before_snapshot TEXT NOT NULL,
+                     after_snapshot TEXT,
+                     state TEXT NOT NULL DEFAULT 'undo' CHECK (state IN ('undo', 'redo')),
+                     created_at INTEGER NOT NULL DEFAULT (unixepoch())
+                 );
+                 CREATE INDEX edit_snapshots_session_id ON edit_snapshots(session_id, id);
+                 INSERT INTO edit_snapshots (session_id, before_snapshot)
+                     SELECT id, undo_snapshot FROM sessions WHERE undo_snapshot IS NOT NULL;
+                 UPDATE sessions SET undo_snapshot = NULL;
+                 PRAGMA user_version = 16;",
+            )?;
+        }
+        if version < 17 {
+            connection.execute_batch(
+                "CREATE TABLE child_agent_runs (
+                     id TEXT PRIMARY KEY,
+                     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                     tool_call_id TEXT NOT NULL,
+                     prompt TEXT NOT NULL,
+                     status TEXT NOT NULL CHECK (status IN ('running', 'completed', 'error', 'interrupted')),
+                     result TEXT,
+                     created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                     finished_at INTEGER
+                 );
+                 CREATE INDEX child_agent_runs_session_id ON child_agent_runs(session_id, created_at);
+                 PRAGMA user_version = 17;",
+            )?;
+        }
+        if version < 18 {
+            connection.execute_batch(
+                "CREATE TABLE tool_decisions (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                     tool_call_id TEXT NOT NULL,
+                     tool_name TEXT NOT NULL,
+                     decision TEXT NOT NULL CHECK (decision IN ('requested', 'approved', 'rejected')),
+                     scope TEXT,
+                     created_at INTEGER NOT NULL DEFAULT (unixepoch())
+                 );
+                 CREATE INDEX tool_decisions_session_id ON tool_decisions(session_id, id);
+                 PRAGMA user_version = 18;",
+            )?;
+        }
+        connection.execute(
+            "UPDATE tool_executions SET status = 'interrupted', finished_at = unixepoch()
+             WHERE status = 'running'",
+            [],
+        )?;
+        connection.execute(
+            "UPDATE child_agent_runs SET status = 'interrupted', finished_at = unixepoch()
+             WHERE status = 'running'",
+            [],
+        )?;
         Ok(Self { connection, path })
     }
 
@@ -603,6 +729,8 @@ impl Database {
             title: "New chat".to_string(),
             provider: provider.to_string(),
             model: model.to_string(),
+            compaction_summary: None,
+            summarized_upto: 0,
         };
         self.connection.execute(
             "INSERT INTO sessions (id, title, provider, model) VALUES (?1, ?2, ?3, ?4)",
@@ -614,7 +742,7 @@ impl Database {
     pub fn find_session(&self, id_prefix: &str) -> Result<Option<Session>> {
         let pattern = format!("{id_prefix}%");
         let mut statement = self.connection.prepare(
-            "SELECT id, title, provider, model FROM sessions
+            "SELECT id, title, provider, model, compaction_summary, summarized_upto FROM sessions
              WHERE id LIKE ?1 ORDER BY updated_at DESC LIMIT 2",
         )?;
         let sessions = statement
@@ -677,6 +805,21 @@ impl Database {
         .collect()
     }
 
+    pub fn set_compaction_checkpoint(
+        &self,
+        session_id: &str,
+        summary: &str,
+        summarized_upto: usize,
+    ) -> Result<()> {
+        self.connection.execute(
+            "UPDATE sessions
+             SET compaction_summary = ?2, summarized_upto = ?3, updated_at = unixepoch()
+             WHERE id = ?1",
+            params![session_id, summary, summarized_upto as i64],
+        )?;
+        Ok(())
+    }
+
     /// Persist a full turn: every message it produced plus one usage record, atomically. A turn is
     /// usually a user prompt and an assistant answer, but may also include the assistant's tool
     /// requests and the tool results in between.
@@ -687,6 +830,30 @@ impl Database {
         usage: &Usage,
         model: &str,
         finish_reason: &str,
+    ) -> Result<()> {
+        self.save_turn_with_undo(
+            session_id,
+            messages,
+            usage,
+            model,
+            finish_reason,
+            None,
+            None,
+            &[],
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn save_turn_with_undo(
+        &self,
+        session_id: &str,
+        messages: &[Message],
+        usage: &Usage,
+        model: &str,
+        finish_reason: &str,
+        before_snapshot: Option<&str>,
+        after_snapshot: Option<&str>,
+        completed_inputs: &[String],
     ) -> Result<()> {
         let input_tokens =
             i64::try_from(usage.prompt_tokens).context("input token count overflow")?;
@@ -744,8 +911,238 @@ impl Database {
              WHERE id = ?1",
             params![session_id, make_title(title_source)],
         )?;
+        if let (Some(before), Some(after)) = (before_snapshot, after_snapshot) {
+            transaction.execute(
+                "DELETE FROM edit_snapshots WHERE session_id = ?1 AND state = 'redo'",
+                [session_id],
+            )?;
+            transaction.execute(
+                "INSERT INTO edit_snapshots
+                     (session_id, before_snapshot, after_snapshot, state)
+                 VALUES (?1, ?2, ?3, 'undo')",
+                params![session_id, before, after],
+            )?;
+        }
+        for id in completed_inputs {
+            transaction.execute("DELETE FROM queued_inputs WHERE id = ?1", [id])?;
+        }
         transaction.commit()?;
         Ok(())
+    }
+
+    pub fn next_edit_snapshot(
+        &self,
+        session_id: &str,
+        state: &str,
+    ) -> Result<Option<(i64, String, Option<String>)>> {
+        let order = if state == "redo" { "ASC" } else { "DESC" };
+        let query = format!(
+            "SELECT id, before_snapshot, after_snapshot FROM edit_snapshots
+             WHERE session_id = ?1 AND state = ?2 ORDER BY id {order} LIMIT 1"
+        );
+        self.connection
+            .query_row(&query, params![session_id, state], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn move_edit_snapshot(&self, id: i64, state: &str) -> Result<()> {
+        self.connection.execute(
+            "UPDATE edit_snapshots SET state = ?2 WHERE id = ?1",
+            params![id, state],
+        )?;
+        Ok(())
+    }
+
+    pub fn start_tool_execution(
+        &self,
+        session_id: &str,
+        tool_call_id: &str,
+        tool_name: &str,
+        arguments: &str,
+    ) -> Result<String> {
+        let id = Uuid::new_v4().to_string();
+        self.connection.execute(
+            "INSERT INTO tool_executions
+                 (id, session_id, tool_call_id, tool_name, arguments, status)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'running')",
+            params![id, session_id, tool_call_id, tool_name, arguments],
+        )?;
+        Ok(id)
+    }
+
+    pub fn finish_tool_execution(&self, id: &str, output: &str) -> Result<()> {
+        let status = if output.starts_with("Error: ") {
+            "error"
+        } else {
+            "completed"
+        };
+        self.connection.execute(
+            "UPDATE tool_executions
+             SET status = ?2, output = ?3, finished_at = unixepoch()
+             WHERE id = ?1 AND status = 'running'",
+            params![id, status, output],
+        )?;
+        Ok(())
+    }
+
+    pub fn interrupted_tool_executions(&self, session_id: &str) -> Result<Vec<String>> {
+        let mut statement = self.connection.prepare(
+            "SELECT tool_name FROM tool_executions
+             WHERE session_id = ?1 AND status = 'interrupted'
+             ORDER BY started_at, rowid",
+        )?;
+        let rows = statement.query_map([session_id], |row| row.get(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn tool_executions(&self, session_id: &str, limit: usize) -> Result<Vec<ToolExecution>> {
+        let limit = i64::try_from(limit).context("tool execution limit overflow")?;
+        let mut statement = self.connection.prepare(
+            "SELECT tool_name, status, arguments, output, started_at
+             FROM tool_executions WHERE session_id = ?1
+             ORDER BY started_at DESC, rowid DESC LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![session_id, limit], |row| {
+            Ok(ToolExecution {
+                tool_name: row.get(0)?,
+                status: row.get(1)?,
+                arguments: row.get(2)?,
+                output: row.get(3)?,
+                started_at: row.get(4)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn record_tool_decision(
+        &self,
+        session_id: &str,
+        tool_call_id: &str,
+        tool_name: &str,
+        decision: &str,
+        scope: Option<&str>,
+    ) -> Result<()> {
+        self.connection.execute(
+            "INSERT INTO tool_decisions
+                 (session_id, tool_call_id, tool_name, decision, scope)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![session_id, tool_call_id, tool_name, decision, scope],
+        )?;
+        Ok(())
+    }
+
+    pub fn tool_decisions(&self, session_id: &str, limit: usize) -> Result<Vec<ToolDecision>> {
+        let limit = i64::try_from(limit).context("tool decision limit overflow")?;
+        let mut statement = self.connection.prepare(
+            "SELECT tool_name, decision, scope, created_at FROM tool_decisions
+             WHERE session_id = ?1 ORDER BY id DESC LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![session_id, limit], |row| {
+            Ok(ToolDecision {
+                tool_name: row.get(0)?,
+                decision: row.get(1)?,
+                scope: row.get(2)?,
+                created_at: row.get(3)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn start_child_agent(
+        &self,
+        session_id: &str,
+        tool_call_id: &str,
+        prompt: &str,
+    ) -> Result<String> {
+        let id = Uuid::new_v4().to_string();
+        self.connection.execute(
+            "INSERT INTO child_agent_runs (id, session_id, tool_call_id, prompt, status)
+             VALUES (?1, ?2, ?3, ?4, 'running')",
+            params![id, session_id, tool_call_id, prompt],
+        )?;
+        Ok(id)
+    }
+
+    pub fn finish_child_agent(&self, id: &str, result: &str) -> Result<()> {
+        let status = if result.starts_with("Error: ") {
+            "error"
+        } else {
+            "completed"
+        };
+        self.connection.execute(
+            "UPDATE child_agent_runs SET status = ?2, result = ?3, finished_at = unixepoch()
+             WHERE id = ?1 AND status = 'running'",
+            params![id, status, result],
+        )?;
+        Ok(())
+    }
+
+    pub fn child_agent_runs(&self, session_id: &str, limit: usize) -> Result<Vec<ChildAgentRun>> {
+        let limit = i64::try_from(limit).context("child agent limit overflow")?;
+        let mut statement = self.connection.prepare(
+            "SELECT id, status, prompt, result, created_at FROM child_agent_runs
+             WHERE session_id = ?1 ORDER BY created_at DESC, rowid DESC LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![session_id, limit], |row| {
+            Ok(ChildAgentRun {
+                id: row.get(0)?,
+                status: row.get(1)?,
+                prompt: row.get(2)?,
+                result: row.get(3)?,
+                created_at: row.get(4)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn claim_queued_input(&self, id: &str) -> Result<()> {
+        self.connection.execute(
+            "UPDATE queued_inputs SET status = 'claimed' WHERE id = ?1",
+            [id],
+        )?;
+        Ok(())
+    }
+
+    pub fn complete_queued_inputs(&self, ids: &[String]) -> Result<()> {
+        let transaction = self.connection.unchecked_transaction()?;
+        for id in ids {
+            transaction.execute("DELETE FROM queued_inputs WHERE id = ?1", [id])?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn recover_queued_inputs(&self, session_id: &str) -> Result<Vec<(String, String)>> {
+        self.connection.execute(
+            "UPDATE queued_inputs SET status = 'queued'
+             WHERE session_id = ?1 AND status = 'claimed'",
+            [session_id],
+        )?;
+        let mut statement = self.connection.prepare(
+            "SELECT id, content FROM queued_inputs
+             WHERE session_id = ?1 ORDER BY created_at, rowid",
+        )?;
+        let rows = statement.query_map([session_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn enqueue_input_at(path: &Path, session_id: &str, content: &str) -> Result<String> {
+        let connection = Connection::open(path)?;
+        connection.busy_timeout(Duration::from_secs(5))?;
+        let id = Uuid::new_v4().to_string();
+        connection.execute(
+            "INSERT INTO queued_inputs (id, session_id, content) VALUES (?1, ?2, ?3)",
+            params![id, session_id, content],
+        )?;
+        Ok(id)
     }
 
     pub fn save_generated_title(
@@ -1529,6 +1926,8 @@ fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
         title: row.get(1)?,
         provider: row.get(2)?,
         model: row.get(3)?,
+        compaction_summary: row.get(4)?,
+        summarized_upto: row.get::<_, i64>(5)?.max(0) as usize,
     })
 }
 
@@ -1601,6 +2000,184 @@ mod tests {
             database.session_stats(&session.id).unwrap().request_count,
             1
         );
+    }
+
+    #[test]
+    fn compaction_checkpoint_survives_resume() {
+        let database = database();
+        let session = database.create_session("test", "model").unwrap();
+        database
+            .set_compaction_checkpoint(&session.id, "earlier work", 7)
+            .unwrap();
+
+        let resumed = database.find_session(&session.id).unwrap().unwrap();
+        assert_eq!(resumed.compaction_summary.as_deref(), Some("earlier work"));
+        assert_eq!(resumed.summarized_upto, 7);
+        assert_eq!(database.schema_version().unwrap(), 18);
+    }
+
+    #[test]
+    fn edit_snapshots_form_undo_and_redo_stacks() {
+        let database = database();
+        let session = database.create_session("test", "model").unwrap();
+        database
+            .save_turn_with_undo(
+                &session.id,
+                &[Message::user("edit"), Message::assistant("done")],
+                &Usage::default(),
+                "model",
+                "stop",
+                Some(r#"[["/tmp/a.txt","original"]]"#),
+                Some(r#"[["/tmp/a.txt","changed"]]"#),
+                &[],
+            )
+            .unwrap();
+
+        let first = database
+            .next_edit_snapshot(&session.id, "undo")
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.1, r#"[["/tmp/a.txt","original"]]"#);
+        assert_eq!(first.2.as_deref(), Some(r#"[["/tmp/a.txt","changed"]]"#));
+        database.move_edit_snapshot(first.0, "redo").unwrap();
+        assert!(
+            database
+                .next_edit_snapshot(&session.id, "undo")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            database
+                .next_edit_snapshot(&session.id, "redo")
+                .unwrap()
+                .unwrap()
+                .0,
+            first.0
+        );
+        assert_eq!(database.schema_version().unwrap(), 18);
+    }
+
+    #[test]
+    fn tool_execution_journal_records_outcomes_and_recovers_running_rows() {
+        let database = database();
+        let session = database.create_session("test", "model").unwrap();
+        let completed = database
+            .start_tool_execution(&session.id, "call-1", "patch_file", "{}")
+            .unwrap();
+        database
+            .finish_tool_execution(&completed, "patched file")
+            .unwrap();
+        let running = database
+            .start_tool_execution(&session.id, "call-2", "run_command", "{}")
+            .unwrap();
+        assert_eq!(
+            database
+                .connection
+                .query_row(
+                    "SELECT status FROM tool_executions WHERE id = ?1",
+                    [&completed],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "completed"
+        );
+
+        let Database { connection, path } = database;
+        let database = Database::initialize(connection, path).unwrap();
+        assert_eq!(
+            database
+                .connection
+                .query_row(
+                    "SELECT status FROM tool_executions WHERE id = ?1",
+                    [&running],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "interrupted"
+        );
+        assert_eq!(database.schema_version().unwrap(), 18);
+        let rows = database.tool_executions(&session.id, 20).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].tool_name, "run_command");
+        assert_eq!(rows[0].status, "interrupted");
+    }
+
+    #[test]
+    fn queued_inputs_recover_in_fifo_order_and_complete_explicitly() {
+        let database = database();
+        let session = database.create_session("test", "model").unwrap();
+        let first = Uuid::new_v4().to_string();
+        let second = Uuid::new_v4().to_string();
+        database
+            .connection
+            .execute(
+                "INSERT INTO queued_inputs (id, session_id, content) VALUES (?1, ?2, 'first')",
+                params![first, session.id],
+            )
+            .unwrap();
+        database
+            .connection
+            .execute(
+                "INSERT INTO queued_inputs (id, session_id, content) VALUES (?1, ?2, 'second')",
+                params![second, session.id],
+            )
+            .unwrap();
+        database.claim_queued_input(&first).unwrap();
+
+        let recovered = database.recover_queued_inputs(&session.id).unwrap();
+        assert_eq!(
+            recovered,
+            vec![(first.clone(), "first".into()), (second, "second".into())]
+        );
+        database.complete_queued_inputs(&[first]).unwrap();
+        assert_eq!(
+            database.recover_queued_inputs(&session.id).unwrap().len(),
+            1
+        );
+        assert_eq!(database.schema_version().unwrap(), 18);
+    }
+
+    #[test]
+    fn child_agent_runs_persist_results_and_recover_interruptions() {
+        let database = database();
+        let session = database.create_session("test", "model").unwrap();
+        let completed = database
+            .start_child_agent(&session.id, "c1", "inspect")
+            .unwrap();
+        database.finish_child_agent(&completed, "found it").unwrap();
+        database
+            .start_child_agent(&session.id, "c2", "search")
+            .unwrap();
+        let Database { connection, path } = database;
+        let database = Database::initialize(connection, path).unwrap();
+        let rows = database.child_agent_runs(&session.id, 20).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].status, "interrupted");
+        assert_eq!(rows[1].result.as_deref(), Some("found it"));
+        assert_eq!(database.schema_version().unwrap(), 18);
+    }
+
+    #[test]
+    fn tool_decisions_are_append_only_and_keep_explicit_scopes() {
+        let database = database();
+        let session = database.create_session("test", "model").unwrap();
+        database
+            .record_tool_decision(&session.id, "c1", "run_command", "requested", None)
+            .unwrap();
+        database
+            .record_tool_decision(
+                &session.id,
+                "c1",
+                "run_command",
+                "approved",
+                Some("run_command:cargo test"),
+            )
+            .unwrap();
+        let rows = database.tool_decisions(&session.id, 20).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].decision, "approved");
+        assert_eq!(rows[0].scope.as_deref(), Some("run_command:cargo test"));
+        assert_eq!(rows[1].decision, "requested");
     }
 
     #[test]
