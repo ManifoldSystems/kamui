@@ -824,6 +824,9 @@ are marked interrupted and shown when their session is resumed. Kamui never retr
 automatically because the command or file write may already have taken effect.
 Use `/audit` to inspect the 20 most recent entries for the active session; arguments and outputs are
 shown as bounded previews so large command output cannot flood the terminal.
+The same report includes append-only requested, approved, and rejected approval decisions. An
+`always` decision records its exact command or canonical path scope instead of implying tool-wide
+permission.
 
 Read-only `spawn_agent` runs also have durable lifecycle records. `/agents` shows their task,
 status, and bounded final result for the active session. A process crash changes running children to

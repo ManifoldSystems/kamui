@@ -466,6 +466,9 @@ after title generation while later turns are fine.
   the undo stack. New rows carry before/after states for durable multi-level undo and redo.
 - `user_version = 17` adds `child_agent_runs`. Existing read-only sub-agents persist their task,
   status, and final result; running rows become interrupted after a crash and are never auto-retried.
+- `user_version = 18` adds append-only `tool_decisions` events for requested, approved, and rejected
+  approval-gated calls. Exact-resource `always` grants record their scope; `/audit` shows decisions
+  separately from execution lifecycle rows.
 
 ## Configuration
 

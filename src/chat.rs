@@ -1086,7 +1086,8 @@ where
                 match session.as_ref() {
                     Some(active) => {
                         let rows = database.tool_executions(&active.id, 20)?;
-                        chat_ui.notice(&format_tool_audit(&rows))?;
+                        let decisions = database.tool_decisions(&active.id, 40)?;
+                        chat_ui.notice(&format_tool_audit(&decisions, &rows))?;
                     }
                     None => chat_ui.notice("No active session.")?,
                 }
@@ -1875,6 +1876,15 @@ where
                         && !session_permission_matches(&always_allowed, project.root(), call)
                 })
                 .collect();
+            for call in &approval_calls {
+                database.record_tool_decision(
+                    &active_session_id,
+                    &call.id,
+                    &call.name,
+                    "requested",
+                    None,
+                )?;
+            }
             let batch_decision = if approval_calls.len() > 1 {
                 let body = format_batch_approval(&tools, &approval_calls);
                 let answer = tokio::select! {
@@ -2085,10 +2095,24 @@ where
                     && !session_permission_matches(&always_allowed, project.root(), call)
                 {
                     if batch_decision == BatchDecision::RejectAll {
+                        database.record_tool_decision(
+                            &active_session_id,
+                            &call.id,
+                            &call.name,
+                            "rejected",
+                            None,
+                        )?;
                         chat_ui.notice("skipped by batch decision")?;
                         "The user declined this tool call as part of the reviewed batch."
                             .to_string()
                     } else if batch_decision == BatchDecision::ApproveAll {
+                        database.record_tool_decision(
+                            &active_session_id,
+                            &call.id,
+                            &call.name,
+                            "approved",
+                            None,
+                        )?;
                         if call.name == tools::PATCH_FILE_TOOL {
                             snapshot_patch_target(
                                 project.root(),
@@ -2132,11 +2156,27 @@ where
                         if always {
                             let scope = session_permission_scope(project.root(), call);
                             always_allowed.insert(scope.clone());
+                            database.record_tool_decision(
+                                &active_session_id,
+                                &call.id,
+                                &call.name,
+                                "approved",
+                                Some(&scope),
+                            )?;
                             chat_ui.notice(&format!(
                             "always allowing {scope} for the rest of this session — /new clears this"
                         ))?;
                         }
                         if approved {
+                            if !always {
+                                database.record_tool_decision(
+                                    &active_session_id,
+                                    &call.id,
+                                    &call.name,
+                                    "approved",
+                                    None,
+                                )?;
+                            }
                             if call.name == tools::PATCH_FILE_TOOL {
                                 snapshot_patch_target(
                                     project.root(),
@@ -2156,6 +2196,13 @@ where
                                 }
                             }
                         } else {
+                            database.record_tool_decision(
+                                &active_session_id,
+                                &call.id,
+                                &call.name,
+                                "rejected",
+                                None,
+                            )?;
                             chat_ui.notice("skipped")?;
                             "The user declined to run this command.".to_string()
                         }
@@ -3509,11 +3556,35 @@ fn report_interrupted_tools(
     Ok(())
 }
 
-fn format_tool_audit(rows: &[storage::ToolExecution]) -> String {
-    if rows.is_empty() {
+fn format_tool_audit(
+    decisions: &[storage::ToolDecision],
+    rows: &[storage::ToolExecution],
+) -> String {
+    if rows.is_empty() && decisions.is_empty() {
         return "No mutating tool executions recorded for this session.".to_string();
     }
-    let mut output = String::from("Recent mutating tool executions:\n");
+    let mut output = String::new();
+    if !decisions.is_empty() {
+        output.push_str("Recent approval decisions:\n");
+        for decision in decisions {
+            let scope = decision
+                .scope
+                .as_deref()
+                .map(|scope| format!(" | scope: {}", audit_preview(scope, 120)))
+                .unwrap_or_default();
+            let _ = writeln!(
+                output,
+                "{} | {} | {}{}",
+                decision.created_at, decision.decision, decision.tool_name, scope
+            );
+        }
+    }
+    if !rows.is_empty() {
+        if !output.is_empty() {
+            output.push('\n');
+        }
+        output.push_str("Recent mutating tool executions:\n");
+    }
     for row in rows {
         let arguments = audit_preview(&row.arguments, 120);
         let result = row

@@ -112,6 +112,13 @@ pub struct ToolExecution {
     pub started_at: i64,
 }
 
+pub struct ToolDecision {
+    pub tool_name: String,
+    pub decision: String,
+    pub scope: Option<String>,
+    pub created_at: i64,
+}
+
 pub struct ChildAgentRun {
     pub id: String,
     pub status: String,
@@ -419,6 +426,21 @@ impl Database {
                  );
                  CREATE INDEX child_agent_runs_session_id ON child_agent_runs(session_id, created_at);
                  PRAGMA user_version = 17;",
+            )?;
+        }
+        if version < 18 {
+            connection.execute_batch(
+                "CREATE TABLE tool_decisions (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                     tool_call_id TEXT NOT NULL,
+                     tool_name TEXT NOT NULL,
+                     decision TEXT NOT NULL CHECK (decision IN ('requested', 'approved', 'rejected')),
+                     scope TEXT,
+                     created_at INTEGER NOT NULL DEFAULT (unixepoch())
+                 );
+                 CREATE INDEX tool_decisions_session_id ON tool_decisions(session_id, id);
+                 PRAGMA user_version = 18;",
             )?;
         }
         connection.execute(
@@ -990,6 +1012,41 @@ impl Database {
                 arguments: row.get(2)?,
                 output: row.get(3)?,
                 started_at: row.get(4)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn record_tool_decision(
+        &self,
+        session_id: &str,
+        tool_call_id: &str,
+        tool_name: &str,
+        decision: &str,
+        scope: Option<&str>,
+    ) -> Result<()> {
+        self.connection.execute(
+            "INSERT INTO tool_decisions
+                 (session_id, tool_call_id, tool_name, decision, scope)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![session_id, tool_call_id, tool_name, decision, scope],
+        )?;
+        Ok(())
+    }
+
+    pub fn tool_decisions(&self, session_id: &str, limit: usize) -> Result<Vec<ToolDecision>> {
+        let limit = i64::try_from(limit).context("tool decision limit overflow")?;
+        let mut statement = self.connection.prepare(
+            "SELECT tool_name, decision, scope, created_at FROM tool_decisions
+             WHERE session_id = ?1 ORDER BY id DESC LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![session_id, limit], |row| {
+            Ok(ToolDecision {
+                tool_name: row.get(0)?,
+                decision: row.get(1)?,
+                scope: row.get(2)?,
+                created_at: row.get(3)?,
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -1954,7 +2011,7 @@ mod tests {
         let resumed = database.find_session(&session.id).unwrap().unwrap();
         assert_eq!(resumed.compaction_summary.as_deref(), Some("earlier work"));
         assert_eq!(resumed.summarized_upto, 7);
-        assert_eq!(database.schema_version().unwrap(), 17);
+        assert_eq!(database.schema_version().unwrap(), 18);
     }
 
     #[test]
@@ -1995,7 +2052,7 @@ mod tests {
                 .0,
             first.0
         );
-        assert_eq!(database.schema_version().unwrap(), 17);
+        assert_eq!(database.schema_version().unwrap(), 18);
     }
 
     #[test]
@@ -2036,7 +2093,7 @@ mod tests {
                 .unwrap(),
             "interrupted"
         );
-        assert_eq!(database.schema_version().unwrap(), 17);
+        assert_eq!(database.schema_version().unwrap(), 18);
         let rows = database.tool_executions(&session.id, 20).unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].tool_name, "run_command");
@@ -2075,7 +2132,7 @@ mod tests {
             database.recover_queued_inputs(&session.id).unwrap().len(),
             1
         );
-        assert_eq!(database.schema_version().unwrap(), 17);
+        assert_eq!(database.schema_version().unwrap(), 18);
     }
 
     #[test]
@@ -2095,7 +2152,30 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].status, "interrupted");
         assert_eq!(rows[1].result.as_deref(), Some("found it"));
-        assert_eq!(database.schema_version().unwrap(), 17);
+        assert_eq!(database.schema_version().unwrap(), 18);
+    }
+
+    #[test]
+    fn tool_decisions_are_append_only_and_keep_explicit_scopes() {
+        let database = database();
+        let session = database.create_session("test", "model").unwrap();
+        database
+            .record_tool_decision(&session.id, "c1", "run_command", "requested", None)
+            .unwrap();
+        database
+            .record_tool_decision(
+                &session.id,
+                "c1",
+                "run_command",
+                "approved",
+                Some("run_command:cargo test"),
+            )
+            .unwrap();
+        let rows = database.tool_decisions(&session.id, 20).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].decision, "approved");
+        assert_eq!(rows[0].scope.as_deref(), Some("run_command:cargo test"));
+        assert_eq!(rows[1].decision, "requested");
     }
 
     #[test]
