@@ -82,7 +82,15 @@ impl ExplorationGuard {
         }
         None
     }
+
+    fn blocks(&self, tool: &str) -> bool {
+        self.warnings >= 2 && is_inspection_tool(tool)
+    }
 }
+
+const EXPLORATION_BLOCKED: &str = "Error: exploration budget exhausted. Repository inspection is \
+temporarily blocked for this turn. Use patch_file now with the evidence already collected, or \
+return a precise blocker. A successful patch_file resets the exploration budget.";
 
 fn is_inspection_tool(name: &str) -> bool {
     matches!(
@@ -2149,7 +2157,9 @@ where
                     .as_ref()
                     .is_some_and(|s| s.status == PlanStatus::Pending)
                     && is_mutating_tool(&call.name);
-                let output = if is_mutating_held {
+                let output = if exploration_guard.blocks(&call.name) {
+                    EXPLORATION_BLOCKED.to_string()
+                } else if is_mutating_held {
                     "Plan Mode is active — propose a plan with update_plan and wait for approval before mutating tools.".to_string()
                 } else if call.name == tools::ASK_USER_TOOL {
                     tokio::select! {
@@ -2700,7 +2710,9 @@ where
                     render::render_tool_call(&call.name, &call.arguments, ui)
                 );
             }
-            let output = if call.name == tools::ASK_USER_TOOL {
+            let output = if exploration_guard.blocks(&call.name) {
+                EXPLORATION_BLOCKED.to_string()
+            } else if call.name == tools::ASK_USER_TOOL {
                 println!("    skipped: ask_user is not available in non-interactive mode");
                 "There is no user to ask in non-interactive mode. Proceed using your best \
                  judgment, or state your assumption in the final answer."
@@ -5910,6 +5922,22 @@ mod tests {
         assert_eq!(guard.calls, 0);
         assert_eq!(guard.bytes, 0);
         assert_eq!(guard.warnings, 0);
+    }
+
+    #[test]
+    fn exploration_guard_hard_blocks_reads_until_a_patch_succeeds() {
+        let mut guard = ExplorationGuard::default();
+        for _ in 0..EXPLORATION_FINAL_CALLS {
+            guard.observe("read_file", "result");
+        }
+        assert!(guard.warning().unwrap().contains("budget is exhausted"));
+        assert!(guard.blocks("read_file"));
+        assert!(guard.blocks("grep"));
+        assert!(!guard.blocks("patch_file"));
+        assert!(!guard.blocks("run_command"));
+
+        guard.observe("patch_file", "patched file");
+        assert!(!guard.blocks("read_file"));
     }
     use crate::pricing::ModelPrice;
     use std::fs;

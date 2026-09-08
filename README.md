@@ -849,8 +849,10 @@ normal path checks, journals, and undo snapshots.
 On coding turns, Kamui also watches for exploration drift. If repeated repository reads consume a
 large number of calls or bytes without a successful file edit, it adds a private steering reminder
 to the current model request to narrow the investigation and implement or state a precise blocker.
-The reminder is advisory rather than a hard tool limit, is emitted at most twice per turn, is not
-stored as user conversation history, and does not apply to deliberately read-only child agents.
+The first reminder is advisory. After the second threshold, further repository-inspection calls are
+rejected locally until a file patch succeeds, while editing and verification tools remain available.
+Reminders are emitted at most twice per turn, are not stored as user conversation history, and do
+not apply to deliberately read-only child agents.
 
 In the fullscreen UI, prompts submitted while the agent is busy are persisted before Kamui labels
 them queued. Their FIFO IDs follow them into steering or the next turn and are removed atomically
