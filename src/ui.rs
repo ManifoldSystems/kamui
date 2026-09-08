@@ -1498,6 +1498,12 @@ pub enum HubEvent {
     Quit,
 }
 
+#[derive(Clone)]
+pub struct QueuedInput {
+    pub id: Option<String>,
+    pub content: String,
+}
+
 /// Owns the keyboard for the whole session, opencode-style. While the agent runs the editor
 /// stays live: typed lines queue instead of racing the turn, Esc raises an interrupt, and
 /// page keys keep scrolling. Approval / ask_user prompts register a one-shot requester whose
@@ -1506,7 +1512,8 @@ pub struct InputHub {
     rx: tokio::sync::mpsc::UnboundedReceiver<HubEvent>,
     pub interrupt: Arc<tokio::sync::Notify>,
     busy: Arc<std::sync::atomic::AtomicBool>,
-    queue: Arc<Mutex<VecDeque<String>>>,
+    queue: Arc<Mutex<VecDeque<QueuedInput>>>,
+    queue_context: Arc<std::sync::RwLock<Option<(std::path::PathBuf, String)>>>,
     requester: Arc<Mutex<Option<tokio::sync::oneshot::Sender<String>>>>,
     candidates: Arc<std::sync::RwLock<Vec<crate::tui::Candidate>>>,
     screen: ScreenHandle,
@@ -1523,6 +1530,7 @@ impl InputHub {
         let interrupt = Arc::new(tokio::sync::Notify::new());
         let busy = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let queue = Arc::new(Mutex::new(VecDeque::new()));
+        let queue_context = Arc::new(std::sync::RwLock::new(None));
         let requester: Arc<Mutex<Option<tokio::sync::oneshot::Sender<String>>>> =
             Arc::new(Mutex::new(None));
         let candidates = Arc::new(std::sync::RwLock::new(Vec::new()));
@@ -1533,6 +1541,7 @@ impl InputHub {
             let interrupt = interrupt.clone();
             let busy = busy.clone();
             let queue = queue.clone();
+            let queue_context = queue_context.clone();
             let requester = requester.clone();
             let candidates = candidates.clone();
             let models_src = models_src.clone();
@@ -1545,6 +1554,7 @@ impl InputHub {
                     interrupt,
                     busy,
                     queue,
+                    queue_context,
                     requester,
                     candidates,
                     models_src,
@@ -1558,6 +1568,7 @@ impl InputHub {
             interrupt,
             busy,
             queue,
+            queue_context,
             requester,
             candidates,
             screen: hub_screen,
@@ -1692,11 +1703,42 @@ impl InputHub {
         self.queue
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .push_back(line);
+            .push_back(QueuedInput {
+                id: None,
+                content: line,
+            });
+    }
+
+    pub fn push_queued(&self, input: QueuedInput) {
+        self.queue
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push_back(input);
+    }
+
+    pub fn set_queue_context(&self, path: std::path::PathBuf, session_id: String) {
+        *self
+            .queue_context
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = Some((path, session_id));
+    }
+
+    pub fn clear_queue(&self) {
+        self.queue
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+    }
+
+    pub fn clear_queue_context(&self) {
+        *self
+            .queue_context
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = None;
     }
 
     /// Pops a queued line, if any; drained between turns. Updates the footer count.
-    pub fn pop_queue(&self) -> Option<String> {
+    pub fn pop_queue(&self) -> Option<QueuedInput> {
         let popped = self
             .queue
             .lock()
@@ -2407,7 +2449,8 @@ fn input_thread(
     tx: tokio::sync::mpsc::UnboundedSender<HubEvent>,
     interrupt: Arc<tokio::sync::Notify>,
     busy: Arc<std::sync::atomic::AtomicBool>,
-    queue: Arc<Mutex<VecDeque<String>>>,
+    queue: Arc<Mutex<VecDeque<QueuedInput>>>,
+    queue_context: Arc<std::sync::RwLock<Option<(std::path::PathBuf, String)>>>,
     requester: Arc<Mutex<Option<tokio::sync::oneshot::Sender<String>>>>,
     candidates: Arc<std::sync::RwLock<Vec<crate::tui::Candidate>>>,
     models_src: Arc<std::sync::RwLock<Vec<(String, String)>>>,
@@ -2614,7 +2657,14 @@ fn input_thread(
                                 };
                                 if let Some(line) = line {
                                     submit_line(
-                                        &screen, &tx, &requester, &busy, &interrupt, &queue, line,
+                                        &screen,
+                                        &tx,
+                                        &requester,
+                                        &busy,
+                                        &interrupt,
+                                        &queue,
+                                        &queue_context,
+                                        line,
                                     );
                                 }
                             }
@@ -2676,6 +2726,7 @@ fn input_thread(
                                 &busy,
                                 &interrupt,
                                 &queue,
+                                &queue_context,
                                 "/mode next".into(),
                             ),
                             Some(HitTarget::Footer(FooterAction::Help)) => {
@@ -2962,7 +3013,16 @@ fn input_thread(
                             let line = format!("{}{}", dialog.prefix, value);
                             s.model.dialog = None;
                             drop(s);
-                            submit_line(&screen, &tx, &requester, &busy, &interrupt, &queue, line);
+                            submit_line(
+                                &screen,
+                                &tx,
+                                &requester,
+                                &busy,
+                                &interrupt,
+                                &queue,
+                                &queue_context,
+                                line,
+                            );
                             continue;
                         }
                     }
@@ -3210,6 +3270,7 @@ fn input_thread(
                         &busy,
                         &interrupt,
                         &queue,
+                        &queue_context,
                         "/mode next".to_string(),
                     );
                 }
@@ -3222,6 +3283,7 @@ fn input_thread(
                     &busy,
                     &interrupt,
                     &queue,
+                    &queue_context,
                     "/mode prev".to_string(),
                 );
             }
@@ -3323,7 +3385,16 @@ fn input_thread(
                     }
                     history_idx = history.len();
                 }
-                submit_line(&screen, &tx, &requester, &busy, &interrupt, &queue, line);
+                submit_line(
+                    &screen,
+                    &tx,
+                    &requester,
+                    &busy,
+                    &interrupt,
+                    &queue,
+                    &queue_context,
+                    line,
+                );
             }
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 scroll_screen(&screen, -(page_rows(&screen) / 2));
@@ -3435,13 +3506,15 @@ fn insert_clipboard_reference(buf: &mut String, caret: usize) -> usize {
 
 /// Shared submit path for the editor and modal dialogs: a waiting approval/ask_user takes
 /// the answer, busy queues it, idle sends it straight to the chat loop.
+#[allow(clippy::too_many_arguments)]
 fn submit_line(
     screen: &ScreenHandle,
     tx: &tokio::sync::mpsc::UnboundedSender<HubEvent>,
     requester: &Arc<Mutex<Option<tokio::sync::oneshot::Sender<String>>>>,
     busy: &Arc<std::sync::atomic::AtomicBool>,
     interrupt: &Arc<tokio::sync::Notify>,
-    queue: &Arc<Mutex<VecDeque<String>>>,
+    queue: &Arc<Mutex<VecDeque<QueuedInput>>>,
+    queue_context: &Arc<std::sync::RwLock<Option<(std::path::PathBuf, String)>>>,
     line: String,
 ) {
     if line.is_empty() {
@@ -3474,10 +3547,29 @@ fn submit_line(
     if let Some(tx) = answer_tx {
         let _ = tx.send(line);
     } else if busy.load(std::sync::atomic::Ordering::SeqCst) {
+        let persisted = queue_context
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .map(|(path, session_id)| {
+                crate::storage::Database::enqueue_input_at(path, session_id, &line)
+            });
+        let id = match persisted {
+            Some(Ok(id)) => Some(id),
+            Some(Err(error)) => {
+                let mut s = lock_screen(&screen.0);
+                let _ = s.add_notice(format!("could not queue input: {error:#}"));
+                return;
+            }
+            None => None,
+        };
         queue
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .push_back(line.clone());
+            .push_back(QueuedInput {
+                id,
+                content: line.clone(),
+            });
         let mut s = lock_screen(&screen.0);
         s.model.queued_count = queue.lock().unwrap_or_else(PoisonError::into_inner).len();
         let _ = s.add_notice(format!("queued: {line}"));

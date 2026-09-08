@@ -819,6 +819,11 @@ Mutating tool calls are also journaled in SQLite before execution. On a restart,
 are marked interrupted and shown when their session is resumed. Kamui never retries them
 automatically because the command or file write may already have taken effect.
 
+In the fullscreen UI, prompts submitted while the agent is busy are persisted before Kamui labels
+them queued. Their FIFO IDs follow them into steering or the next turn and are removed atomically
+with the completed turn. Restarting and resuming restores both queued and previously claimed input,
+so a crash cannot silently lose text typed while the agent was running.
+
 If the [RTK](https://github.com/rtk-ai/rtk) binary is installed, simple approved commands are
 automatically prefixed with `rtk` so their output is compressed before it reaches the model. RTK is
 optional: commands with shell operators, commands whose first word the shell runs itself (`cd`,

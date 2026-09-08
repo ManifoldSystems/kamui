@@ -361,6 +361,19 @@ impl Database {
                  PRAGMA user_version = 14;",
             )?;
         }
+        if version < 15 {
+            connection.execute_batch(
+                "CREATE TABLE queued_inputs (
+                     id TEXT PRIMARY KEY,
+                     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                     content TEXT NOT NULL,
+                     status TEXT NOT NULL DEFAULT 'queued' CHECK (status IN ('queued', 'claimed')),
+                     created_at INTEGER NOT NULL DEFAULT (unixepoch())
+                 );
+                 CREATE INDEX queued_inputs_session_id ON queued_inputs(session_id, created_at);
+                 PRAGMA user_version = 15;",
+            )?;
+        }
         connection.execute(
             "UPDATE tool_executions SET status = 'interrupted', finished_at = unixepoch()
              WHERE status = 'running'",
@@ -744,9 +757,10 @@ impl Database {
         model: &str,
         finish_reason: &str,
     ) -> Result<()> {
-        self.save_turn_with_undo(session_id, messages, usage, model, finish_reason, None)
+        self.save_turn_with_undo(session_id, messages, usage, model, finish_reason, None, &[])
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn save_turn_with_undo(
         &self,
         session_id: &str,
@@ -755,6 +769,7 @@ impl Database {
         model: &str,
         finish_reason: &str,
         undo_snapshot: Option<&str>,
+        completed_inputs: &[String],
     ) -> Result<()> {
         let input_tokens =
             i64::try_from(usage.prompt_tokens).context("input token count overflow")?;
@@ -813,6 +828,9 @@ impl Database {
              WHERE id = ?1",
             params![session_id, make_title(title_source), undo_snapshot],
         )?;
+        for id in completed_inputs {
+            transaction.execute("DELETE FROM queued_inputs WHERE id = ?1", [id])?;
+        }
         transaction.commit()?;
         Ok(())
     }
@@ -866,6 +884,49 @@ impl Database {
         let rows = statement.query_map([session_id], |row| row.get(0))?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
+    }
+
+    pub fn claim_queued_input(&self, id: &str) -> Result<()> {
+        self.connection.execute(
+            "UPDATE queued_inputs SET status = 'claimed' WHERE id = ?1",
+            [id],
+        )?;
+        Ok(())
+    }
+
+    pub fn complete_queued_inputs(&self, ids: &[String]) -> Result<()> {
+        let transaction = self.connection.unchecked_transaction()?;
+        for id in ids {
+            transaction.execute("DELETE FROM queued_inputs WHERE id = ?1", [id])?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn recover_queued_inputs(&self, session_id: &str) -> Result<Vec<(String, String)>> {
+        self.connection.execute(
+            "UPDATE queued_inputs SET status = 'queued'
+             WHERE session_id = ?1 AND status = 'claimed'",
+            [session_id],
+        )?;
+        let mut statement = self.connection.prepare(
+            "SELECT id, content FROM queued_inputs
+             WHERE session_id = ?1 ORDER BY created_at, rowid",
+        )?;
+        let rows = statement.query_map([session_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn enqueue_input_at(path: &Path, session_id: &str, content: &str) -> Result<String> {
+        let connection = Connection::open(path)?;
+        connection.busy_timeout(Duration::from_secs(5))?;
+        let id = Uuid::new_v4().to_string();
+        connection.execute(
+            "INSERT INTO queued_inputs (id, session_id, content) VALUES (?1, ?2, ?3)",
+            params![id, session_id, content],
+        )?;
+        Ok(id)
     }
 
     pub fn save_generated_title(
@@ -1737,7 +1798,7 @@ mod tests {
         let resumed = database.find_session(&session.id).unwrap().unwrap();
         assert_eq!(resumed.compaction_summary.as_deref(), Some("earlier work"));
         assert_eq!(resumed.summarized_upto, 7);
-        assert_eq!(database.schema_version().unwrap(), 14);
+        assert_eq!(database.schema_version().unwrap(), 15);
     }
 
     #[test]
@@ -1752,6 +1813,7 @@ mod tests {
                 "model",
                 "stop",
                 Some(r#"[["/tmp/a.txt","original"]]"#),
+                &[],
             )
             .unwrap();
 
@@ -1809,7 +1871,42 @@ mod tests {
                 .unwrap(),
             "interrupted"
         );
-        assert_eq!(database.schema_version().unwrap(), 14);
+        assert_eq!(database.schema_version().unwrap(), 15);
+    }
+
+    #[test]
+    fn queued_inputs_recover_in_fifo_order_and_complete_explicitly() {
+        let database = database();
+        let session = database.create_session("test", "model").unwrap();
+        let first = Uuid::new_v4().to_string();
+        let second = Uuid::new_v4().to_string();
+        database
+            .connection
+            .execute(
+                "INSERT INTO queued_inputs (id, session_id, content) VALUES (?1, ?2, 'first')",
+                params![first, session.id],
+            )
+            .unwrap();
+        database
+            .connection
+            .execute(
+                "INSERT INTO queued_inputs (id, session_id, content) VALUES (?1, ?2, 'second')",
+                params![second, session.id],
+            )
+            .unwrap();
+        database.claim_queued_input(&first).unwrap();
+
+        let recovered = database.recover_queued_inputs(&session.id).unwrap();
+        assert_eq!(
+            recovered,
+            vec![(first.clone(), "first".into()), (second, "second".into())]
+        );
+        database.complete_queued_inputs(&[first]).unwrap();
+        assert_eq!(
+            database.recover_queued_inputs(&session.id).unwrap().len(),
+            1
+        );
+        assert_eq!(database.schema_version().unwrap(), 15);
     }
 
     #[test]

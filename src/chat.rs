@@ -14,7 +14,7 @@ use crate::storage::{Database, Session};
 use crate::terminal::{Style, Ui};
 use crate::tools;
 use crate::tools::ToolRegistry;
-use crate::ui::{self, ChatUi, HubEvent, InputHub};
+use crate::ui::{self, ChatUi, HubEvent, InputHub, QueuedInput};
 use anyhow::{Context, Result};
 use chrono::{Local, TimeZone};
 use dialoguer::console::Term;
@@ -212,6 +212,14 @@ where
             } else {
                 print_history_preview(&messages);
             }
+            if let Some(hub) = hub.as_ref() {
+                for (id, content) in database.recover_queued_inputs(&session.id)? {
+                    hub.push_queued(QueuedInput {
+                        id: Some(id),
+                        content,
+                    });
+                }
+            }
             (Some(session), messages)
         }
         None => (None, Vec::new()),
@@ -356,7 +364,7 @@ where
             &active.model,
             active.send_session_id,
         )?;
-        let input = if use_tui {
+        let (input, admitted_input) = if use_tui {
             let hub = hub.as_mut().expect("tui implies hub");
             let cmds: Vec<crate::commands::CustomCommand> = command_library.list().to_vec();
             let sks: Vec<crate::skills::Skill> = skill_library.list().to_vec();
@@ -364,10 +372,10 @@ where
             chat_ui.prompt()?;
             // Queued lines typed while the agent ran are consumed first, in order.
             if let Some(queued) = hub.pop_queue() {
-                queued
+                (queued.content, queued.id)
             } else {
                 match hub.next().await {
-                    Some(HubEvent::Line(line)) => line,
+                    Some(HubEvent::Line(line)) => (line, None),
                     Some(HubEvent::Quit) | None => {
                         shutdown(
                             &mut chat_ui,
@@ -414,7 +422,7 @@ where
                     break;
                 }
             };
-            line
+            (line, None)
         };
         let input = input.trim();
 
@@ -449,6 +457,9 @@ where
             let (outcome, ok) = crate::terminal::tool_outcome_parts(&output, started.elapsed());
             chat_ui.tool_call("shell", direct)?;
             chat_ui.tool_finished(&outcome, ok, tool_body(&output))?;
+            if let Some(id) = admitted_input.as_ref() {
+                database.complete_queued_inputs(std::slice::from_ref(id))?;
+            }
             continue;
         }
         // Slash commands are UI operations, not conversation turns — opencode hides them
@@ -1092,7 +1103,7 @@ where
                 chat_ui.leave_intro()?;
             }
             let tui_sink = if use_tui { Some(&mut chat_ui) } else { None };
-            if let Err(error) = handle_command(
+            let command_result = handle_command(
                 &canonical_input,
                 provider.as_ref(),
                 context_window,
@@ -1103,7 +1114,8 @@ where
                 &mut last_turn_snapshot,
                 &config.prices,
                 tui_sink,
-            ) {
+            );
+            if let Err(error) = &command_result {
                 if chat_ui.is_fullscreen() {
                     chat_ui.error(&format!("Command failed: {error:#}"))?;
                 } else {
@@ -1112,6 +1124,11 @@ where
                         ui.style(&format!("Command failed: {error:#}\n"), &[Style::Red])
                     );
                 }
+            }
+            if command_result.is_ok()
+                && let Some(id) = admitted_input.as_ref()
+            {
+                database.complete_queued_inputs(std::slice::from_ref(id))?;
             }
             // Sidebar follows /new //resume: session title, id, and context reset.
             if use_tui {
@@ -1137,6 +1154,26 @@ where
             // Sync Plan Mode with session changes from /new /resume /delete.
             let new_session_id = session.as_ref().map(|s| s.id.clone());
             if prev_session_id != new_session_id {
+                if let Some(hub) = hub.as_ref() {
+                    hub.clear_queue();
+                    match session.as_ref() {
+                        Some(active_session) => {
+                            hub.set_queue_context(
+                                database.path().to_path_buf(),
+                                active_session.id.clone(),
+                            );
+                            for (id, content) in
+                                database.recover_queued_inputs(&active_session.id)?
+                            {
+                                hub.push_queued(QueuedInput {
+                                    id: Some(id),
+                                    content,
+                                });
+                            }
+                        }
+                        None => hub.clear_queue_context(),
+                    }
+                }
                 if let Some(id) = new_session_id {
                     plan_mode = database
                         .get_plan(&id)
@@ -1392,6 +1429,19 @@ where
             Message::user_with_images(expanded.text, expanded.images),
         );
 
+        let is_first_exchange = session.is_none();
+        let active_session = match session.as_ref() {
+            Some(active_session) => active_session,
+            None => session.insert(database.create_session(provider.name(), &active.model)?),
+        };
+        if let Some(hub) = hub.as_ref() {
+            hub.set_queue_context(database.path().to_path_buf(), active_session.id.clone());
+        }
+        let mut admitted_inputs: Vec<String> = admitted_input.into_iter().collect();
+        if let Some(id) = admitted_inputs.first() {
+            database.claim_queued_input(id)?;
+        }
+
         // Agent loop: stream a turn, run any tools it requests, and repeat until a plain answer.
         // `tool_trail` collects this turn's intermediate tool-request and tool-result messages so
         // they can be persisted alongside the prompt and final answer.
@@ -1424,7 +1474,7 @@ where
                     if plan_mode
                         .as_ref()
                         .is_some_and(|state| state.status == PlanStatus::Pending)
-                        && is_plan_approval(&line)
+                        && is_plan_approval(&line.content)
                     {
                         if let Some(state) = plan_mode.as_mut() {
                             state.status = PlanStatus::Approved;
@@ -1455,14 +1505,21 @@ where
                             None,
                             None,
                         );
+                        if let Some(id) = line.id.as_ref() {
+                            database.complete_queued_inputs(std::slice::from_ref(id))?;
+                        }
                         continue;
                     }
-                    if line.trim_start().starts_with('/') {
-                        hub.push_prompt(line);
+                    if line.content.trim_start().starts_with('/') {
+                        hub.push_queued(line);
                         continue;
                     }
-                    chat_ui.user_steering(&line)?;
-                    let message = Message::user(&line);
+                    if let Some(id) = line.id.as_ref() {
+                        database.claim_queued_input(id)?;
+                        admitted_inputs.push(id.clone());
+                    }
+                    chat_ui.user_steering(&line.content)?;
+                    let message = Message::user(&line.content);
                     turn_messages.push(message.clone());
                     tool_trail.push(message);
                 }
@@ -2073,7 +2130,6 @@ where
         turn_record.append(&mut tool_trail);
         turn_record.push(assistant_message);
 
-        let is_first_exchange = session.is_none();
         let active_session = match session.as_mut() {
             Some(session) => session,
             None => session.insert(database.create_session(provider.name(), &active.model)?),
@@ -2086,6 +2142,7 @@ where
             &active.model,
             &final_finish,
             undo_snapshot.as_deref(),
+            &admitted_inputs,
         )?;
         chat_ui.copy_answer(&final_answer)?;
         // Persist plan state after save (session now exists). Approved clears pending.

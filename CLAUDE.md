@@ -164,6 +164,9 @@ effort or operational risk is disproportionate to their immediate value.
   failed outcomes close the row; any row still running when the database reopens becomes
   `interrupted`, is reported on resume, and is never retried automatically because its side effects
   are unknown.
+- Fullscreen input submitted while a turn is busy is persisted in `queued_inputs` before the UI
+  acknowledges it. A stable queue id follows steering/next-turn promotion and is deleted in the
+  same transaction that saves the completed turn; claimed rows return to queued on resume.
 - Session IDs may be resolved from an unambiguous prefix. The UI normally displays the first eight
   characters.
 - Resume displays the six most recent messages and reports how many earlier messages were omitted.
@@ -452,6 +455,8 @@ after title generation while later turns are fine.
   cosine scoring below 2,000 chunks and bounded FTS/LSH candidate scoring above it.
 - `user_version = 14` adds `tool_executions`. Running mutating calls are recovered as interrupted,
   not retried; this table is durable audit data and cascades with its session.
+- `user_version = 15` adds session-scoped `queued_inputs`. FIFO rows survive restarts, claimed rows
+  are recovered on resume, and completion is atomic with turn persistence.
 
 ## Configuration
 
