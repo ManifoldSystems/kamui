@@ -570,6 +570,7 @@ TTY, `NO_COLOR` keeps the fullscreen TUI but removes its semantic foreground/bac
 | `/search <text>` | Search saved messages across all sessions |
 | `/compact` | Summarize older messages to free up context |
 | `/undo` | Revert the files patched by the last turn |
+| `/redo` | Reapply the last undone file edits |
 | `/jobs` | List temporary session jobs and persistent scheduled jobs |
 | `/index` | Rebuild the semantic-search index (needs `embedding_model`) |
 | `/commands` | List your own prompt commands |
@@ -811,9 +812,9 @@ Each file `patch_file` touches is approved individually, exactly as before, but 
 snapshot of what every touched file looked like before the turn started. If a multi-file edit is
 interrupted with `Ctrl+C` partway through, the files it already changed are automatically reverted
 so the turn never leaves the repository half-edited with no trace in session history. `/undo`
-reverts the same way for a turn that *did* complete — one level, most recent turn only. The snapshot
-is stored with the session, so it remains available after restarting and resuming; a second `/undo`
-has nothing left to do.
+reverts the same way for completed edit turns. Undo and redo are multi-level SQLite-backed stacks,
+so both survive restarting and resuming. A new edit after an undo clears the redo branch, matching a
+normal editor; a partial filesystem failure leaves the stack position unchanged for recovery.
 
 Mutating tool calls are also journaled in SQLite before execution. On a restart, calls left running
 are marked interrupted and shown when their session is resumed. Kamui never retries them

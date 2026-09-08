@@ -9,6 +9,7 @@ pub const BUILTINS: &[(&str, &str)] = &[
     ("search", "Search saved messages"),
     ("compact", "Summarize older messages"),
     ("undo", "Revert the last turn's file edits"),
+    ("redo", "Reapply the last undone file edits"),
     ("jobs", "List session and scheduled jobs"),
     ("index", "Rebuild the semantic-search index"),
     ("commands", "List your own prompt commands"),

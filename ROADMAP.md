@@ -558,7 +558,7 @@ independent commands or file edits without weakening reviewability.
 - [ ] Preserve path validation, command allowlists, and capability checks for every item
 - [ ] Support stop-on-first-error versus continue-independent-items behavior
 - [ ] Add batch progress and per-item status in the TUI
-- [ ] Add atomic batch rollback while preserving the existing durable one-level `/undo`
+- [ ] Add atomic batch rollback while preserving the existing durable multi-level `/undo`/`/redo`
 - [ ] Persist an audit record for every requested, approved, rejected, failed, and reverted call
 
 ## Phase 9: Context and Agent UX

@@ -21,7 +21,6 @@ pub struct Session {
     pub model: String,
     pub compaction_summary: Option<String>,
     pub summarized_upto: usize,
-    pub undo_snapshot: Option<String>,
 }
 
 pub struct SessionSummary {
@@ -374,6 +373,23 @@ impl Database {
                  PRAGMA user_version = 15;",
             )?;
         }
+        if version < 16 {
+            connection.execute_batch(
+                "CREATE TABLE edit_snapshots (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                     before_snapshot TEXT NOT NULL,
+                     after_snapshot TEXT,
+                     state TEXT NOT NULL DEFAULT 'undo' CHECK (state IN ('undo', 'redo')),
+                     created_at INTEGER NOT NULL DEFAULT (unixepoch())
+                 );
+                 CREATE INDEX edit_snapshots_session_id ON edit_snapshots(session_id, id);
+                 INSERT INTO edit_snapshots (session_id, before_snapshot)
+                     SELECT id, undo_snapshot FROM sessions WHERE undo_snapshot IS NOT NULL;
+                 UPDATE sessions SET undo_snapshot = NULL;
+                 PRAGMA user_version = 16;",
+            )?;
+        }
         connection.execute(
             "UPDATE tool_executions SET status = 'interrupted', finished_at = unixepoch()
              WHERE status = 'running'",
@@ -656,7 +672,6 @@ impl Database {
             model: model.to_string(),
             compaction_summary: None,
             summarized_upto: 0,
-            undo_snapshot: None,
         };
         self.connection.execute(
             "INSERT INTO sessions (id, title, provider, model) VALUES (?1, ?2, ?3, ?4)",
@@ -668,7 +683,7 @@ impl Database {
     pub fn find_session(&self, id_prefix: &str) -> Result<Option<Session>> {
         let pattern = format!("{id_prefix}%");
         let mut statement = self.connection.prepare(
-            "SELECT id, title, provider, model, compaction_summary, summarized_upto, undo_snapshot FROM sessions
+            "SELECT id, title, provider, model, compaction_summary, summarized_upto FROM sessions
              WHERE id LIKE ?1 ORDER BY updated_at DESC LIMIT 2",
         )?;
         let sessions = statement
@@ -757,7 +772,16 @@ impl Database {
         model: &str,
         finish_reason: &str,
     ) -> Result<()> {
-        self.save_turn_with_undo(session_id, messages, usage, model, finish_reason, None, &[])
+        self.save_turn_with_undo(
+            session_id,
+            messages,
+            usage,
+            model,
+            finish_reason,
+            None,
+            None,
+            &[],
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -768,7 +792,8 @@ impl Database {
         usage: &Usage,
         model: &str,
         finish_reason: &str,
-        undo_snapshot: Option<&str>,
+        before_snapshot: Option<&str>,
+        after_snapshot: Option<&str>,
         completed_inputs: &[String],
     ) -> Result<()> {
         let input_tokens =
@@ -823,11 +848,22 @@ impl Database {
         transaction.execute(
             "UPDATE sessions SET
                  title = CASE WHEN title = 'New chat' THEN ?2 ELSE title END,
-                 undo_snapshot = ?3,
                  updated_at = unixepoch()
              WHERE id = ?1",
-            params![session_id, make_title(title_source), undo_snapshot],
+            params![session_id, make_title(title_source)],
         )?;
+        if let (Some(before), Some(after)) = (before_snapshot, after_snapshot) {
+            transaction.execute(
+                "DELETE FROM edit_snapshots WHERE session_id = ?1 AND state = 'redo'",
+                [session_id],
+            )?;
+            transaction.execute(
+                "INSERT INTO edit_snapshots
+                     (session_id, before_snapshot, after_snapshot, state)
+                 VALUES (?1, ?2, ?3, 'undo')",
+                params![session_id, before, after],
+            )?;
+        }
         for id in completed_inputs {
             transaction.execute("DELETE FROM queued_inputs WHERE id = ?1", [id])?;
         }
@@ -835,10 +871,28 @@ impl Database {
         Ok(())
     }
 
-    pub fn clear_undo_snapshot(&self, session_id: &str) -> Result<()> {
+    pub fn next_edit_snapshot(
+        &self,
+        session_id: &str,
+        state: &str,
+    ) -> Result<Option<(i64, String, Option<String>)>> {
+        let order = if state == "redo" { "ASC" } else { "DESC" };
+        let query = format!(
+            "SELECT id, before_snapshot, after_snapshot FROM edit_snapshots
+             WHERE session_id = ?1 AND state = ?2 ORDER BY id {order} LIMIT 1"
+        );
+        self.connection
+            .query_row(&query, params![session_id, state], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn move_edit_snapshot(&self, id: i64, state: &str) -> Result<()> {
         self.connection.execute(
-            "UPDATE sessions SET undo_snapshot = NULL, updated_at = unixepoch() WHERE id = ?1",
-            [session_id],
+            "UPDATE edit_snapshots SET state = ?2 WHERE id = ?1",
+            params![id, state],
         )?;
         Ok(())
     }
@@ -1712,7 +1766,6 @@ fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
         model: row.get(3)?,
         compaction_summary: row.get(4)?,
         summarized_upto: row.get::<_, i64>(5)?.max(0) as usize,
-        undo_snapshot: row.get(6)?,
     })
 }
 
@@ -1798,11 +1851,11 @@ mod tests {
         let resumed = database.find_session(&session.id).unwrap().unwrap();
         assert_eq!(resumed.compaction_summary.as_deref(), Some("earlier work"));
         assert_eq!(resumed.summarized_upto, 7);
-        assert_eq!(database.schema_version().unwrap(), 15);
+        assert_eq!(database.schema_version().unwrap(), 16);
     }
 
     #[test]
-    fn undo_snapshot_is_saved_with_the_turn_and_can_be_cleared() {
+    fn edit_snapshots_form_undo_and_redo_stacks() {
         let database = database();
         let session = database.create_session("test", "model").unwrap();
         database
@@ -1813,24 +1866,33 @@ mod tests {
                 "model",
                 "stop",
                 Some(r#"[["/tmp/a.txt","original"]]"#),
+                Some(r#"[["/tmp/a.txt","changed"]]"#),
                 &[],
             )
             .unwrap();
 
-        let resumed = database.find_session(&session.id).unwrap().unwrap();
-        assert_eq!(
-            resumed.undo_snapshot.as_deref(),
-            Some(r#"[["/tmp/a.txt","original"]]"#)
-        );
-        database.clear_undo_snapshot(&session.id).unwrap();
+        let first = database
+            .next_edit_snapshot(&session.id, "undo")
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.1, r#"[["/tmp/a.txt","original"]]"#);
+        assert_eq!(first.2.as_deref(), Some(r#"[["/tmp/a.txt","changed"]]"#));
+        database.move_edit_snapshot(first.0, "redo").unwrap();
         assert!(
             database
-                .find_session(&session.id)
+                .next_edit_snapshot(&session.id, "undo")
                 .unwrap()
-                .unwrap()
-                .undo_snapshot
                 .is_none()
         );
+        assert_eq!(
+            database
+                .next_edit_snapshot(&session.id, "redo")
+                .unwrap()
+                .unwrap()
+                .0,
+            first.0
+        );
+        assert_eq!(database.schema_version().unwrap(), 16);
     }
 
     #[test]
@@ -1871,7 +1933,7 @@ mod tests {
                 .unwrap(),
             "interrupted"
         );
-        assert_eq!(database.schema_version().unwrap(), 15);
+        assert_eq!(database.schema_version().unwrap(), 16);
     }
 
     #[test]
@@ -1906,7 +1968,7 @@ mod tests {
             database.recover_queued_inputs(&session.id).unwrap().len(),
             1
         );
-        assert_eq!(database.schema_version().unwrap(), 15);
+        assert_eq!(database.schema_version().unwrap(), 16);
     }
 
     #[test]

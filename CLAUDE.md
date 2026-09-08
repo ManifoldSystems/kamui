@@ -56,7 +56,7 @@ effort or operational risk is disproportionate to their immediate value.
   prompt shuts down gracefully. Windows stdin uses a reader thread and Tokio channel so the async
   runtime does not block on terminal input.
 - Supported chat commands are `/help`, `/new`, `/sessions`, `/resume <id>`, `/model [name]`,
-  `/rename <id> <title>`, `/search <text>`, `/compact`, `/undo`, `/jobs`, `/index`, `/commands`,
+  `/rename <id> <title>`, `/search <text>`, `/compact`, `/undo`, `/redo`, `/jobs`, `/index`, `/commands`,
   `/delete <id>`, `/stats`, `/usage`, `/status`, `/memory`, `/forget <text>` (or `/forget all`),
   and `/exit`. Plain `exit` also quits.
 - Users define their own slash commands as markdown files (`src/commands.rs`): global ones in
@@ -157,9 +157,9 @@ effort or operational risk is disproportionate to their immediate value.
   the first time it is touched in a turn (`chat::snapshot_patch_target`). If the turn is cancelled
   with `Ctrl+C` before it finishes, every file it already changed is reverted automatically
   (`chat::revert_on_cancel`/`revert_snapshot`) so a multi-file edit can never be left half-applied
-  with no trace in session history. `/undo` performs the same revert for the most recently
-  *completed* turn — one level, persisted atomically with the turn in SQLite, restored on resume,
-  and cleared after successful use or when a later turn replaces it.
+  with no trace in session history. `/undo` and `/redo` use durable multi-level edit stacks,
+  persisted atomically with completed turns and restored on resume. A new edit clears the redo
+  branch; a partial revert does not advance either stack.
 - Mutating tool calls are written to the SQLite execution journal before dispatch. Completed and
   failed outcomes close the row; any row still running when the database reopens becomes
   `interrupted`, is reported on resume, and is never retried automatically because its side effects
@@ -457,6 +457,8 @@ after title generation while later turns are fine.
   not retried; this table is durable audit data and cascades with its session.
 - `user_version = 15` adds session-scoped `queued_inputs`. FIFO rows survive restarts, claimed rows
   are recovered on resume, and completion is atomic with turn persistence.
+- `user_version = 16` adds `edit_snapshots`, migrating the previous one-level session snapshot into
+  the undo stack. New rows carry before/after states for durable multi-level undo and redo.
 
 ## Configuration
 

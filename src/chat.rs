@@ -304,13 +304,9 @@ where
         .as_ref()
         .map(|session| session.summarized_upto.min(messages.len()))
         .unwrap_or(0);
-    // The most recently completed turn's pre-edit file snapshot, if it touched any files, so
-    // `/undo` can revert it. `None` once nothing is left to undo.
-    let mut last_turn_snapshot = session.as_ref().and_then(|session| {
-        decode_undo_snapshot(session.undo_snapshot.as_deref())
-            .ok()
-            .flatten()
-    });
+    // Cache of the last turn's edited paths for post-save index refresh. Undo/redo state lives in
+    // SQLite's edit_snapshots stack and is not derived from this process-local value.
+    let mut last_turn_snapshot: Option<HashMap<PathBuf, Option<String>>> = None;
     // Tool names granted a standing "always allow" for the rest of this session (ported from
     // Kumo's "Always allow" approval button). Session-scoped: cleared whenever a chat effectively
     // restarts (`/new`, or `/delete` of the active session), same as `last_turn_snapshot`.
@@ -1043,20 +1039,46 @@ where
                 chat_ui.notice("Plan Mode requested — next turn will require a plan.")?;
                 continue;
             }
-            if command == "/undo" {
-                match last_turn_snapshot.take() {
-                    Some(snapshot) => {
+            if command == "/undo" || command == "/redo" {
+                let Some(active) = session.as_ref() else {
+                    chat_ui.notice(if command == "/undo" {
+                        "Nothing to undo."
+                    } else {
+                        "Nothing to redo."
+                    })?;
+                    continue;
+                };
+                let state = if command == "/undo" { "undo" } else { "redo" };
+                match database.next_edit_snapshot(&active.id, state)? {
+                    Some((id, before, after)) => {
+                        let encoded = if state == "undo" {
+                            Some(before.as_str())
+                        } else {
+                            after.as_deref()
+                        };
+                        let Some(encoded) = encoded else {
+                            chat_ui.notice("This legacy snapshot cannot be redone.")?;
+                            continue;
+                        };
+                        let snapshot = decode_undo_snapshot(Some(encoded))?.unwrap_or_default();
                         let outcome = revert_snapshot(&snapshot);
                         if outcome.failed.is_empty() {
-                            if let Some(active) = session.as_ref() {
-                                database.clear_undo_snapshot(&active.id)?;
-                            }
-                        } else {
-                            last_turn_snapshot = Some(snapshot);
+                            database.move_edit_snapshot(
+                                id,
+                                if state == "undo" { "redo" } else { "undo" },
+                            )?;
                         }
-                        chat_ui.notice(&outcome.summary("from the last turn"))?;
+                        chat_ui.notice(&outcome.summary(if state == "undo" {
+                            "from the previous edit"
+                        } else {
+                            "from the redone edit"
+                        }))?;
                     }
-                    None => chat_ui.notice("Nothing to undo.")?,
+                    None => chat_ui.notice(if state == "undo" {
+                        "Nothing to undo."
+                    } else {
+                        "Nothing to redo."
+                    })?,
                 }
                 continue;
             }
@@ -2135,6 +2157,14 @@ where
             None => session.insert(database.create_session(provider.name(), &active.model)?),
         };
         let undo_snapshot = encode_undo_snapshot(last_turn_snapshot.as_ref())?;
+        let redo_snapshot = last_turn_snapshot
+            .as_ref()
+            .map(snapshot_current_files)
+            .transpose()?
+            .as_ref()
+            .map(|snapshot| encode_undo_snapshot(Some(snapshot)))
+            .transpose()?
+            .flatten();
         database.save_turn_with_undo(
             &active_session.id,
             &turn_record,
@@ -2142,6 +2172,7 @@ where
             &active.model,
             &final_finish,
             undo_snapshot.as_deref(),
+            redo_snapshot.as_deref(),
             &admitted_inputs,
         )?;
         chat_ui.copy_answer(&final_answer)?;
@@ -2740,7 +2771,7 @@ fn handle_command(
                 );
             }
             *messages = database.load_messages(&resumed.id)?;
-            *last_turn_snapshot = decode_undo_snapshot(resumed.undo_snapshot.as_deref())?;
+            *last_turn_snapshot = None;
             out!("Resumed: {} ({})\n", resumed.title, short_id(&resumed.id));
             let interrupted = database.interrupted_tool_executions(&resumed.id)?;
             if !interrupted.is_empty() {
@@ -3419,6 +3450,22 @@ fn decode_undo_snapshot(value: Option<&str>) -> Result<Option<HashMap<PathBuf, O
                 .context("failed to parse stored undo snapshot")
         })
         .transpose()
+}
+
+fn snapshot_current_files(
+    before: &HashMap<PathBuf, Option<String>>,
+) -> Result<HashMap<PathBuf, Option<String>>> {
+    before
+        .keys()
+        .map(|path| {
+            let content = match std::fs::read_to_string(path) {
+                Ok(content) => Some(content),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error.into()),
+            };
+            Ok((path.clone(), content))
+        })
+        .collect()
 }
 
 /// Revert every file in a turn's patch snapshot back to its pre-turn state: restore the original
@@ -5015,6 +5062,7 @@ pub(crate) fn print_help(out: &mut String) {
         out,
         "/undo             Revert the files patched by the last turn"
     );
+    let _ = writeln!(out, "/redo             Reapply the last undone file edits");
     let _ = writeln!(
         out,
         "/jobs             List session and persistent scheduled jobs"
@@ -6519,6 +6567,23 @@ mod tests {
             Some(snapshot)
         );
         assert_eq!(encode_undo_snapshot(None).unwrap(), None);
+    }
+
+    #[test]
+    fn current_snapshot_captures_redo_content_and_deleted_files() {
+        let root = temporary_directory();
+        let edited = root.join("edited.txt");
+        let deleted = root.join("deleted.txt");
+        fs::write(&edited, "after").unwrap();
+        let before = HashMap::from([
+            (edited.clone(), Some("before".to_string())),
+            (deleted.clone(), Some("was here".to_string())),
+        ]);
+
+        let after = snapshot_current_files(&before).unwrap();
+        assert_eq!(after.get(&edited).unwrap().as_deref(), Some("after"));
+        assert_eq!(after.get(&deleted), Some(&None));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
