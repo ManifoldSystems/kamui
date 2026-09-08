@@ -2965,6 +2965,23 @@ fn print_stats(
             cache.median, cache.measured, cache.pct_ge_90, cache.pct_ge_95, cache.warmup
         );
     }
+    let epochs = cache::epochs(&samples);
+    if epochs.len() > 1 {
+        let current = epochs.last().expect("non-empty epoch list");
+        let _ = write!(
+            out,
+            "Cache epochs:  {} observed | current #{}: {} turn(s)",
+            epochs.len(),
+            epochs.len(),
+            current.len()
+        );
+        if let Some(report) = cache::report(current) {
+            let _ = write!(out, " | median {:.0}%", report.median);
+        } else {
+            let _ = write!(out, " | warming");
+        }
+        let _ = writeln!(out);
+    }
     if let (Some(last_input), Some(window)) = (stats.last_input_tokens, context_window) {
         // Buffered like every other line. `print!` here sent the report's most useful line to
         // raw stdout, which both dropped it from `/stats` and wrote it over the frame.
@@ -3743,9 +3760,16 @@ fn update_sidebar(
 /// Session median cache line for the Context rail, or `None` until there are measured turns.
 fn session_cache_line(database: &Database, session_id: &str) -> Option<String> {
     let samples = database.cache_samples(session_id).ok()?;
-    let report = cache::report(&samples)?;
+    let epochs = cache::epochs(&samples);
+    let current = epochs.last().copied().unwrap_or(&samples);
+    let report = cache::report(current)?;
+    let epoch = if epochs.len() > 1 {
+        format!("e{} · ", epochs.len())
+    } else {
+        String::new()
+    };
     Some(format!(
-        "median {:.0}% · {} turns · \u{2265}90% {:.0}%",
+        "{epoch}median {:.0}% · {} turns · \u{2265}90% {:.0}%",
         report.median, report.measured, report.pct_ge_90
     ))
 }

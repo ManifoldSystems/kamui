@@ -408,7 +408,8 @@ Every request is assembled as:
   the likely cause (`miss`, `miss (model switch)`, `miss (prefix rebuilt)`); it is silent on hits
   and first turns. The usage line shows whichever applies, falling back to `Cached: 0 (warm-up)` on
   a pinned profile so a zero is never mistaken for a provider that reports nothing. `/stats` then
-  reports the session: `median X% over N turns | >=90%: A% | >=95%: B% | warm-up: C`. Turn one is
+  reports the session: `median X% over N turns | >=90%: A% | >=95%: B% | warm-up: C`, plus the
+  current observed epoch when a cold turn follows an already-warm cache. Turn one is
   excluded from the ratios - it cannot hit a cache that does not exist - while a later warm-up turn
   stays in the denominator, because a prefix that churned mid-session is exactly the failure worth
   seeing. `storage::cache_samples` feeds it from `kind = 'chat'` rows only.

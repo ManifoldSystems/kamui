@@ -65,10 +65,13 @@ the session is landing:
 
 ```text
 Prompt cache:  median 96% over 12 turns | ≥90%: 92% | ≥95%: 75% | warm-up: 1
+Cache epochs:  2 observed | current #2: 5 turn(s) | median 97%
 ```
 
 The first turn of a session is excluded from those ratios — there is nothing cached to hit yet — but
-a later warm-up turn is counted, because that is a prefix that churned mid-session.
+a later warm-up turn is counted, because that is a prefix that churned mid-session. Once a cache
+has warmed, a later cold turn starts a new observed epoch; `/stats` reports the current epoch
+separately so an old prefix does not hide the health of the active one.
 
 Coding entitlement, quota, concurrency, request-id conflict, authentication, rate-limit, and
 temporary server errors are rendered as bounded, actionable messages. Requests have connect and
