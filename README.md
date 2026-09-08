@@ -804,9 +804,10 @@ background_max_secs = 1800   # safety cap for a background: true job
 
 `patch_file` edits one file per call and is also gated behind your approval (the same `y`/`yes`/
 `a`/`always` prompt): Kamui shows the change as removed (`-`) and added (`+`) lines before asking. A
-patch replaces text that must match the file
-exactly once — if it does not, the patch is rejected and the model is told to re-read the file, so a
-stale edit can never overwrite unexpected content. An empty `old_text` creates a new file. Writes are
+patch first replaces text that matches the file exactly once. If exact matching finds nothing, a
+line-trimmed fallback may recover indentation-only drift, but only when the whole block still has one
+unique location; zero or multiple candidates are rejected, so a stale edit cannot overwrite
+unexpected content. An empty `old_text` creates a new file. Writes are
 atomic per file, and paths cannot escape the project root.
 
 Each file `patch_file` touches is approved individually, exactly as before, but Kamui also keeps a

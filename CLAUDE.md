@@ -149,7 +149,9 @@ effort or operational risk is disproportionate to their immediate value.
   transport and the tools capability are supported.
 - `patch_file` edits one file per call by exact-match replacement and shows a +/- preview before
   the same `y`/`yes` approval. `old_text` must match exactly once or the patch is rejected with
-  recovery guidance; empty `old_text` creates a new file that must not exist. Matching is
+  recovery guidance; empty `old_text` creates a new file that must not exist. If exact matching
+  finds nothing, one line-trimmed block match may recover indentation-only drift; ambiguity remains
+  an error and no edit-distance fuzzy replacement is allowed. Matching is
   line-ending-agnostic (CRLF files are compared in LF space and rewritten with their original
   endings), so LF `old_text` still matches a CRLF file. Writes are atomic (temp file plus rename)
   and paths pass the same containment checks as reads.

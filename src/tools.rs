@@ -1578,6 +1578,46 @@ fn parse_patch_arguments(arguments: &str) -> Result<PatchArguments> {
     })
 }
 
+fn line_trimmed_match(haystack: &str, needle: &str) -> std::result::Result<(usize, usize), usize> {
+    let needle_lines: Vec<&str> = needle.lines().map(str::trim).collect();
+    if needle_lines.is_empty() {
+        return Err(0);
+    }
+    let mut starts = Vec::new();
+    let mut offset = 0usize;
+    let lines: Vec<(&str, usize, usize, usize)> = haystack
+        .split_inclusive('\n')
+        .map(|line| {
+            let start = offset;
+            offset += line.len();
+            let content = line.trim_end_matches('\n');
+            (content, start, start + content.len(), offset)
+        })
+        .collect();
+    for window in lines.windows(needle_lines.len()) {
+        if window
+            .iter()
+            .zip(&needle_lines)
+            .all(|((line, _, _, _), needle)| line.trim() == *needle)
+        {
+            let last = window.last().expect("window is non-empty");
+            starts.push((
+                window[0].1,
+                if needle.ends_with('\n') {
+                    last.3
+                } else {
+                    last.2
+                },
+            ));
+        }
+    }
+    if starts.len() == 1 {
+        Ok(starts[0])
+    } else {
+        Err(starts.len())
+    }
+}
+
 #[async_trait]
 impl Tool for PatchFileTool {
     fn name(&self) -> &str {
@@ -1663,18 +1703,26 @@ impl Tool for PatchFileTool {
         let old_text = patch.old_text.replace("\r\n", "\n");
         let new_text = patch.new_text.replace("\r\n", "\n");
 
-        match normalized.matches(&old_text).count() {
-            0 => anyhow::bail!(
-                "old_text was not found in {}; read the file again and copy the text exactly",
-                patch.path
-            ),
-            1 => {}
+        let updated = match normalized.matches(&old_text).count() {
+            0 => match line_trimmed_match(&normalized, &old_text) {
+                Ok((start, end)) => {
+                    format!("{}{}{}", &normalized[..start], new_text, &normalized[end..])
+                }
+                Err(0) => anyhow::bail!(
+                    "old_text was not found in {}; read the file again and copy the text exactly",
+                    patch.path
+                ),
+                Err(matches) => anyhow::bail!(
+                    "old_text matches {matches} line-trimmed blocks in {}; include more surrounding context",
+                    patch.path
+                ),
+            },
+            1 => normalized.replacen(&old_text, &new_text, 1),
             occurrences => anyhow::bail!(
                 "old_text appears {occurrences} times in {}; include more surrounding context so it matches exactly once",
                 patch.path
             ),
-        }
-        let updated = normalized.replacen(&old_text, &new_text, 1);
+        };
         let updated = if uses_crlf {
             updated.replace('\n', "\r\n")
         } else {
@@ -2661,6 +2709,54 @@ mod tests {
         assert_eq!(
             fs::read_to_string(root.join("a.txt")).unwrap(),
             "one two one"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn patch_file_uses_a_unique_line_trimmed_fallback() {
+        let root = project_root();
+        fs::write(root.join("a.txt"), "fn main() {\n    let value = 1;\n}\n").unwrap();
+        let registry = ToolRegistry::with_defaults(
+            root.clone(),
+            Vec::new(),
+            Vec::new(),
+            CommandLimits::default(),
+        );
+
+        let output = registry
+            .dispatch(&patch_call(
+                r#"{"path":"a.txt","old_text":"fn main() {\n  let value = 1;\n}","new_text":"fn main() {\n    let value = 2;\n}"}"#,
+            ))
+            .await;
+        assert!(!output.starts_with("Error:"), "{output}");
+        assert_eq!(
+            fs::read_to_string(root.join("a.txt")).unwrap(),
+            "fn main() {\n    let value = 2;\n}\n"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn patch_file_rejects_an_ambiguous_line_trimmed_fallback() {
+        let root = project_root();
+        fs::write(root.join("a.txt"), "  same\nother\n    same\n").unwrap();
+        let registry = ToolRegistry::with_defaults(
+            root.clone(),
+            Vec::new(),
+            Vec::new(),
+            CommandLimits::default(),
+        );
+
+        let output = registry
+            .dispatch(&patch_call(
+                r#"{"path":"a.txt","old_text":"\tsame","new_text":"changed"}"#,
+            ))
+            .await;
+        assert!(output.contains("2 line-trimmed blocks"), "{output}");
+        assert_eq!(
+            fs::read_to_string(root.join("a.txt")).unwrap(),
+            "  same\nother\n    same\n"
         );
         fs::remove_dir_all(root).unwrap();
     }
