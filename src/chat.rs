@@ -297,7 +297,11 @@ where
         .unwrap_or(0);
     // The most recently completed turn's pre-edit file snapshot, if it touched any files, so
     // `/undo` can revert it. `None` once nothing is left to undo.
-    let mut last_turn_snapshot: Option<HashMap<PathBuf, Option<String>>> = None;
+    let mut last_turn_snapshot = session.as_ref().and_then(|session| {
+        decode_undo_snapshot(session.undo_snapshot.as_deref())
+            .ok()
+            .flatten()
+    });
     // Tool names granted a standing "always allow" for the rest of this session (ported from
     // Kumo's "Always allow" approval button). Session-scoped: cleared whenever a chat effectively
     // restarts (`/new`, or `/delete` of the active session), same as `last_turn_snapshot`.
@@ -1030,8 +1034,15 @@ where
             if command == "/undo" {
                 match last_turn_snapshot.take() {
                     Some(snapshot) => {
-                        chat_ui
-                            .notice(&revert_snapshot(&snapshot).summary("from the last turn"))?;
+                        let outcome = revert_snapshot(&snapshot);
+                        if outcome.failed.is_empty() {
+                            if let Some(active) = session.as_ref() {
+                                database.clear_undo_snapshot(&active.id)?;
+                            }
+                        } else {
+                            last_turn_snapshot = Some(snapshot);
+                        }
+                        chat_ui.notice(&outcome.summary("from the last turn"))?;
                     }
                     None => chat_ui.notice("Nothing to undo.")?,
                 }
@@ -2062,12 +2073,14 @@ where
             Some(session) => session,
             None => session.insert(database.create_session(provider.name(), &active.model)?),
         };
-        database.save_turn(
+        let undo_snapshot = encode_undo_snapshot(last_turn_snapshot.as_ref())?;
+        database.save_turn_with_undo(
             &active_session.id,
             &turn_record,
             &final_usage,
             &active.model,
             &final_finish,
+            undo_snapshot.as_deref(),
         )?;
         chat_ui.copy_answer(&final_answer)?;
         // Persist plan state after save (session now exists). Approved clears pending.
@@ -2665,6 +2678,7 @@ fn handle_command(
                 );
             }
             *messages = database.load_messages(&resumed.id)?;
+            *last_turn_snapshot = decode_undo_snapshot(resumed.undo_snapshot.as_deref())?;
             out!("Resumed: {} ({})\n", resumed.title, short_id(&resumed.id));
             // Note: Plan Mode restore is handled by the main loop's plan_mode state;
             // /resume via handle_command is not the startup resume path, so we don't
@@ -3255,6 +3269,28 @@ fn snapshot_patch_target(
     } else {
         snapshot.insert(target, None);
     }
+}
+
+fn encode_undo_snapshot(
+    snapshot: Option<&HashMap<PathBuf, Option<String>>>,
+) -> Result<Option<String>> {
+    snapshot
+        .filter(|snapshot| !snapshot.is_empty())
+        .map(|snapshot| {
+            let entries: Vec<(&PathBuf, &Option<String>)> = snapshot.iter().collect();
+            serde_json::to_string(&entries).context("failed to serialize undo snapshot")
+        })
+        .transpose()
+}
+
+fn decode_undo_snapshot(value: Option<&str>) -> Result<Option<HashMap<PathBuf, Option<String>>>> {
+    value
+        .map(|value| {
+            serde_json::from_str::<Vec<(PathBuf, Option<String>)>>(value)
+                .map(|entries| entries.into_iter().collect())
+                .context("failed to parse stored undo snapshot")
+        })
+        .transpose()
 }
 
 /// Revert every file in a turn's patch snapshot back to its pre-turn state: restore the original
@@ -6330,6 +6366,24 @@ mod tests {
 
         assert_eq!(snapshot.get(&root.join("new.txt")), Some(&None));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn undo_snapshot_round_trips_paths_and_missing_files() {
+        let snapshot = HashMap::from([
+            (
+                PathBuf::from("/tmp/edited.txt"),
+                Some("original".to_string()),
+            ),
+            (PathBuf::from("/tmp/created.txt"), None),
+        ]);
+
+        let encoded = encode_undo_snapshot(Some(&snapshot)).unwrap().unwrap();
+        assert_eq!(
+            decode_undo_snapshot(Some(&encoded)).unwrap(),
+            Some(snapshot)
+        );
+        assert_eq!(encode_undo_snapshot(None).unwrap(), None);
     }
 
     #[test]

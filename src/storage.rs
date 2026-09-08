@@ -21,6 +21,7 @@ pub struct Session {
     pub model: String,
     pub compaction_summary: Option<String>,
     pub summarized_upto: usize,
+    pub undo_snapshot: Option<String>,
 }
 
 pub struct SessionSummary {
@@ -337,6 +338,12 @@ impl Database {
                  PRAGMA user_version = 12;",
             )?;
         }
+        if version < 13 {
+            connection.execute_batch(
+                "ALTER TABLE sessions ADD COLUMN undo_snapshot TEXT;
+                 PRAGMA user_version = 13;",
+            )?;
+        }
         Ok(Self { connection, path })
     }
 
@@ -614,6 +621,7 @@ impl Database {
             model: model.to_string(),
             compaction_summary: None,
             summarized_upto: 0,
+            undo_snapshot: None,
         };
         self.connection.execute(
             "INSERT INTO sessions (id, title, provider, model) VALUES (?1, ?2, ?3, ?4)",
@@ -625,7 +633,7 @@ impl Database {
     pub fn find_session(&self, id_prefix: &str) -> Result<Option<Session>> {
         let pattern = format!("{id_prefix}%");
         let mut statement = self.connection.prepare(
-            "SELECT id, title, provider, model, compaction_summary, summarized_upto FROM sessions
+            "SELECT id, title, provider, model, compaction_summary, summarized_upto, undo_snapshot FROM sessions
              WHERE id LIKE ?1 ORDER BY updated_at DESC LIMIT 2",
         )?;
         let sessions = statement
@@ -714,6 +722,18 @@ impl Database {
         model: &str,
         finish_reason: &str,
     ) -> Result<()> {
+        self.save_turn_with_undo(session_id, messages, usage, model, finish_reason, None)
+    }
+
+    pub fn save_turn_with_undo(
+        &self,
+        session_id: &str,
+        messages: &[Message],
+        usage: &Usage,
+        model: &str,
+        finish_reason: &str,
+        undo_snapshot: Option<&str>,
+    ) -> Result<()> {
         let input_tokens =
             i64::try_from(usage.prompt_tokens).context("input token count overflow")?;
         let output_tokens =
@@ -766,11 +786,20 @@ impl Database {
         transaction.execute(
             "UPDATE sessions SET
                  title = CASE WHEN title = 'New chat' THEN ?2 ELSE title END,
+                 undo_snapshot = ?3,
                  updated_at = unixepoch()
              WHERE id = ?1",
-            params![session_id, make_title(title_source)],
+            params![session_id, make_title(title_source), undo_snapshot],
         )?;
         transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn clear_undo_snapshot(&self, session_id: &str) -> Result<()> {
+        self.connection.execute(
+            "UPDATE sessions SET undo_snapshot = NULL, updated_at = unixepoch() WHERE id = ?1",
+            [session_id],
+        )?;
         Ok(())
     }
 
@@ -1557,6 +1586,7 @@ fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
         model: row.get(3)?,
         compaction_summary: row.get(4)?,
         summarized_upto: row.get::<_, i64>(5)?.max(0) as usize,
+        undo_snapshot: row.get(6)?,
     })
 }
 
@@ -1642,7 +1672,38 @@ mod tests {
         let resumed = database.find_session(&session.id).unwrap().unwrap();
         assert_eq!(resumed.compaction_summary.as_deref(), Some("earlier work"));
         assert_eq!(resumed.summarized_upto, 7);
-        assert_eq!(database.schema_version().unwrap(), 12);
+        assert_eq!(database.schema_version().unwrap(), 13);
+    }
+
+    #[test]
+    fn undo_snapshot_is_saved_with_the_turn_and_can_be_cleared() {
+        let database = database();
+        let session = database.create_session("test", "model").unwrap();
+        database
+            .save_turn_with_undo(
+                &session.id,
+                &[Message::user("edit"), Message::assistant("done")],
+                &Usage::default(),
+                "model",
+                "stop",
+                Some(r#"[["/tmp/a.txt","original"]]"#),
+            )
+            .unwrap();
+
+        let resumed = database.find_session(&session.id).unwrap().unwrap();
+        assert_eq!(
+            resumed.undo_snapshot.as_deref(),
+            Some(r#"[["/tmp/a.txt","original"]]"#)
+        );
+        database.clear_undo_snapshot(&session.id).unwrap();
+        assert!(
+            database
+                .find_session(&session.id)
+                .unwrap()
+                .unwrap()
+                .undo_snapshot
+                .is_none()
+        );
     }
 
     #[test]

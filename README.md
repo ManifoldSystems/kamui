@@ -808,8 +808,9 @@ Each file `patch_file` touches is approved individually, exactly as before, but 
 snapshot of what every touched file looked like before the turn started. If a multi-file edit is
 interrupted with `Ctrl+C` partway through, the files it already changed are automatically reverted
 so the turn never leaves the repository half-edited with no trace in session history. `/undo`
-reverts the same way for a turn that *did* complete — one level, most recent turn only; a second
-`/undo` has nothing left to do.
+reverts the same way for a turn that *did* complete — one level, most recent turn only. The snapshot
+is stored with the session, so it remains available after restarting and resuming; a second `/undo`
+has nothing left to do.
 
 If the [RTK](https://github.com/rtk-ai/rtk) binary is installed, simple approved commands are
 automatically prefixed with `rtk` so their output is compressed before it reaches the model. RTK is

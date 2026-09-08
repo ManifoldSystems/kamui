@@ -158,8 +158,8 @@ effort or operational risk is disproportionate to their immediate value.
   with `Ctrl+C` before it finishes, every file it already changed is reverted automatically
   (`chat::revert_on_cancel`/`revert_snapshot`) so a multi-file edit can never be left half-applied
   with no trace in session history. `/undo` performs the same revert for the most recently
-  *completed* turn — one level, in-memory only (not persisted to SQLite), cleared after use or when
-  a new turn starts.
+  *completed* turn — one level, persisted atomically with the turn in SQLite, restored on resume,
+  and cleared after successful use or when a later turn replaces it.
 - Session IDs may be resolved from an unambiguous prefix. The UI normally displays the first eight
   characters.
 - Resume displays the six most recent messages and reports how many earlier messages were omitted.
