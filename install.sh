@@ -1,8 +1,8 @@
 #!/bin/sh
 set -eu
 
-repository="ManifoldSystems/kamui"
 install_dir="${KAMUI_INSTALL_DIR:-$HOME/.local/bin}"
+release_url="${KAMUI_RELEASE_URL:-https://is3.cloudhost.id/orvix/kamui-releases/latest}"
 os=$(uname -s)
 arch=$(uname -m)
 
@@ -15,7 +15,6 @@ case "$os-$arch" in
 esac
 
 archive="kamui-$target.tar.gz"
-release_url="https://github.com/$repository/releases/latest/download"
 temp_dir=$(mktemp -d)
 trap 'rm -rf "$temp_dir"' EXIT INT TERM
 
