@@ -56,7 +56,7 @@ effort or operational risk is disproportionate to their immediate value.
   prompt shuts down gracefully. Windows stdin uses a reader thread and Tokio channel so the async
   runtime does not block on terminal input.
 - Supported chat commands are `/help`, `/new`, `/sessions`, `/resume <id>`, `/model [name]`,
-  `/rename <id> <title>`, `/search <text>`, `/compact`, `/undo`, `/redo`, `/audit`, `/agents`, `/context`, `/jobs`, `/index`, `/commands`,
+  `/rename <id> <title>`, `/search <text>`, `/compact`, `/undo`, `/redo`, `/audit`, `/agents`, `/context`, `/timeline`, `/jobs`, `/index`, `/commands`,
   `/delete <id>`, `/stats`, `/usage`, `/status`, `/memory`, `/forget <text>` (or `/forget all`),
   and `/exit`. Plain `exit` also quits.
 - Users define their own slash commands as markdown files (`src/commands.rs`): global ones in

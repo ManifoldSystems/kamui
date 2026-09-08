@@ -574,6 +574,7 @@ TTY, `NO_COLOR` keeps the fullscreen TUI but removes its semantic foreground/bac
 | `/audit` | Show recent mutating tool executions for this session |
 | `/agents` | Show recent child-agent runs for this session |
 | `/context` | Inspect current reusable context without a network call |
+| `/timeline` | Show recent approvals, tool executions, and child-agent activity |
 | `/jobs` | List temporary session jobs and persistent scheduled jobs |
 | `/index` | Rebuild the semantic-search index (needs `embedding_model`) |
 | `/commands` | List your own prompt commands |

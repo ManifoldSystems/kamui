@@ -13,6 +13,7 @@ pub const BUILTINS: &[(&str, &str)] = &[
     ("audit", "Show recent mutating tool executions"),
     ("agents", "Show recent child-agent runs"),
     ("context", "Inspect current reusable context"),
+    ("timeline", "Show session activity timeline"),
     ("jobs", "List session and scheduled jobs"),
     ("index", "Rebuild the semantic-search index"),
     ("commands", "List your own prompt commands"),

@@ -124,6 +124,7 @@ pub struct ChildAgentRun {
     pub status: String,
     pub prompt: String,
     pub result: Option<String>,
+    pub created_at: i64,
 }
 
 fn scheduled_job_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScheduledJob> {
@@ -1085,7 +1086,7 @@ impl Database {
     pub fn child_agent_runs(&self, session_id: &str, limit: usize) -> Result<Vec<ChildAgentRun>> {
         let limit = i64::try_from(limit).context("child agent limit overflow")?;
         let mut statement = self.connection.prepare(
-            "SELECT id, status, prompt, result FROM child_agent_runs
+            "SELECT id, status, prompt, result, created_at FROM child_agent_runs
              WHERE session_id = ?1 ORDER BY created_at DESC, rowid DESC LIMIT ?2",
         )?;
         let rows = statement.query_map(params![session_id, limit], |row| {
@@ -1094,6 +1095,7 @@ impl Database {
                 status: row.get(1)?,
                 prompt: row.get(2)?,
                 result: row.get(3)?,
+                created_at: row.get(4)?,
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()

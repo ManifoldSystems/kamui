@@ -1142,6 +1142,17 @@ where
                 ))?;
                 continue;
             }
+            if command == "/timeline" {
+                match session.as_ref() {
+                    Some(active) => chat_ui.notice(&format_timeline(
+                        &database.tool_decisions(&active.id, 40)?,
+                        &database.tool_executions(&active.id, 20)?,
+                        &database.child_agent_runs(&active.id, 20)?,
+                    ))?,
+                    None => chat_ui.notice("No active session.")?,
+                }
+                continue;
+            }
             if command == "/jobs" {
                 let text = format!(
                     "Session jobs:\n{}\n\nScheduled jobs:\n{}",
@@ -3673,6 +3684,48 @@ fn format_child_agents(rows: &[storage::ChildAgentRun]) -> String {
     output.trim_end().to_string()
 }
 
+fn format_timeline(
+    decisions: &[storage::ToolDecision],
+    executions: &[storage::ToolExecution],
+    agents: &[storage::ChildAgentRun],
+) -> String {
+    let mut events: Vec<(i64, String)> = decisions
+        .iter()
+        .map(|event| {
+            (
+                event.created_at,
+                format!("decision | {} {}", event.decision, event.tool_name),
+            )
+        })
+        .chain(executions.iter().map(|event| {
+            (
+                event.started_at,
+                format!("tool | {} {}", event.status, event.tool_name),
+            )
+        }))
+        .chain(agents.iter().map(|event| {
+            (
+                event.created_at,
+                format!(
+                    "agent | {} {}",
+                    event.status,
+                    audit_preview(&event.prompt, 100)
+                ),
+            )
+        }))
+        .collect();
+    events.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    events.truncate(40);
+    if events.is_empty() {
+        return "No timeline events recorded for this session.".to_string();
+    }
+    let mut output = String::from("Recent session activity:\n");
+    for (timestamp, event) in events {
+        let _ = writeln!(output, "{timestamp} | {event}");
+    }
+    output.trim_end().to_string()
+}
+
 async fn dispatch_with_journal(
     tools: &ToolRegistry,
     call: &crate::provider::ToolCall,
@@ -5392,6 +5445,7 @@ pub(crate) fn print_help(out: &mut String) {
     );
     let _ = writeln!(out, "/agents           Show recent child-agent runs");
     let _ = writeln!(out, "/context          Inspect current reusable context");
+    let _ = writeln!(out, "/timeline         Show session activity timeline");
     let _ = writeln!(
         out,
         "/jobs             List session and persistent scheduled jobs"
@@ -6976,6 +7030,35 @@ mod tests {
         assert!(summary.contains("2. patch_file"));
         assert!(summary.contains("a.txt"));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn timeline_merges_activity_newest_first() {
+        let decisions = [storage::ToolDecision {
+            tool_name: "run_command".into(),
+            decision: "approved".into(),
+            scope: None,
+            created_at: 2,
+        }];
+        let executions = [storage::ToolExecution {
+            tool_name: "patch_file".into(),
+            status: "completed".into(),
+            arguments: "{}".into(),
+            output: Some("ok".into()),
+            started_at: 3,
+        }];
+        let agents = [storage::ChildAgentRun {
+            id: "agent".into(),
+            status: "completed".into(),
+            prompt: "inspect".into(),
+            result: Some("done".into()),
+            created_at: 1,
+        }];
+        let timeline = format_timeline(&decisions, &executions, &agents);
+        let tool = timeline.find("tool | completed patch_file").unwrap();
+        let decision = timeline.find("decision | approved run_command").unwrap();
+        let agent = timeline.find("agent | completed inspect").unwrap();
+        assert!(tool < decision && decision < agent);
     }
 
     #[test]
