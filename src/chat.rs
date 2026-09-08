@@ -1102,6 +1102,46 @@ where
                 }
                 continue;
             }
+            if command == "/context" {
+                let message_bytes: usize =
+                    messages.iter().map(|message| message.content.len()).sum();
+                let memory_bytes = database.total_memory_bytes()?;
+                let index_chunks = database.chunk_count(&project.key())?;
+                let tools_count = session_tools.as_ref().map(Vec::len).unwrap_or(0);
+                let last_input = session
+                    .as_ref()
+                    .and_then(|active| database.session_stats(&active.id).ok())
+                    .and_then(|stats| stats.last_input_tokens);
+                let pressure = match (last_input, context_window) {
+                    (Some(input), Some(window)) => {
+                        format!(
+                            "{input}/{window} ({:.1}%)",
+                            input as f64 / window as f64 * 100.0
+                        )
+                    }
+                    _ => "unavailable".to_string(),
+                };
+                let cache_epoch = session
+                    .as_ref()
+                    .and_then(|active| database.cache_samples(&active.id).ok())
+                    .map(|samples| cache::epochs(&samples).len().max(1))
+                    .unwrap_or(1);
+                chat_ui.notice(&format!(
+                    "Current context:\nProject: {}\nInstructions: {}\nMessages: {} ({} bytes)\nCompacted through: {} message(s)\nSummary: {} bytes\nMemory: {} bytes\nTools: {}\nSemantic index: {} chunk(s)\nLast context pressure: {}\nCache epoch: {}\nAttachments: request-local, not persisted",
+                    display_path(project.root()),
+                    project.instruction_name().unwrap_or("none"),
+                    messages.len(),
+                    message_bytes,
+                    summarized_upto,
+                    summary.as_deref().map(str::len).unwrap_or(0),
+                    memory_bytes,
+                    tools_count,
+                    index_chunks,
+                    pressure,
+                    cache_epoch,
+                ))?;
+                continue;
+            }
             if command == "/jobs" {
                 let text = format!(
                     "Session jobs:\n{}\n\nScheduled jobs:\n{}",
@@ -5351,6 +5391,7 @@ pub(crate) fn print_help(out: &mut String) {
         "/audit            Show recent mutating tool executions"
     );
     let _ = writeln!(out, "/agents           Show recent child-agent runs");
+    let _ = writeln!(out, "/context          Inspect current reusable context");
     let _ = writeln!(
         out,
         "/jobs             List session and persistent scheduled jobs"
