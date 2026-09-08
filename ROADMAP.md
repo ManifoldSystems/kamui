@@ -512,6 +512,15 @@ polish: users hit these before they ever need a design system or batch-approval 
 - [x] Modal click-through prevention and bounded transcript click targets
 - [x] Semantic mouse targets for sidebar/footer actions with overlay precedence and hover feedback
 
+### Reliability and recovery
+
+- [x] Durable FIFO input queue with crash recovery and atomic completion alongside turn persistence
+- [x] Mutating-tool execution journal with interrupted recovery and bounded `/audit` viewer
+- [x] Durable read-only child-agent lifecycle records with bounded `/agents` viewer
+- [x] Multi-level session-scoped `/undo` and `/redo`, including migration from one-level snapshots
+- [x] Exact command/canonical path session grants instead of tool-wide `always` permissions
+- [x] Unique line-trimmed patch fallback while preserving strict ambiguity rejection
+
 ## OpenCode-inspired TUI direction
 
 Kamui's fullscreen TUI is deliberately inspired by OpenCode (boxy rails, live editor, sidebar).
