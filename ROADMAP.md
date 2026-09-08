@@ -560,11 +560,11 @@ Do not start this phase until the Near-term dogfooding items above are in a usab
 permission modal already exists; the next step is reducing friction when one turn produces several
 independent commands or file edits without weakening reviewability.
 
-- [ ] Group pending tool calls into a single reviewable batch
-- [ ] Show a grouped command/diff preview with tool, path, risk, and affected files
-- [ ] Approve all, reject all, or approve/reject individual items in a batch
+- [x] Group pending approval-gated tool calls into a single reviewable batch
+- [x] Show a grouped command/diff preview with tool and target details
+- [x] Approve all, reject all, or fall back to individual review
 - [ ] Keep approval scope explicit: once, tool-for-session, or reviewed-batch only
-- [ ] Preserve path validation, command allowlists, and capability checks for every item
+- [x] Preserve path validation, command allowlists, and capability checks for every item
 - [ ] Support stop-on-first-error versus continue-independent-items behavior
 - [ ] Add batch progress and per-item status in the TUI
 - [ ] Add atomic batch rollback while preserving the existing durable multi-level `/undo`/`/redo`

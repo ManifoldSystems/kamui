@@ -1867,6 +1867,34 @@ where
                     }
                 }
             };
+            let approval_calls: Vec<&ToolCall> = tool_calls
+                .iter()
+                .filter(|call| {
+                    tools.requires_confirmation_for(&call.name, &call.arguments)
+                        && !auto_approve
+                        && !session_permission_matches(&always_allowed, project.root(), call)
+                })
+                .collect();
+            let batch_decision = if approval_calls.len() > 1 {
+                let body = format_batch_approval(&tools, &approval_calls);
+                let answer = tokio::select! {
+                    answer = read_batch_approval_line(&mut input_rx, use_tui, hub.as_mut(), body) => answer,
+                    () = wait_interrupt(&interrupt) => None,
+                    signal = tokio::signal::ctrl_c() => {
+                        signal.context("failed to listen for Ctrl+C")?;
+                        revert_on_cancel(&mut chat_ui, &turn_snapshot);
+                        chat_ui.notice("interrupted — back to prompt")?;
+                        continue 'chat;
+                    }
+                };
+                match answer.as_deref().map(str::trim) {
+                    Some("y" | "Y" | "yes" | "Yes" | "all") => BatchDecision::ApproveAll,
+                    Some("i" | "I" | "individual") => BatchDecision::Individual,
+                    _ => BatchDecision::RejectAll,
+                }
+            } else {
+                BatchDecision::Individual
+            };
             // Plan Mode: auto-enter on first update_plan with ≥3 steps (Q1=B).
             if plan_mode.is_none() {
                 for call in &tool_calls {
@@ -2056,37 +2084,11 @@ where
                     && !auto_approve
                     && !session_permission_matches(&always_allowed, project.root(), call)
                 {
-                    let preview = tools.preview(call);
-                    if !use_tui {
-                        if let Some(preview) = &preview {
-                            chat_ui.notice(preview)?;
-                        }
-                        chat_ui.notice("approve? [y/N/a]")?;
-                    }
-                    let modal_title = format!("Allow {}?", call.name);
-                    let modal_body =
-                        preview.unwrap_or_else(|| format!("{} {}", call.name, call.arguments));
-                    let answer = tokio::select! {
-                        answer = read_approval_line(&mut input_rx, use_tui, hub.as_mut(), &modal_title, modal_body) => answer,
-                        () = wait_interrupt(&interrupt) => None,
-                        signal = tokio::signal::ctrl_c() => {
-                            signal.context("failed to listen for Ctrl+C")?;
-                            revert_on_cancel(&mut chat_ui, &turn_snapshot);
-                            chat_ui.notice("interrupted — back to prompt")?;
-                            continue 'chat;
-                        }
-                    };
-                    let trimmed = answer.as_deref().map(str::trim);
-                    let always = matches!(trimmed, Some("a" | "A" | "always" | "Always"));
-                    let approved = always || matches!(trimmed, Some("y" | "Y" | "yes" | "Yes"));
-                    if always {
-                        let scope = session_permission_scope(project.root(), call);
-                        always_allowed.insert(scope.clone());
-                        chat_ui.notice(&format!(
-                            "always allowing {scope} for the rest of this session — /new clears this"
-                        ))?;
-                    }
-                    if approved {
+                    if batch_decision == BatchDecision::RejectAll {
+                        chat_ui.notice("skipped by batch decision")?;
+                        "The user declined this tool call as part of the reviewed batch."
+                            .to_string()
+                    } else if batch_decision == BatchDecision::ApproveAll {
                         if call.name == tools::PATCH_FILE_TOOL {
                             snapshot_patch_target(
                                 project.root(),
@@ -2094,20 +2096,69 @@ where
                                 &mut turn_snapshot,
                             );
                         }
-                        tokio::select! {
-                            output = dispatch_with_journal(
-                                &tools, call, database, &mut session, provider.name(), &active.model,
-                            ) => output?,
+                        dispatch_with_journal(
+                            &tools,
+                            call,
+                            database,
+                            &mut session,
+                            provider.name(),
+                            &active.model,
+                        )
+                        .await?
+                    } else {
+                        let preview = tools.preview(call);
+                        if !use_tui {
+                            if let Some(preview) = &preview {
+                                chat_ui.notice(preview)?;
+                            }
+                            chat_ui.notice("approve? [y/N/a]")?;
+                        }
+                        let modal_title = format!("Allow {}?", call.name);
+                        let modal_body =
+                            preview.unwrap_or_else(|| format!("{} {}", call.name, call.arguments));
+                        let answer = tokio::select! {
+                            answer = read_approval_line(&mut input_rx, use_tui, hub.as_mut(), &modal_title, modal_body) => answer,
+                            () = wait_interrupt(&interrupt) => None,
                             signal = tokio::signal::ctrl_c() => {
                                 signal.context("failed to listen for Ctrl+C")?;
                                 revert_on_cancel(&mut chat_ui, &turn_snapshot);
                                 chat_ui.notice("interrupted — back to prompt")?;
                                 continue 'chat;
                             }
+                        };
+                        let trimmed = answer.as_deref().map(str::trim);
+                        let always = matches!(trimmed, Some("a" | "A" | "always" | "Always"));
+                        let approved = always || matches!(trimmed, Some("y" | "Y" | "yes" | "Yes"));
+                        if always {
+                            let scope = session_permission_scope(project.root(), call);
+                            always_allowed.insert(scope.clone());
+                            chat_ui.notice(&format!(
+                            "always allowing {scope} for the rest of this session — /new clears this"
+                        ))?;
                         }
-                    } else {
-                        chat_ui.notice("skipped")?;
-                        "The user declined to run this command.".to_string()
+                        if approved {
+                            if call.name == tools::PATCH_FILE_TOOL {
+                                snapshot_patch_target(
+                                    project.root(),
+                                    &call.arguments,
+                                    &mut turn_snapshot,
+                                );
+                            }
+                            tokio::select! {
+                                output = dispatch_with_journal(
+                                    &tools, call, database, &mut session, provider.name(), &active.model,
+                                ) => output?,
+                                signal = tokio::signal::ctrl_c() => {
+                                    signal.context("failed to listen for Ctrl+C")?;
+                                    revert_on_cancel(&mut chat_ui, &turn_snapshot);
+                                    chat_ui.notice("interrupted — back to prompt")?;
+                                    continue 'chat;
+                                }
+                            }
+                        } else {
+                            chat_ui.notice("skipped")?;
+                            "The user declined to run this command.".to_string()
+                        }
                     }
                 } else {
                     // Reached because the tool never needs confirmation, --auto-approve overrode
@@ -4318,6 +4369,53 @@ async fn read_approval_line(
         hub.close_permission_modal();
         answer
     } else {
+        input_rx.as_mut().unwrap().recv().await
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BatchDecision {
+    ApproveAll,
+    RejectAll,
+    Individual,
+}
+
+fn format_batch_approval(tools: &ToolRegistry, calls: &[&ToolCall]) -> String {
+    calls
+        .iter()
+        .enumerate()
+        .map(|(index, call)| {
+            let detail = tools
+                .preview(call)
+                .unwrap_or_else(|| audit_preview(&call.arguments, 100));
+            format!("{}. {}\n{}", index + 1, call.name, detail)
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+async fn read_batch_approval_line(
+    input_rx: &mut Option<mpsc::UnboundedReceiver<String>>,
+    use_tui: bool,
+    hub: Option<&mut InputHub>,
+    body: String,
+) -> Option<String> {
+    if use_tui {
+        let hub = hub.expect("tui implies hub");
+        hub.open_permission_modal_with_options(
+            "Review tool batch",
+            body,
+            vec![
+                ("y", "Allow all"),
+                ("i", "Review individually"),
+                ("n", "Reject all"),
+            ],
+        );
+        let answer = hub.request_line().await;
+        hub.close_permission_modal();
+        answer
+    } else {
+        println!("{body}\napprove all? [y/N/i]");
         input_rx.as_mut().unwrap().recv().await
     }
 }
@@ -6738,6 +6836,33 @@ mod tests {
             ..call
         };
         assert!(!session_permission_matches(&grants, &root, &different));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn batch_approval_summary_keeps_every_call_visible() {
+        let root = temporary_directory();
+        let registry = ToolRegistry::with_defaults(
+            root.clone(),
+            Vec::new(),
+            Vec::new(),
+            crate::tools::CommandLimits::default(),
+        );
+        let command = ToolCall {
+            id: "1".into(),
+            name: "run_command".into(),
+            arguments: r#"{"command":"cargo test"}"#.into(),
+        };
+        let patch = ToolCall {
+            id: "2".into(),
+            name: tools::PATCH_FILE_TOOL.into(),
+            arguments: r#"{"path":"a.txt","old_text":"a","new_text":"b"}"#.into(),
+        };
+        let summary = format_batch_approval(&registry, &[&command, &patch]);
+        assert!(summary.contains("1. run_command"));
+        assert!(summary.contains("cargo test"));
+        assert!(summary.contains("2. patch_file"));
+        assert!(summary.contains("a.txt"));
         fs::remove_dir_all(root).unwrap();
     }
 

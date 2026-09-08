@@ -833,6 +833,11 @@ Choosing `always` at an approval is scoped to the exact normalized command or ca
 for the active session. It does not grant every future `run_command` or `patch_file` call; different
 flags and different files still require approval, and `/new` clears all session grants.
 
+When one model response requests several approval-gated tools, Kamui first shows one grouped summary:
+allow the reviewed batch, reject it, or fall back to the existing per-item approval flow. Batch
+approval is one-time only, never a session grant, and calls still execute sequentially with their
+normal path checks, journals, and undo snapshots.
+
 In the fullscreen UI, prompts submitted while the agent is busy are persisted before Kamui labels
 them queued. Their FIFO IDs follow them into steering or the next turn and are removed atomically
 with the completed turn. Restarting and resuming restores both queued and previously claimed input,

@@ -166,6 +166,9 @@ effort or operational risk is disproportionate to their immediate value.
   failed outcomes close the row; any row still running when the database reopens becomes
   `interrupted`, is reported on resume, and is never retried automatically because its side effects
   are unknown.
+- Multiple approval-gated calls in one response receive a grouped one-time review before execution.
+  Allow-all does not create permission grants; individual review retains exact command/path grants,
+  and every call still dispatches sequentially through validation, journaling, and edit snapshots.
 - Fullscreen input submitted while a turn is busy is persisted in `queued_inputs` before the UI
   acknowledges it. A stable queue id follows steering/next-turn promotion and is deleted in the
   same transaction that saves the completed turn; claimed rows return to queued on resume.
