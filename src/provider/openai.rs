@@ -4,6 +4,8 @@ use super::{
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use reqwest::Client;
+
+const KAMUI_VERSION: &str = env!("CARGO_PKG_VERSION");
 use reqwest::{StatusCode, header::RETRY_AFTER};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -138,6 +140,16 @@ impl OpenAIProvider {
             None => bail!(
                 "this provider requires session_id (Orvix Coding Plan); no active Kamui session id was provided"
             ),
+        }
+    }
+
+    fn add_coding_headers(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        if self.send_session_id {
+            builder
+                .header("x-orvix-coding-client", "kamui")
+                .header("x-orvix-coding-client-version", KAMUI_VERSION)
+        } else {
+            builder
         }
     }
 
@@ -629,9 +641,7 @@ impl Provider for OpenAIProvider {
             prompt_cache_key: cache_key.as_deref(),
         };
         let response = self
-            .client
-            .post(self.chat_url())
-            .bearer_auth(&self.api_key)
+            .add_coding_headers(self.client.post(self.chat_url()).bearer_auth(&self.api_key))
             .json(&body)
             .send();
         let response = timeout(RESPONSE_TIMEOUT, response)
@@ -675,9 +685,7 @@ impl Provider for OpenAIProvider {
         let mut response = loop {
             attempts += 1;
             let sent = self
-                .client
-                .post(self.chat_url())
-                .bearer_auth(&self.api_key)
+                .add_coding_headers(self.client.post(self.chat_url()).bearer_auth(&self.api_key))
                 .json(&body)
                 .send();
             match timeout(RESPONSE_TIMEOUT, sent).await {

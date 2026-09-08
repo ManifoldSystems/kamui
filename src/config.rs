@@ -757,6 +757,11 @@ pub fn append_profile(
 }
 
 fn validate_coding_pair(name: &str, path: Option<&str>, send_session_id: bool) -> Result<()> {
+    if path == Some(ORVIX_COMPLETIONS_PATH) && !send_session_id {
+        anyhow::bail!(
+            "profile '{name}' uses Orvix Coding completions_path but send_session_id is false; enable send_session_id"
+        );
+    }
     if send_session_id && path != Some(ORVIX_COMPLETIONS_PATH) {
         anyhow::bail!(
             "profile '{name}' enables send_session_id but does not use completions_path = \"{ORVIX_COMPLETIONS_PATH}\"; set both for Orvix Coding or disable send_session_id"
@@ -872,6 +877,18 @@ model = "orvix/deepseek-v4-flash"
         )
         .unwrap_err();
         assert!(error.to_string().contains("set both for Orvix Coding"));
+    }
+
+    #[test]
+    fn rejects_coding_path_with_explicitly_disabled_session_routing() {
+        let error = resolve(
+            file(
+                "model = \"m\"\n[provider]\napi_key = \"k\"\ncompletions_path = \"/coding/completions\"\nsend_session_id = false",
+            ),
+            None,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("send_session_id is false"));
     }
 
     #[test]

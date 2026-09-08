@@ -50,6 +50,8 @@ arrive.
 a masked field and the resulting config is atomically written with owner-only permissions. Use a key with
 `coding:invoke`. Kamui sends its session UUID as top-level `session_id` so Orvix can stick the
 upstream route for cache. Switch with `/model orvix-coding-flash`. Keep `/v1` profiles for A/B.
+Coding requests also identify the client and Kamui version in observability-only headers; Orvix
+does not use those claims for entitlement, routing, quota, or billing decisions.
 
 On these profiles Kamui also keeps the request prefix byte-stable so that cache can hold: the system
 prompt, your project instructions, the skill list and the tool definitions are built once and stay

@@ -2874,7 +2874,7 @@ fn print_stats(
     // them for good -- so this counts turns, and it only appears for a provider that actually
     // returns cached tokens.
     let samples = database.cache_samples(&session.id)?;
-    if samples.iter().any(|(_, cached)| *cached > 0)
+    if samples.len() > 1
         && let Some(cache) = cache::report(&samples)
     {
         let _ = writeln!(
