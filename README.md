@@ -852,7 +852,8 @@ to the current model request to narrow the investigation and implement or state 
 The first reminder is advisory after four inspection calls or 64 KiB. After six calls or 128 KiB,
 further repository-inspection calls are rejected locally. The first successful patch raises the
 turn-wide ceiling to eight calls or 192 KiB for targeted follow-up; later patches do not reset or
-extend it. Editing and verification tools remain available.
+extend it. Repository inspection through `run_command` shell readers or interpreter snippets is
+rejected so it cannot bypass the budget. Editing and verification commands remain available.
 Reminders are emitted at most twice per turn, are not stored as user conversation history, and do
 not apply to deliberately read-only child agents.
 

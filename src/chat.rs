@@ -97,12 +97,52 @@ impl ExplorationGuard {
 const EXPLORATION_BLOCKED: &str = "Error: exploration budget exhausted. Repository inspection is \
 temporarily blocked for this turn. Use patch_file now with the evidence already collected, or \
 return a precise blocker. The turn-wide inspection budget does not reset after edits.";
+const SHELL_INSPECTION_BLOCKED: &str = "Error: do not inspect repository files through \
+run_command. Use read_file, list_directory, grep, or glob so the turn-wide exploration budget \
+remains enforceable. run_command remains available for tests, lint, builds, and git status/diff.";
 
 fn is_inspection_tool(name: &str) -> bool {
     matches!(
         name,
         "read_file" | "read_image" | "list_directory" | "grep" | "glob" | "search_code"
     )
+}
+
+fn is_shell_inspection(name: &str, arguments: &str) -> bool {
+    if name != "run_command" {
+        return false;
+    }
+    let Ok(arguments) = serde_json::from_str::<serde_json::Value>(arguments) else {
+        return false;
+    };
+    let Some(command) = arguments.get("command").and_then(|value| value.as_str()) else {
+        return false;
+    };
+    let command = command.to_ascii_lowercase();
+    let first = command
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .rsplit('/')
+        .next()
+        .unwrap_or_default();
+    if matches!(first, "cat" | "sed" | "awk" | "grep" | "rg" | "find" | "ls") {
+        return true;
+    }
+    matches!(first, "python" | "python3" | "perl" | "ruby" | "node")
+        && [
+            "read_text",
+            "read_to_string",
+            "path(",
+            "open(",
+            "os.walk",
+            "rglob(",
+            "glob(",
+            "readdir",
+            "readfile",
+        ]
+        .iter()
+        .any(|marker| command.contains(marker))
 }
 
 fn is_successful_mutation(name: &str, output: &str) -> bool {
@@ -2163,7 +2203,9 @@ where
                     .as_ref()
                     .is_some_and(|s| s.status == PlanStatus::Pending)
                     && is_mutating_tool(&call.name);
-                let output = if exploration_guard.blocks(&call.name) {
+                let output = if is_shell_inspection(&call.name, &call.arguments) {
+                    SHELL_INSPECTION_BLOCKED.to_string()
+                } else if exploration_guard.blocks(&call.name) {
                     EXPLORATION_BLOCKED.to_string()
                 } else if is_mutating_held {
                     "Plan Mode is active — propose a plan with update_plan and wait for approval before mutating tools.".to_string()
@@ -2716,7 +2758,9 @@ where
                     render::render_tool_call(&call.name, &call.arguments, ui)
                 );
             }
-            let output = if exploration_guard.blocks(&call.name) {
+            let output = if is_shell_inspection(&call.name, &call.arguments) {
+                SHELL_INSPECTION_BLOCKED.to_string()
+            } else if exploration_guard.blocks(&call.name) {
                 EXPLORATION_BLOCKED.to_string()
             } else if call.name == tools::ASK_USER_TOOL {
                 println!("    skipped: ask_user is not available in non-interactive mode");
@@ -5955,6 +5999,34 @@ mod tests {
         guard.observe("read_file", "result");
         assert!(guard.warning().is_some());
         assert!(guard.blocks("read_file"));
+    }
+
+    #[test]
+    fn shell_repository_inspection_is_blocked_without_blocking_verification() {
+        assert!(is_shell_inspection(
+            "run_command",
+            r#"{"command":"python3 - <<'PY'\nfrom pathlib import Path\nprint(Path('src/main.rs').read_text())\nPY"}"#
+        ));
+        assert!(is_shell_inspection(
+            "run_command",
+            r#"{"command":"rg 'handler' src"}"#
+        ));
+        assert!(is_shell_inspection(
+            "run_command",
+            r#"{"command":"cat src/main.rs"}"#
+        ));
+        assert!(!is_shell_inspection(
+            "run_command",
+            r#"{"command":"npm test -- leads.test.js"}"#
+        ));
+        assert!(!is_shell_inspection(
+            "run_command",
+            r#"{"command":"git status --short && git diff --check"}"#
+        ));
+        assert!(!is_shell_inspection(
+            "read_file",
+            r#"{"path":"src/main.rs"}"#
+        ));
     }
     use crate::pricing::ModelPrice;
     use std::fs;
