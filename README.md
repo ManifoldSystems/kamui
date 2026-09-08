@@ -850,8 +850,9 @@ On coding turns, Kamui also watches for exploration drift. If repeated repositor
 large number of calls or bytes without a successful file edit, it adds a private steering reminder
 to the current model request to narrow the investigation and implement or state a precise blocker.
 The first reminder is advisory after four inspection calls or 64 KiB. After six calls or 128 KiB,
-further repository-inspection calls are
-rejected locally until a file patch succeeds, while editing and verification tools remain available.
+further repository-inspection calls are rejected locally. The first successful patch raises the
+turn-wide ceiling to eight calls or 192 KiB for targeted follow-up; later patches do not reset or
+extend it. Editing and verification tools remain available.
 Reminders are emitted at most twice per turn, are not stored as user conversation history, and do
 not apply to deliberately read-only child agents.
 

@@ -173,7 +173,8 @@ effort or operational risk is disproportionate to their immediate value.
   exploration without a successful `patch_file` warns after four calls or 64 KiB and hard-caps
   inspection after six calls or 128 KiB. It injects up to two private system reminders to
   narrow the search and implement or report a blocker. After the second threshold, primary turns
-  reject further inspection calls until `patch_file` succeeds; editing and verification stay open.
+  reject further inspection calls. The first successful `patch_file` raises the turn-wide allowance
+  to eight calls or 192 KiB; no patch resets or extends it. Editing and verification stay open.
   The reminders are not persisted and the guard is intentionally disabled for read-only child agents.
 - Fullscreen input submitted while a turn is busy is persisted in `queued_inputs` before the UI
   acknowledges it. A stable queue id follows steering/next-turn promotion and is deleted in the

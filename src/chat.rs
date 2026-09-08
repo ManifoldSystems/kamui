@@ -39,12 +39,15 @@ const EXPLORATION_WARNING_CALLS: usize = 4;
 const EXPLORATION_WARNING_BYTES: usize = 64 * 1024;
 const EXPLORATION_FINAL_CALLS: usize = 6;
 const EXPLORATION_FINAL_BYTES: usize = 128 * 1024;
+const EXPLORATION_POST_PATCH_CALLS: usize = 8;
+const EXPLORATION_POST_PATCH_BYTES: usize = 192 * 1024;
 
 #[derive(Default)]
 struct ExplorationGuard {
     calls: usize,
     bytes: usize,
     warnings: usize,
+    patched: bool,
 }
 
 impl ExplorationGuard {
@@ -52,16 +55,19 @@ impl ExplorationGuard {
         if is_inspection_tool(tool) {
             self.calls += 1;
             self.bytes = self.bytes.saturating_add(output.len());
-        } else if is_successful_mutation(tool, output) {
-            self.calls = 0;
-            self.bytes = 0;
-            self.warnings = 0;
+        } else if is_successful_mutation(tool, output) && !self.patched {
+            self.patched = true;
+            self.warnings = self.warnings.min(1);
         }
     }
 
     fn warning(&mut self) -> Option<&'static str> {
-        let final_pressure =
-            self.calls >= EXPLORATION_FINAL_CALLS || self.bytes >= EXPLORATION_FINAL_BYTES;
+        let (final_calls, final_bytes) = if self.patched {
+            (EXPLORATION_POST_PATCH_CALLS, EXPLORATION_POST_PATCH_BYTES)
+        } else {
+            (EXPLORATION_FINAL_CALLS, EXPLORATION_FINAL_BYTES)
+        };
+        let final_pressure = self.calls >= final_calls || self.bytes >= final_bytes;
         if final_pressure && self.warnings < 2 {
             self.warnings = 2;
             return Some(
@@ -90,7 +96,7 @@ impl ExplorationGuard {
 
 const EXPLORATION_BLOCKED: &str = "Error: exploration budget exhausted. Repository inspection is \
 temporarily blocked for this turn. Use patch_file now with the evidence already collected, or \
-return a precise blocker. A successful patch_file resets the exploration budget.";
+return a precise blocker. The turn-wide inspection budget does not reset after edits.";
 
 fn is_inspection_tool(name: &str) -> bool {
     matches!(
@@ -5909,7 +5915,7 @@ mod tests {
     }
 
     #[test]
-    fn successful_patch_resets_exploration_but_failed_patch_does_not() {
+    fn first_successful_patch_grants_only_two_more_reads() {
         let mut guard = ExplorationGuard::default();
         for _ in 0..EXPLORATION_WARNING_CALLS {
             guard.observe("glob", "result");
@@ -5918,10 +5924,17 @@ mod tests {
         assert!(guard.warning().is_some());
 
         guard.observe("patch_file", "patched src/main.rs");
-        assert!(guard.warning().is_none());
-        assert_eq!(guard.calls, 0);
-        assert_eq!(guard.bytes, 0);
-        assert_eq!(guard.warnings, 0);
+        assert!(!guard.blocks("read_file"));
+        assert_eq!(guard.calls, EXPLORATION_WARNING_CALLS);
+        assert!(guard.patched);
+        for _ in EXPLORATION_WARNING_CALLS..EXPLORATION_POST_PATCH_CALLS {
+            guard.observe("read_file", "result");
+        }
+        assert!(guard.warning().unwrap().contains("budget is exhausted"));
+        assert!(guard.blocks("read_file"));
+
+        guard.observe("patch_file", "patched another file");
+        assert!(guard.blocks("read_file"));
     }
 
     #[test]
@@ -5938,6 +5951,10 @@ mod tests {
 
         guard.observe("patch_file", "patched file");
         assert!(!guard.blocks("read_file"));
+        guard.observe("read_file", "result");
+        guard.observe("read_file", "result");
+        assert!(guard.warning().is_some());
+        assert!(guard.blocks("read_file"));
     }
     use crate::pricing::ModelPrice;
     use std::fs;
