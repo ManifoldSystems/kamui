@@ -16,6 +16,9 @@ Kamui is configured with a `kamui.toml` file. On first run, Kamui starts an inte
 flow that asks for an OpenAI-compatible base URL and API key, discovers the available models, and
 lets you choose the default model. It then saves the configuration and starts the chat immediately:
 
+Orvix Coding saves every discovered model as a switchable profile backed by one shared credential;
+the picker selects only the default. Other OpenAI-compatible providers save only the selected model.
+
 | Platform | Global config file |
 | --- | --- |
 | Windows | `%APPDATA%\\kamui\\kamui.toml` |
@@ -47,7 +50,8 @@ arrive.
 "+ Add provider / model" flow. Kamui derives `https://api.orvix.id/v1`,
 `completions_path = "/coding/completions"`, and `send_session_id = true`; models are listed from
 `GET /coding/models` (the Coding allowlist), not `/v1/models`. The API key is entered in
-a masked field and the resulting config is atomically written with owner-only permissions. Use a key with
+a masked field and the resulting profiles share that credential rather than duplicating it. The config
+is atomically written with owner-only permissions. Use a key with
 `coding:invoke`. Kamui sends its session UUID as top-level `session_id` so Orvix can stick the
 upstream route for cache. Switch with `/model orvix-coding-flash`. Keep `/v1` profiles for A/B.
 Coding requests also identify the client and Kamui version in observability-only headers; Orvix

@@ -64,13 +64,18 @@ pub async fn run(path: &Path) -> Result<()> {
                     .items(&models)
                     .default(0)
                     .interact()?;
-                config::save_onboarding(
-                    path,
-                    &base_url,
-                    &api_key,
-                    &models[selected],
-                    orvix_coding,
-                )?;
+                if orvix_coding {
+                    config::save_orvix_onboarding(
+                        path,
+                        &base_url,
+                        &api_key,
+                        &models,
+                        &models[selected],
+                        true,
+                    )?;
+                } else {
+                    config::save_onboarding(path, &base_url, &api_key, &models[selected], false)?;
+                }
                 println!("Connected. Found {} models.", models.len());
                 println!("Configuration saved to {}", path.display());
                 println!();

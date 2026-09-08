@@ -429,7 +429,7 @@ where
     // `/warnings` flips this; the transcript only renders the warning rail when it is set.
     let mut show_warnings = true;
     // In-flight "Add provider" wizard: base URL + API key + Coding flag awaiting a model.
-    let mut pending_add: Option<(String, String, bool)> = None;
+    let mut pending_add: Option<(String, String, bool, Vec<String>)> = None;
     // Background jobs already reported as finished, so each is announced once.
     let mut announced_jobs: HashSet<String> = HashSet::new();
     // One fixed tool array per Session (prefix-cache stability): computed once from the
@@ -657,7 +657,7 @@ where
                     {
                         Ok(models) if !models.is_empty() => {
                             chat_ui.notice(&format!("{} models found— pick one.", models.len()))?;
-                            pending_add = Some((base, key, orvix_coding));
+                            pending_add = Some((base, key, orvix_coding, models.clone()));
                             hub_ref.open_dialog(
                                 "Pick Model",
                                 "/model __picked__ ",
@@ -672,30 +672,36 @@ where
                     continue;
                 }
                 if let Some(rest) = argument.strip_prefix("__picked__ ") {
-                    let Some((base, key, orvix_coding)) = pending_add.as_ref() else {
+                    let Some((base, key, orvix_coding, models)) = pending_add.as_ref() else {
                         chat_ui.error("No pending provider registration.")?;
                         continue;
                     };
                     let path = crate::config::global_config_path()?;
-                    let name =
-                        crate::config::append_profile(&path, base, key, rest, *orvix_coding)?;
-                    let profile = crate::config::Profile {
-                        name: name.clone(),
-                        model: rest.to_string(),
-                        base_url: base.clone(),
-                        api_key: key.clone(),
-                        context_window: None,
-                        tools: true,
-                        embedding_model: None,
-                        completions_path: orvix_coding
-                            .then(|| crate::config::ORVIX_COMPLETIONS_PATH.to_string()),
-                        send_session_id: *orvix_coding,
+                    let name = if *orvix_coding {
+                        crate::config::save_orvix_onboarding(
+                            path.as_path(),
+                            base,
+                            key,
+                            models,
+                            rest,
+                            false,
+                        )?
+                    } else {
+                        crate::config::append_profile(path.as_path(), base, key, rest, false)?
                     };
+                    let loaded = crate::config::Config::load()?;
+                    let crate::config::Loaded::Ready(reloaded) = loaded else {
+                        anyhow::bail!("configuration became incomplete after adding models");
+                    };
+                    config = reloaded;
+                    let profile = config
+                        .find(&name)
+                        .cloned()
+                        .context("selected profile was missing after adding models")?;
                     active = profile.clone();
                     provider = build_provider(&active);
                     context_window = None;
                     database.set_setting(ACTIVE_PROFILE_KEY, &name)?;
-                    config.profiles.push(profile);
                     pending_add = None;
                     session_tools = None;
                     head_messages = None;

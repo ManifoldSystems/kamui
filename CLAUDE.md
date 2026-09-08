@@ -99,8 +99,9 @@ effort or operational risk is disproportionate to their immediate value.
   the active provider and model, rebuilding the provider and persisting the choice in the SQLite
   `settings` table so it survives restarts. The banner shows the active model and profile. In
   fullscreen TUI mode bare `/model` opens the picker dialog, whose "+ Add provider / model" entry
-  reuses onboarding (base URL + API key -> live list_models -> pick) to append a new profile to
-  the global kamui.toml via `config::append_profile` and switch immediately.
+  reuses onboarding (base URL + API key -> live list_models -> pick). Orvix Coding adds every
+  returned model under one shared provider credential and switches to the selected default; generic
+  providers append only the selected profile.
 - After each streamed response the usage line reports time-to-first-token and total response time.
   These latency figures are displayed only, not persisted.
 - Chat requests offer the model read-only `read_file`, `list_directory`, `grep`, `glob`, and
@@ -528,9 +529,11 @@ Fields:
   the same way `base_url`/`api_key`/`tools` do. `None` (the default) leaves semantic search
   unavailable — `search_code` is then not offered to the model at all, rather than erroring.
 
-On first run, when no global `kamui.toml` exists, Kamui scaffolds the global config directory with a
-commented template and exits, asking the user to fill in the key. `KAMUI_DATA_DIR` remains an
-environment override for the database location only (a container/ops concern, not provider config).
+On first run, when no global `kamui.toml` exists, Kamui scaffolds the global config directory and
+starts onboarding. Orvix Coding discovery stores every returned model as a profile backed by one
+shared provider credential; the picker chooses only `default_profile`. Generic OpenAI-compatible
+onboarding stores only the selected model. `KAMUI_DATA_DIR` remains an environment override for the
+database location only (a container/ops concern, not provider config).
 
 Never commit API keys, credentials, provider responses containing secrets, or local database files.
 A project `kamui.toml` is safe to commit because it cannot contain a key. If a key appears in logs,

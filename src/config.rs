@@ -374,6 +374,102 @@ pub fn save_onboarding(
     atomic_write(path, &content)
 }
 
+/// Save all discovered Orvix Coding models under one shared credential. Only the model selected
+/// in the picker becomes the default profile; every other entitled model remains switchable.
+pub fn save_orvix_onboarding(
+    path: &Path,
+    base_url: &str,
+    api_key: &str,
+    models: &[String],
+    selected_model: &str,
+    replace_existing: bool,
+) -> Result<String> {
+    if replace_existing {
+        ensure_onboarding_supported(path)?;
+    }
+    if models.is_empty() || !models.iter().any(|model| model == selected_model) {
+        anyhow::bail!("selected Orvix model was not present in the discovered model list");
+    }
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    let mut document: toml::Value =
+        toml::from_str(&content).with_context(|| format!("failed to parse {}", path.display()))?;
+    let root = document
+        .as_table_mut()
+        .context("global kamui.toml must contain a TOML table")?;
+    if replace_existing {
+        root.remove("model");
+        root.remove("provider");
+    }
+
+    let mut provider = toml::map::Map::new();
+    provider.insert(
+        "base_url".into(),
+        toml::Value::String(base_url.trim_end_matches('/').into()),
+    );
+    provider.insert("api_key".into(), toml::Value::String(api_key.into()));
+    provider.insert(
+        "completions_path".into(),
+        toml::Value::String(ORVIX_COMPLETIONS_PATH.into()),
+    );
+    provider.insert("send_session_id".into(), toml::Value::Boolean(true));
+    let providers = root
+        .entry("providers")
+        .or_insert_with(|| toml::Value::Table(Default::default()))
+        .as_table_mut()
+        .context("[providers] must be a TOML table")?;
+    providers.insert("orvix-coding".into(), toml::Value::Table(provider));
+
+    let profiles = root
+        .entry("profiles")
+        .or_insert_with(|| toml::Value::Table(Default::default()))
+        .as_table_mut()
+        .context("[profiles] must be a TOML table")?;
+    if replace_existing {
+        profiles.clear();
+    }
+    let mut selected_profile = String::new();
+    for model in models {
+        let base_name: String = model
+            .chars()
+            .map(|character| {
+                if character.is_ascii_alphanumeric() || character == '-' {
+                    character.to_ascii_lowercase()
+                } else {
+                    '-'
+                }
+            })
+            .collect();
+        let mut name = base_name.clone();
+        let mut counter = 2;
+        while profiles
+            .keys()
+            .any(|taken| taken.eq_ignore_ascii_case(&name))
+        {
+            name = format!("{base_name}-{counter}");
+            counter += 1;
+        }
+        let mut profile = toml::map::Map::new();
+        profile.insert(
+            "provider".into(),
+            toml::Value::String("orvix-coding".into()),
+        );
+        profile.insert("model".into(), toml::Value::String(model.clone()));
+        if model == selected_model {
+            selected_profile = name.clone();
+        }
+        profiles.insert(name, toml::Value::Table(profile));
+    }
+    root.insert(
+        "default_profile".into(),
+        toml::Value::String(selected_profile.clone()),
+    );
+    let rendered =
+        toml::to_string_pretty(&document).context("failed to serialize configuration")?;
+    atomic_write(path, &rendered)?;
+    Ok(selected_profile)
+}
+
 pub fn ensure_onboarding_supported(path: &Path) -> Result<()> {
     let file = read_config_file(path)?;
     if !file.profiles.is_empty() || !file.providers.is_empty() {
@@ -1008,6 +1104,70 @@ api_key = "k"
         std::fs::remove_file(path).unwrap();
 
         assert!(error.to_string().contains("advanced profiles"));
+    }
+
+    #[test]
+    fn orvix_onboarding_saves_every_model_and_selects_one_default() {
+        let path = temporary_config("context_window = 8000\n[provider]\ntools = false");
+        let models = vec![
+            "orvix/muse-spark".to_string(),
+            "orvix/glm-flash".to_string(),
+            "orvix/deepseek-flash".to_string(),
+        ];
+
+        let selected = save_orvix_onboarding(
+            &path,
+            ORVIX_BASE_URL,
+            "sk-shared",
+            &models,
+            "orvix/glm-flash",
+            true,
+        )
+        .unwrap();
+        let saved = read_config_file(&path).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+
+        assert_eq!(saved.profiles.len(), 3);
+        assert_eq!(saved.default_profile.as_deref(), Some(selected.as_str()));
+        assert_eq!(
+            saved.profiles[&selected].model.as_deref(),
+            Some("orvix/glm-flash")
+        );
+        assert!(saved.profiles.values().all(|profile| {
+            profile.provider.as_deref() == Some("orvix-coding") && profile.api_key.is_none()
+        }));
+        assert_eq!(raw.matches("sk-shared").count(), 1);
+    }
+
+    #[test]
+    fn adding_orvix_models_preserves_existing_profiles() {
+        let path = temporary_config(
+            "default_profile = \"local\"\n[providers.local]\napi_key = \"local-key\"\n\
+             [profiles.local]\nprovider = \"local\"\nmodel = \"local-model\"",
+        );
+        let models = vec![
+            "orvix/muse-spark".to_string(),
+            "orvix/glm-flash".to_string(),
+        ];
+
+        let selected = save_orvix_onboarding(
+            &path,
+            ORVIX_BASE_URL,
+            "sk-shared",
+            &models,
+            "orvix/muse-spark",
+            false,
+        )
+        .unwrap();
+        let saved = read_config_file(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+
+        assert!(saved.profiles.contains_key("local"));
+        assert!(saved.providers.contains_key("local"));
+        assert!(saved.providers.contains_key("orvix-coding"));
+        assert_eq!(saved.profiles.len(), 3);
+        assert_eq!(saved.default_profile.as_deref(), Some(selected.as_str()));
     }
 
     #[test]
