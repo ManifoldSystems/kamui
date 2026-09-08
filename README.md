@@ -330,13 +330,13 @@ same way for a single scripted turn.
 Windows PowerShell:
 
 ```powershell
-irm https://raw.githubusercontent.com/algonacci/kamui/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/ManifoldSystems/kamui/main/install.ps1 | iex
 ```
 
 Linux and macOS:
 
 ```sh
-curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/algonacci/kamui/main/install.sh | sh
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/ManifoldSystems/kamui/main/install.sh | sh
 ```
 
 Then open a new terminal and run:

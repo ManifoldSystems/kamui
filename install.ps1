@@ -1,6 +1,6 @@
 $ErrorActionPreference = "Stop"
 
-$Repository = "algonacci/kamui"
+$Repository = "ManifoldSystems/kamui"
 $InstallDir = Join-Path $env:LOCALAPPDATA "Programs\kamui\bin"
 
 if (-not [Environment]::Is64BitOperatingSystem) {

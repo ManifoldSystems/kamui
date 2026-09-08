@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-repository="algonacci/kamui"
+repository="ManifoldSystems/kamui"
 install_dir="${KAMUI_INSTALL_DIR:-$HOME/.local/bin}"
 os=$(uname -s)
 arch=$(uname -m)
