@@ -1082,6 +1082,16 @@ where
                 }
                 continue;
             }
+            if command == "/audit" {
+                match session.as_ref() {
+                    Some(active) => {
+                        let rows = database.tool_executions(&active.id, 20)?;
+                        chat_ui.notice(&format_tool_audit(&rows))?;
+                    }
+                    None => chat_ui.notice("No active session.")?,
+                }
+                continue;
+            }
             if command == "/jobs" {
                 let text = format!(
                     "Session jobs:\n{}\n\nScheduled jobs:\n{}",
@@ -3428,6 +3438,36 @@ fn report_interrupted_tools(
     Ok(())
 }
 
+fn format_tool_audit(rows: &[storage::ToolExecution]) -> String {
+    if rows.is_empty() {
+        return "No mutating tool executions recorded for this session.".to_string();
+    }
+    let mut output = String::from("Recent mutating tool executions:\n");
+    for row in rows {
+        let arguments = audit_preview(&row.arguments, 120);
+        let result = row
+            .output
+            .as_deref()
+            .map(|value| audit_preview(value, 120))
+            .unwrap_or_else(|| "-".to_string());
+        let _ = writeln!(
+            output,
+            "{} | {} | {} | args: {} | result: {}",
+            row.started_at, row.status, row.tool_name, arguments, result
+        );
+    }
+    output.trim_end().to_string()
+}
+
+fn audit_preview(value: &str, limit: usize) -> String {
+    let single_line = value.replace('\n', " ");
+    let mut preview: String = single_line.chars().take(limit).collect();
+    if single_line.chars().count() > limit {
+        preview.push_str("...");
+    }
+    preview
+}
+
 async fn dispatch_with_journal(
     tools: &ToolRegistry,
     call: &crate::provider::ToolCall,
@@ -5086,6 +5126,10 @@ pub(crate) fn print_help(out: &mut String) {
         "/undo             Revert the files patched by the last turn"
     );
     let _ = writeln!(out, "/redo             Reapply the last undone file edits");
+    let _ = writeln!(
+        out,
+        "/audit            Show recent mutating tool executions"
+    );
     let _ = writeln!(
         out,
         "/jobs             List session and persistent scheduled jobs"

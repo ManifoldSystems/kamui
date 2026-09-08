@@ -571,6 +571,7 @@ TTY, `NO_COLOR` keeps the fullscreen TUI but removes its semantic foreground/bac
 | `/compact` | Summarize older messages to free up context |
 | `/undo` | Revert the files patched by the last turn |
 | `/redo` | Reapply the last undone file edits |
+| `/audit` | Show recent mutating tool executions for this session |
 | `/jobs` | List temporary session jobs and persistent scheduled jobs |
 | `/index` | Rebuild the semantic-search index (needs `embedding_model`) |
 | `/commands` | List your own prompt commands |
@@ -819,6 +820,8 @@ normal editor; a partial filesystem failure leaves the stack position unchanged 
 Mutating tool calls are also journaled in SQLite before execution. On a restart, calls left running
 are marked interrupted and shown when their session is resumed. Kamui never retries them
 automatically because the command or file write may already have taken effect.
+Use `/audit` to inspect the 20 most recent entries for the active session; arguments and outputs are
+shown as bounded previews so large command output cannot flood the terminal.
 
 Choosing `always` at an approval is scoped to the exact normalized command or canonical file path
 for the active session. It does not grant every future `run_command` or `patch_file` call; different

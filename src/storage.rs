@@ -104,6 +104,14 @@ pub struct ScheduledJob {
     pub worker_id: Option<String>,
 }
 
+pub struct ToolExecution {
+    pub tool_name: String,
+    pub status: String,
+    pub arguments: String,
+    pub output: Option<String>,
+    pub started_at: i64,
+}
+
 fn scheduled_job_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScheduledJob> {
     Ok(ScheduledJob {
         id: row.get(0)?,
@@ -936,6 +944,26 @@ impl Database {
              ORDER BY started_at, rowid",
         )?;
         let rows = statement.query_map([session_id], |row| row.get(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn tool_executions(&self, session_id: &str, limit: usize) -> Result<Vec<ToolExecution>> {
+        let limit = i64::try_from(limit).context("tool execution limit overflow")?;
+        let mut statement = self.connection.prepare(
+            "SELECT tool_name, status, arguments, output, started_at
+             FROM tool_executions WHERE session_id = ?1
+             ORDER BY started_at DESC, rowid DESC LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![session_id, limit], |row| {
+            Ok(ToolExecution {
+                tool_name: row.get(0)?,
+                status: row.get(1)?,
+                arguments: row.get(2)?,
+                output: row.get(3)?,
+                started_at: row.get(4)?,
+            })
+        })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
     }
@@ -1934,6 +1962,10 @@ mod tests {
             "interrupted"
         );
         assert_eq!(database.schema_version().unwrap(), 16);
+        let rows = database.tool_executions(&session.id, 20).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].tool_name, "run_command");
+        assert_eq!(rows[0].status, "interrupted");
     }
 
     #[test]
