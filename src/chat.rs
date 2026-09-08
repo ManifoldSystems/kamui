@@ -35,10 +35,10 @@ const RESUME_REPLAY_MESSAGES: usize = 10;
 /// Upper bound on model/tool round-trips within a single user turn, to stop runaway tool loops.
 /// Generous enough for multi-file edits while still bounding a stuck loop.
 const MAX_TOOL_ROUNDS: usize = 25;
-const EXPLORATION_WARNING_CALLS: usize = 10;
-const EXPLORATION_WARNING_BYTES: usize = 128 * 1024;
-const EXPLORATION_FINAL_CALLS: usize = 18;
-const EXPLORATION_FINAL_BYTES: usize = 256 * 1024;
+const EXPLORATION_WARNING_CALLS: usize = 4;
+const EXPLORATION_WARNING_BYTES: usize = 64 * 1024;
+const EXPLORATION_FINAL_CALLS: usize = 6;
+const EXPLORATION_FINAL_BYTES: usize = 128 * 1024;
 
 #[derive(Default)]
 struct ExplorationGuard {
