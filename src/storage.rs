@@ -19,6 +19,8 @@ pub struct Session {
     pub title: String,
     pub provider: String,
     pub model: String,
+    pub compaction_summary: Option<String>,
+    pub summarized_upto: usize,
 }
 
 pub struct SessionSummary {
@@ -328,6 +330,13 @@ impl Database {
                  PRAGMA user_version = 11;",
             )?;
         }
+        if version < 12 {
+            connection.execute_batch(
+                "ALTER TABLE sessions ADD COLUMN compaction_summary TEXT;
+                 ALTER TABLE sessions ADD COLUMN summarized_upto INTEGER NOT NULL DEFAULT 0;
+                 PRAGMA user_version = 12;",
+            )?;
+        }
         Ok(Self { connection, path })
     }
 
@@ -603,6 +612,8 @@ impl Database {
             title: "New chat".to_string(),
             provider: provider.to_string(),
             model: model.to_string(),
+            compaction_summary: None,
+            summarized_upto: 0,
         };
         self.connection.execute(
             "INSERT INTO sessions (id, title, provider, model) VALUES (?1, ?2, ?3, ?4)",
@@ -614,7 +625,7 @@ impl Database {
     pub fn find_session(&self, id_prefix: &str) -> Result<Option<Session>> {
         let pattern = format!("{id_prefix}%");
         let mut statement = self.connection.prepare(
-            "SELECT id, title, provider, model FROM sessions
+            "SELECT id, title, provider, model, compaction_summary, summarized_upto FROM sessions
              WHERE id LIKE ?1 ORDER BY updated_at DESC LIMIT 2",
         )?;
         let sessions = statement
@@ -675,6 +686,21 @@ impl Database {
             Ok(message)
         })
         .collect()
+    }
+
+    pub fn set_compaction_checkpoint(
+        &self,
+        session_id: &str,
+        summary: &str,
+        summarized_upto: usize,
+    ) -> Result<()> {
+        self.connection.execute(
+            "UPDATE sessions
+             SET compaction_summary = ?2, summarized_upto = ?3, updated_at = unixepoch()
+             WHERE id = ?1",
+            params![session_id, summary, summarized_upto as i64],
+        )?;
+        Ok(())
     }
 
     /// Persist a full turn: every message it produced plus one usage record, atomically. A turn is
@@ -1529,6 +1555,8 @@ fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
         title: row.get(1)?,
         provider: row.get(2)?,
         model: row.get(3)?,
+        compaction_summary: row.get(4)?,
+        summarized_upto: row.get::<_, i64>(5)?.max(0) as usize,
     })
 }
 
@@ -1601,6 +1629,20 @@ mod tests {
             database.session_stats(&session.id).unwrap().request_count,
             1
         );
+    }
+
+    #[test]
+    fn compaction_checkpoint_survives_resume() {
+        let database = database();
+        let session = database.create_session("test", "model").unwrap();
+        database
+            .set_compaction_checkpoint(&session.id, "earlier work", 7)
+            .unwrap();
+
+        let resumed = database.find_session(&session.id).unwrap().unwrap();
+        assert_eq!(resumed.compaction_summary.as_deref(), Some("earlier work"));
+        assert_eq!(resumed.summarized_upto, 7);
+        assert_eq!(database.schema_version().unwrap(), 12);
     }
 
     #[test]

@@ -288,8 +288,13 @@ where
     let mut prefix_guard = cache::PrefixGuard::new(active.send_session_id);
     // Rolling context compaction: `summary` folds in messages before `summarized_upto`; the rest of
     // `messages` is sent verbatim. Both reset whenever a command replaces the loaded history.
-    let mut summary: Option<String> = None;
-    let mut summarized_upto: usize = 0;
+    let mut summary = session
+        .as_ref()
+        .and_then(|session| session.compaction_summary.clone());
+    let mut summarized_upto = session
+        .as_ref()
+        .map(|session| session.summarized_upto.min(messages.len()))
+        .unwrap_or(0);
     // The most recently completed turn's pre-edit file snapshot, if it touched any files, so
     // `/undo` can revert it. `None` once nothing is left to undo.
     let mut last_turn_snapshot: Option<HashMap<PathBuf, Option<String>>> = None;
@@ -912,6 +917,13 @@ where
                 };
                 match outcome {
                     Ok(Some((new_summary, new_upto, count))) => {
+                        if let Some(session) = session.as_ref() {
+                            database.set_compaction_checkpoint(
+                                &session.id,
+                                &new_summary,
+                                new_upto,
+                            )?;
+                        }
                         summary = Some(new_summary);
                         summarized_upto = new_upto;
                         chat_ui.notice(&format!(
@@ -1168,10 +1180,16 @@ where
                     plan_requested = false;
                 }
             }
-            // Compaction state is tied to the current history; reset it if a command replaced it.
+            // Compaction state belongs to the selected session. A resume restores its durable
+            // checkpoint; /new has no selected session and therefore starts empty.
             if messages.len() != messages_before {
-                summary = None;
-                summarized_upto = 0;
+                summary = session
+                    .as_ref()
+                    .and_then(|session| session.compaction_summary.clone());
+                summarized_upto = session
+                    .as_ref()
+                    .map(|session| session.summarized_upto.min(messages.len()))
+                    .unwrap_or(0);
                 // A different conversation gets a different prefix by design, so the first turn
                 // after it is a warm-up, not drift worth reporting.
                 prefix_guard.reset();
@@ -1287,6 +1305,9 @@ where
             };
             match outcome {
                 Ok(Some((new_summary, new_upto, count))) => {
+                    if let Some(session) = session.as_ref() {
+                        database.set_compaction_checkpoint(&session.id, &new_summary, new_upto)?;
+                    }
                     summary = Some(new_summary);
                     summarized_upto = new_upto;
                     chat_ui.notice(&format!(

@@ -5,6 +5,7 @@ use serde::Deserialize;
 use std::fs;
 use std::path::Path;
 use std::time::{Duration, Instant};
+use uuid::Uuid;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -28,6 +29,9 @@ struct Totals {
     input_tokens: u64,
     output_tokens: u64,
     total_tokens: u64,
+    cached_tokens: u64,
+    cache_hits: Vec<f64>,
+    warmups: usize,
     latency: Duration,
 }
 
@@ -60,14 +64,17 @@ where
     println!();
 
     for case in &suite.cases {
+        let session_id = profile.send_session_id.then(|| Uuid::new_v4().to_string());
+        let mut messages = Vec::new();
         for run in 1..=runs {
+            messages.push(Message::user(&case.prompt));
             let started = Instant::now();
             let response = provider
                 .chat(ChatRequest {
                     model: profile.model.clone(),
-                    messages: vec![Message::user(&case.prompt)],
+                    messages: messages.clone(),
                     tools: Vec::new(),
-                    session_id: None,
+                    session_id: session_id.clone(),
                 })
                 .await
                 .with_context(|| format!("benchmark case '{}' failed", case.name))?;
@@ -81,6 +88,19 @@ where
             totals.input_tokens += response.usage.prompt_tokens;
             totals.output_tokens += response.usage.completion_tokens;
             totals.total_tokens += response.usage.total_tokens;
+            totals.cached_tokens += response.usage.cached_tokens;
+            if profile.send_session_id {
+                if response.usage.prompt_tokens > 0 && response.usage.cached_tokens == 0 {
+                    totals.warmups += 1;
+                }
+                if run > 1 && response.usage.prompt_tokens > 0 {
+                    totals.cache_hits.push(
+                        (response.usage.cached_tokens as f64 / response.usage.prompt_tokens as f64
+                            * 100.0)
+                            .min(100.0),
+                    );
+                }
+            }
 
             let mark = if passed { "PASS" } else { "FAIL" };
             println!(
@@ -93,6 +113,7 @@ where
             if !missing.is_empty() {
                 println!("       missing: {}", missing.join(", "));
             }
+            messages.push(Message::assistant(response.content));
         }
     }
 
@@ -108,6 +129,40 @@ where
         totals.input_tokens,
         totals.output_tokens
     );
+    if !totals.cache_hits.is_empty() {
+        let aggregate = if totals.input_tokens > 0 {
+            totals.cached_tokens as f64 / totals.input_tokens as f64 * 100.0
+        } else {
+            0.0
+        };
+        totals
+            .cache_hits
+            .sort_by(|left, right| left.partial_cmp(right).expect("cache ratios are finite"));
+        let measured = totals.cache_hits.len();
+        let median = if measured.is_multiple_of(2) {
+            (totals.cache_hits[measured / 2 - 1] + totals.cache_hits[measured / 2]) / 2.0
+        } else {
+            totals.cache_hits[measured / 2]
+        };
+        let threshold = |minimum: f64| {
+            totals
+                .cache_hits
+                .iter()
+                .filter(|hit| **hit >= minimum)
+                .count() as f64
+                / measured as f64
+                * 100.0
+        };
+        println!(
+            "Prompt cache: median {:.0}% | aggregate {:.0}% | >=90%: {:.0}% | >=95%: {:.0}% | measured: {} | warm-up: {}",
+            median,
+            aggregate.min(100.0),
+            threshold(90.0),
+            threshold(95.0),
+            measured,
+            totals.warmups
+        );
+    }
 
     if totals.passed == totals.runs {
         Ok(())

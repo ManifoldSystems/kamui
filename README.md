@@ -438,7 +438,10 @@ kamui benchmark suite.json --profile sol --runs 3
 
 Each run reports pass/fail, latency, and tokens; the command exits non-zero when an expectation is
 missing, making the same suite usable locally and in CI. Expectations are optional and matched
-case-insensitively.
+case-insensitively. On an Orvix Coding profile, repeated runs of each case form one append-only
+session with a stable session ID. The result also reports median and aggregate cache hit rates,
+shares at or above 90% and 95%, measured turns, and warm-ups; the first run of each case is excluded
+from the steady-state ratios.
 
 ### Scheduled jobs
 

@@ -93,7 +93,8 @@ effort or operational risk is disproportionate to their immediate value.
 - Long sessions are compacted automatically: when the un-summarized recent history exceeds a byte
   threshold (about half the profile's `context_window`, or a default), older messages are folded
   into a rolling summary and the request sends the summary plus recent messages. `/compact` forces
-  it. Full history stays in storage; the summary is in-memory and regenerated after a resume.
+  it. Full history stays in storage; the summary and summarized boundary are persisted per session
+  and restored on resume, so a restart does not generate a different cache epoch unnecessarily.
 - `/model` lists the configured provider profiles and marks the active one; `/model <name>` switches
   the active provider and model, rebuilding the provider and persisting the choice in the SQLite
   `settings` table so it survives restarts. The banner shows the active model and profile. In
@@ -231,7 +232,8 @@ effort or operational risk is disproportionate to their immediate value.
   exits non-zero if any required check fails, so it is usable as a pre-flight script.
 - `kamui benchmark <suite.json> [--profile <name>] [--runs <n>]` runs repeatable prompt cases,
   validates optional case-insensitive expected substrings, reports latency/token totals, and exits
-  non-zero when a case fails.
+  non-zero when a case fails. For Orvix Coding profiles, runs are append-only turns under one stable
+  session ID per case and include steady-state cache metrics with each case's first turn excluded.
 - `kamui jobs` manages a SQLite-backed scheduled command queue (`src/jobs.rs`, schema v9). One-shot
   and interval jobs persist across restarts; a foreground worker atomically claims due work, stores
   capped output/exit status, coalesces missed intervals, and can run once under an OS scheduler.

@@ -308,6 +308,8 @@ colour without removing the structured event feed.
 `kamui benchmark <suite.json>` runs repeatable prompt cases against a chosen profile, supports
 multiple runs, checks optional case-insensitive expected substrings, reports latency and token
 totals, and exits non-zero on failed expectations.
+For Orvix Coding profiles, repeated runs are append-only turns in one stable session per case and
+the final report includes median/aggregate cache rates plus the shares at or above 90% and 95%.
 
 Cost tracking needed no migration either, and no new writes: `usage_records` has carried
 `input_tokens`, `output_tokens`, and the `model` that produced them since `user_version = 5`. The
@@ -619,4 +621,3 @@ Kamui should feel intentional and polished rather than like a chat log wrapped i
 - [ ] Add snapshot/golden tests for important screens, dialogs, wrapping, and theme variants
 - [ ] Run usability tests for first-time approval, batch review, context inspection, and recovery from errors
 - [ ] Establish measurable UX budgets for keypresses, modal depth, visual jitter, and time-to-understand
-
