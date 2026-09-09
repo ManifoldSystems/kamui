@@ -1,6 +1,19 @@
 #!/bin/sh
 set -eu
 
+force=0
+for arg in "$@"; do
+  case "$arg" in
+    --force) force=1 ;;
+    -h|--help)
+      echo "Usage: install.sh [--force]"
+      echo "  --force   Reinstall even when the installed version is already current."
+      exit 0
+      ;;
+    *) echo "Unknown argument: $arg (see --help)" >&2; exit 1 ;;
+  esac
+done
+
 install_dir="${KAMUI_INSTALL_DIR:-$HOME/.local/bin}"
 release_url="${KAMUI_RELEASE_URL:-https://is3.cloudhost.id/orvix/kamui-releases/latest}"
 os=$(uname -s)
@@ -35,6 +48,27 @@ download() {
     exit 1
   fi
 }
+
+fetch_text() {
+  if command -v curl >/dev/null 2>&1; then
+    curl --proto '=https' --tlsv1.2 -fsSL "$1" 2>/dev/null || true
+  elif command -v wget >/dev/null 2>&1; then
+    wget -qO- "$1" 2>/dev/null || true
+  fi
+}
+
+installed_version=""
+if [ -x "$install_dir/kamui" ]; then
+  installed_version=$("$install_dir/kamui" --version 2>/dev/null | awk '{print $2}' || true)
+fi
+
+if [ "$force" -eq 0 ] && [ -n "$installed_version" ]; then
+  remote_version=$(fetch_text "$release_url/VERSION" | tr -d '[:space:]')
+  if [ -n "$remote_version" ] && [ "$remote_version" = "$installed_version" ]; then
+    printf '  kamui %s is already up to date. Use --force to reinstall.\n\n' "$installed_version"
+    exit 0
+  fi
+fi
 
 printf '  Downloading %s\n' "$archive"
 download "$release_url/$archive" "$temp_dir/$archive"

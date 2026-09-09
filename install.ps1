@@ -1,5 +1,9 @@
 $ErrorActionPreference = "Stop"
 
+param(
+    [switch]$Force
+)
+
 $InstallDir = Join-Path $env:LOCALAPPDATA "Programs\kamui\bin"
 $ReleaseUrl = if ($env:KAMUI_RELEASE_URL) { $env:KAMUI_RELEASE_URL.TrimEnd("/") } else { "https://is3.cloudhost.id/orvix/kamui-releases/latest" }
 
@@ -10,6 +14,16 @@ if (-not [Environment]::Is64BitOperatingSystem) {
 $Target = "x86_64-pc-windows-msvc"
 $Archive = "kamui-$Target.zip"
 $TempDir = Join-Path ([IO.Path]::GetTempPath()) "kamui-install-$([Guid]::NewGuid())"
+
+$Binary = Join-Path $InstallDir "kamui.exe"
+if (-not $Force -and (Test-Path $Binary)) {
+    try { $Installed = (& $Binary --version 2>$null).Split()[1] } catch { $Installed = "" }
+    try { $Remote = (Invoke-WebRequest "$ReleaseUrl/VERSION" -UseBasicParsing).Content.Trim() } catch { $Remote = "" }
+    if ($Installed -and $Remote -and ($Installed -eq $Remote)) {
+        Write-Host "kamui $Installed is already up to date. Use -Force to reinstall."
+        return
+    }
+}
 
 try {
     New-Item -ItemType Directory -Force -Path $TempDir, $InstallDir | Out-Null

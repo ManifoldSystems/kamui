@@ -4155,11 +4155,27 @@ fn last_foldable_index(cards: &[Card]) -> Option<usize> {
 /// Puts text on the system clipboard. Kept behind one function so the failure mode -- a
 /// headless session with no clipboard at all -- is reported once, as a notice, instead of
 /// taking the UI down.
+///
+/// On Linux the clipboard is hosted inside the setting process (arboard docs): dropping the
+/// last `Clipboard` right after `set_text` hands the selection back, so managers see the
+/// contents vanish ~1ms after the copy. A detached thread re-sets and `wait()`s until
+/// something else replaces the clipboard, keeping ownership alive without blocking the UI.
 fn set_clipboard_text(text: &str) -> Result<()> {
-    arboard::Clipboard::new()
-        .context("could not access the system clipboard")?
-        .set_text(text.to_string())
-        .context("could not write to the system clipboard")
+    let owned = text.to_string();
+    let mut ctx = arboard::Clipboard::new().context("could not access the system clipboard")?;
+    ctx.set_text(owned.clone())
+        .context("could not write to the system clipboard")?;
+    #[cfg(all(
+        unix,
+        not(any(target_os = "macos", target_os = "android", target_os = "emscripten")),
+    ))]
+    std::thread::spawn(move || {
+        use arboard::SetExtLinux;
+        // Re-set is idempotent; `wait()` parks until another app takes the clipboard,
+        // then this thread exits. Only the latest copy lingers.
+        let _ = ctx.set().wait().text(owned);
+    });
+    Ok(())
 }
 
 /// The editor's visible rows together with where the caret sits among them. Rows and caret come
