@@ -354,7 +354,7 @@ anyway). To remove Kamui, run the matching uninstaller — configuration and the
 are kept unless you pass `--purge` (or `-Purge` on Windows):
 
 ```sh
-curl --proto '=https' --tlsv1.2 -fsSL https://is3.cloudhost.id/orvix/kamui-releases/uninstall.sh | sh
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/ManifoldSystems/kamui/main/uninstall.sh | sh
 ```
 
 For development, install the current checkout into Cargo's binary directory:

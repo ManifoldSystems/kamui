@@ -1,8 +1,8 @@
-$ErrorActionPreference = "Stop"
-
 param(
     [switch]$Force
 )
+
+$ErrorActionPreference = "Stop"
 
 $InstallDir = Join-Path $env:LOCALAPPDATA "Programs\kamui\bin"
 $ReleaseUrl = if ($env:KAMUI_RELEASE_URL) { $env:KAMUI_RELEASE_URL.TrimEnd("/") } else { "https://is3.cloudhost.id/orvix/kamui-releases/latest" }
