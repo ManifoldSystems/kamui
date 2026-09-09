@@ -9,6 +9,8 @@ use std::process::Command;
 
 const INSTRUCTION_FILES: [&str; 2] = ["KAMUI.md", "AGENTS.md"];
 const MAX_FILE_BYTES: u64 = 1024 * 1024;
+/// Upper bound on `@`-path completion entries. Beyond this the popup is unusable anyway.
+pub const MAX_PATH_CANDIDATES: usize = 20_000;
 const MAX_CONTEXT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
 const MAX_IMAGE_PIXELS: u64 = 25_000_000;
@@ -92,6 +94,8 @@ impl ProjectContext {
     /// Return insertion-ready `@` references for visible, non-ignored project files and
     /// directories. Paths use `/` on every platform; directories end in `/` and paths containing
     /// whitespace are double quoted. Named non-filesystem references are included as well.
+    /// Capped at [`MAX_PATH_CANDIDATES`]: launched from `$HOME` or `/` the tree can hold
+    /// millions of entries, and an uncapped walk + sort froze startup with no prompt.
     #[allow(dead_code)]
     pub fn at_path_candidates(&self) -> Result<Vec<String>> {
         let mut candidates = vec![
@@ -133,6 +137,9 @@ impl ProjectContext {
                 reference.push('/');
             }
             candidates.push(format_at_reference(&reference));
+            if candidates.len() >= MAX_PATH_CANDIDATES {
+                break;
+            }
         }
 
         candidates.sort();
