@@ -348,6 +348,15 @@ kamui
 Check the installed version with `kamui --version` and list command-line options with
 `kamui --help`.
 
+Re-running the installer refreshes to the latest release (it skips the download when
+`kamui --version` already matches; pass `--force`, or `-Force` on Windows, to reinstall
+anyway). To remove Kamui, run the matching uninstaller — configuration and the database
+are kept unless you pass `--purge` (or `-Purge` on Windows):
+
+```sh
+curl --proto '=https' --tlsv1.2 -fsSL https://is3.cloudhost.id/orvix/kamui-releases/uninstall.sh | sh
+```
+
 For development, install the current checkout into Cargo's binary directory:
 
 ```sh

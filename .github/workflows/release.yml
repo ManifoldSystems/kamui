@@ -102,6 +102,18 @@ jobs:
           path: dist
           merge-multiple: true
 
+      - name: Write VERSION file
+        shell: bash
+        run: |
+          # Bare version (no leading v) so installers can compare it
+          # against `kamui --version`. Falls back to Cargo.toml when the
+          # tag is not a plain v<semver>.
+          version="${GITHUB_REF_NAME#v}"
+          if [ -z "$version" ]; then
+            version=$(grep '^version' Cargo.toml | head -1 | cut -d'"' -f2)
+          fi
+          printf '%s' "$version" > dist/VERSION
+
       - uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
