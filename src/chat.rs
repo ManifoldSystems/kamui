@@ -234,9 +234,21 @@ where
     if let Some(hub) = hub.as_ref() {
         refresh_model_source(&config, &active.name, hub);
         refresh_session_source(database, hub);
-        if let Ok(candidates) = project.at_path_candidates() {
-            hub.set_path_candidates(candidates);
-        }
+        // `@`-path completion walks the whole project tree, which can hold millions of
+        // entries from `$HOME` or `/` — doing it here froze startup with no prompt.
+        // Compute in the background and publish when ready; typing `@` before then
+        // simply offers the named references until the file list lands.
+        let root = project.root().to_path_buf();
+        let handle = hub.path_candidates_handle();
+        std::thread::spawn(move || {
+            if let Ok(context) = crate::context::ProjectContext::from_root(root)
+                && let Ok(candidates) = context.at_path_candidates()
+            {
+                *handle
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = candidates;
+            }
+        });
     }
     let ui = Ui::stdio();
     let mcp_sidebar = mcp_sidebar_value(&mcp_statuses);

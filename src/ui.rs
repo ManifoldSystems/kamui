@@ -1605,11 +1605,10 @@ impl InputHub {
             .unwrap_or_else(PoisonError::into_inner) = candidates;
     }
 
-    pub fn set_path_candidates(&self, candidates: Vec<String>) {
-        *self
-            .path_candidates
-            .write()
-            .unwrap_or_else(PoisonError::into_inner) = candidates;
+    /// Shared handle to the `@`-path completion list, so a background thread can publish
+    /// candidates computed after startup without blocking the first prompt.
+    pub fn path_candidates_handle(&self) -> std::sync::Arc<std::sync::RwLock<Vec<String>>> {
+        self.path_candidates.clone()
     }
 
     /// Sources for the Ctrl+K model picker: (submit value, display label).
