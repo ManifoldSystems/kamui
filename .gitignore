@@ -29,3 +29,6 @@ conductor
 # Local scratch (screenshots, one-off implementation prompts)
 .tmp-screenshots/
 IMAGE_SUPPORT_PROMPT.md
+
+# Packaged installer archives
+dist/
