@@ -2116,7 +2116,8 @@ where
                     "running {} sub-agent(s), up to {MAX_CONCURRENT_SUB_AGENTS} concurrently",
                     spawn_calls.len()
                 ))?;
-                tokio::select! {
+                let mut spinner = start_spinner("Running sub-agents...", ui, &mut chat_ui);
+                let output = tokio::select! {
                     output = dispatch_spawn_agents(
                         provider.as_ref(),
                         &active.model,
@@ -2125,13 +2126,23 @@ where
                         coding_session_id.clone(),
                         Some((database, active_session_id.as_str())),
                     ) => output,
+                    () = wait_interrupt(&interrupt) => {
+                        stop_spinner(&mut spinner, &mut chat_ui).await;
+                        revert_on_cancel(&mut chat_ui, &turn_snapshot);
+                        chat_ui.notice("interrupted — back to prompt")?;
+                        continue 'chat;
+                    }
                     signal = tokio::signal::ctrl_c() => {
+                        stop_spinner(&mut spinner, &mut chat_ui).await;
                         signal.context("failed to listen for Ctrl+C")?;
                         revert_on_cancel(&mut chat_ui, &turn_snapshot);
                         chat_ui.notice("interrupted — back to prompt")?;
                         continue 'chat;
                     }
-                }
+                };
+                stop_spinner(&mut spinner, &mut chat_ui).await;
+                chat_ui.notice(&format!("{} sub-agent(s) finished", spawn_calls.len()))?;
+                output
             };
             let approval_calls: Vec<&ToolCall> = tool_calls
                 .iter()
@@ -2829,6 +2840,10 @@ where
             .collect();
         if !spawn_calls.is_empty() && session.is_none() {
             session = Some(database.create_session(provider.name(), &active.model)?);
+        }
+        if !spawn_calls.is_empty() {
+            println!("running {} sub-agent(s)…", spawn_calls.len());
+            let _ = io::stdout().flush();
         }
         let spawned_outputs = dispatch_spawn_agents(
             provider.as_ref(),
@@ -3668,7 +3683,7 @@ async fn run_compaction(
     summarized_upto: usize,
     session_id: Option<String>,
 ) -> Result<Option<(String, usize, usize)>> {
-    let Some(cutoff) = compaction::cutoff(messages.len(), summarized_upto) else {
+    let Some(cutoff) = compaction::cutoff(messages, summarized_upto) else {
         return Ok(None);
     };
     let rendered = compaction::render(&messages[summarized_upto..cutoff]);

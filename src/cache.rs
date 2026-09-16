@@ -69,7 +69,7 @@ pub fn turn_messages(
         messages.push(Message::system(tail));
     }
     messages.push(user);
-    messages
+    Message::paired_tool_transcript(&messages)
 }
 
 /// The head's text as one string, for fingerprinting it. Message boundaries are part of what must

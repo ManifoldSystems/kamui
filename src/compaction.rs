@@ -2,7 +2,7 @@
 //! a rolling summary so the conversation can continue without overflowing the model's context. The
 //! full history is always kept in storage; only the per-request message list is compressed.
 
-use crate::provider::{ChatRequest, Message};
+use crate::provider::{ChatRequest, Message, Role};
 
 /// Most recent messages always kept verbatim, never summarized.
 const KEEP_RECENT: usize = 6;
@@ -42,9 +42,20 @@ pub fn total_bytes(messages: &[Message]) -> usize {
 
 /// Index up to which messages should be folded into the summary, keeping the most recent
 /// `KEEP_RECENT` verbatim. Returns `None` when there is nothing new worth summarizing.
-pub fn cutoff(total_messages: usize, already_summarized: usize) -> Option<usize> {
-    let cutoff = total_messages.saturating_sub(KEEP_RECENT);
+///
+/// The cut is snapped onto an assistant `tool_calls` boundary so a live window never
+/// starts on a `role: tool` turn (DeepSeek 400s that).
+pub fn cutoff(messages: &[Message], already_summarized: usize) -> Option<usize> {
+    let mut cutoff = messages.len().saturating_sub(KEEP_RECENT);
+    cutoff = snap_to_tool_group_start(messages, cutoff);
     (cutoff > already_summarized).then_some(cutoff)
+}
+
+fn snap_to_tool_group_start(messages: &[Message], mut cutoff: usize) -> usize {
+    while cutoff > 0 && messages.get(cutoff).is_some_and(|m| m.role == Role::Tool) {
+        cutoff -= 1;
+    }
+    cutoff
 }
 
 /// Render messages as plain text for the summarizer.
@@ -128,10 +139,38 @@ mod tests {
 
     #[test]
     fn cutoff_keeps_recent_messages_and_advances() {
-        assert_eq!(cutoff(4, 0), None); // fewer than KEEP_RECENT + 1
-        assert_eq!(cutoff(10, 0), Some(4)); // summarize the first 4, keep 6
-        assert_eq!(cutoff(10, 4), None); // nothing new past what is already summarized
-        assert_eq!(cutoff(12, 4), Some(6)); // fold two more in
+        let messages: Vec<Message> = (0..12).map(|i| Message::user(format!("m{i}"))).collect();
+        assert_eq!(cutoff(&messages[..4], 0), None); // fewer than KEEP_RECENT + 1
+        assert_eq!(cutoff(&messages[..10], 0), Some(4)); // summarize the first 4, keep 6
+        assert_eq!(cutoff(&messages[..10], 4), None); // nothing new past what is already summarized
+        assert_eq!(cutoff(&messages[..12], 4), Some(6)); // fold two more in
+    }
+
+    #[test]
+    fn cutoff_does_not_split_a_tool_batch() {
+        use crate::provider::ToolCall;
+        let call = |id: &str| ToolCall {
+            id: id.to_string(),
+            name: "read_file".to_string(),
+            arguments: "{}".to_string(),
+        };
+        let messages = vec![
+            Message::user("start"),
+            Message::tool_request("", vec![call("c1"), call("c2")]),
+            Message::tool_result("c1", "a"),
+            Message::tool_result("c2", "b"),
+            Message::assistant("ok"),
+            Message::user("next"),
+            Message::assistant("done"),
+            Message::user("again"),
+            Message::assistant("later"),
+        ];
+        // Naive KEEP_RECENT=6 cuts at index 3 (`tool` for c2). Remaining would
+        // start on an orphan tool result. Snap back onto the assistant request.
+        let cut = cutoff(&messages, 0).expect("enough history");
+        assert_eq!(cut, 1);
+        assert!(!messages[cut].tool_calls.is_empty());
+        assert_ne!(messages[cut].role_name(), "tool");
     }
 
     #[test]

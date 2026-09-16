@@ -99,6 +99,48 @@ impl Message {
         }
     }
 
+    /// Keep only complete, contiguous tool batches. DeepSeek (and other
+    /// OpenAI-compat vendors) 400 a `role: tool` turn that is not a reply to
+    /// the immediately preceding assistant `tool_calls`, and also 400 an
+    /// assistant `tool_calls` turn that is only half-answered. Compaction used
+    /// to slice a batch in half.
+    pub fn paired_tool_transcript(messages: &[Self]) -> Vec<Self> {
+        let mut out = Vec::with_capacity(messages.len());
+        let mut index = 0;
+        while index < messages.len() {
+            let message = &messages[index];
+            if message.role == Role::Assistant && !message.tool_calls.is_empty() {
+                let wanted: std::collections::HashSet<&str> = message
+                    .tool_calls
+                    .iter()
+                    .map(|call| call.id.as_str())
+                    .collect();
+                let mut batch = vec![message.clone()];
+                let mut answered = std::collections::HashSet::new();
+                let mut next = index + 1;
+                while next < messages.len() && messages[next].role == Role::Tool {
+                    if let Some(id) = messages[next].tool_call_id.as_deref()
+                        && wanted.contains(id)
+                        && answered.insert(id)
+                    {
+                        batch.push(messages[next].clone());
+                    }
+                    next += 1;
+                }
+                if answered == wanted {
+                    out.extend(batch);
+                }
+                index = next;
+                continue;
+            }
+            if message.role != Role::Tool {
+                out.push(message.clone());
+            }
+            index += 1;
+        }
+        out
+    }
+
     pub fn from_parts(role: &str, content: String) -> Result<Self> {
         let role = match role {
             "system" => Role::System,
@@ -275,6 +317,68 @@ mod tests {
         assert_eq!(message.role_name(), "tool");
         assert_eq!(message.tool_call_id.as_deref(), Some("c1"));
         assert!(message.tool_calls.is_empty());
+    }
+
+    fn tool_call(id: &str) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            name: "read_file".to_string(),
+            arguments: "{}".to_string(),
+        }
+    }
+
+    #[test]
+    fn paired_tool_transcript_keeps_a_contiguous_batch() {
+        let messages = vec![
+            Message::user("list files"),
+            Message::tool_request("", vec![tool_call("c1"), tool_call("c2")]),
+            Message::tool_result("c1", "a"),
+            Message::tool_result("c2", "b"),
+            Message::assistant("done"),
+        ];
+        assert_eq!(Message::paired_tool_transcript(&messages).len(), 5);
+    }
+
+    #[test]
+    fn paired_tool_transcript_drops_orphan_tool_results() {
+        let messages = vec![
+            Message::user("list files"),
+            Message::tool_result("c1", "a"),
+            Message::tool_result("c2", "b"),
+            Message::assistant("done"),
+        ];
+        let paired = Message::paired_tool_transcript(&messages);
+        assert_eq!(paired.len(), 2);
+        assert_eq!(paired[0].role, Role::User);
+        assert_eq!(paired[1].role, Role::Assistant);
+    }
+
+    #[test]
+    fn paired_tool_transcript_stops_matching_after_a_non_tool_turn() {
+        let messages = vec![
+            Message::tool_request("", vec![tool_call("c1"), tool_call("c2")]),
+            Message::tool_result("c1", "a"),
+            Message::user("steer"),
+            Message::tool_result("c2", "b"),
+        ];
+        let paired = Message::paired_tool_transcript(&messages);
+        assert_eq!(paired.len(), 1);
+        assert_eq!(paired[0].role, Role::User);
+    }
+
+    #[test]
+    fn paired_tool_transcript_drops_a_half_answered_batch() {
+        let messages = vec![
+            Message::user("list files"),
+            Message::tool_request("", vec![tool_call("c1"), tool_call("c2")]),
+            Message::tool_result("c2", "b"),
+            Message::assistant("done"),
+        ];
+        let paired = Message::paired_tool_transcript(&messages);
+        assert_eq!(paired.len(), 2);
+        assert_eq!(paired[0].role, Role::User);
+        assert_eq!(paired[1].role, Role::Assistant);
+        assert!(paired[1].tool_calls.is_empty());
     }
 
     #[test]
